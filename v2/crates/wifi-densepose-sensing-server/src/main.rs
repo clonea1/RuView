@@ -482,16 +482,17 @@ const NODE_STALE_AFTER_MS: u64 = 10_000;
 
 /// Build a node's *own* [`NodeInference`] from its smoothed per-node state
 /// (ADR-297). Uses the node's own `current_motion_level` — never the room
-/// aggregate — with a confidence from its smoothed person score and freshness
+/// aggregate — with its smoothed classification confidence and freshness
 /// from its last frame time. Pure given the state snapshot + `now`.
 fn node_inference_for(n: &NodeState, now: std::time::Instant) -> NodeInference {
     let age_ms = n
         .last_frame_time
         .map(|t| now.duration_since(t).as_millis() as u64);
-    let present = !matches!(n.current_motion_level.as_str(), "absent");
-    let score = n.smoothed_person_score.clamp(0.0, 1.0);
-    let confidence = if present { score } else { 1.0 - score };
-    NodeInference::new(n.current_motion_level.clone(), confidence, age_ms)
+    NodeInference::new(
+        n.current_motion_level.clone(),
+        n.smoothed_classification_confidence,
+        age_ms,
+    )
 }
 
 #[cfg(test)]
@@ -654,6 +655,11 @@ struct NodeState {
     pub(crate) frame_history: VecDeque<Vec<f64>>,
     smoothed_person_score: f64,
     pub(crate) prev_person_count: usize,
+    /// Confidence in `current_motion_level`, from `smooth_and_classify_node`'s
+    /// EMA-smoothed motion score (and any adaptive-model override). Distinct
+    /// from `smoothed_person_score`, which is a person-*count* hysteresis
+    /// signal, not a classification-confidence measure.
+    smoothed_classification_confidence: f64,
     smoothed_motion: f64,
     current_motion_level: String,
     debounce_counter: u32,
@@ -979,6 +985,7 @@ impl NodeState {
             frame_history: VecDeque::new(),
             smoothed_person_score: 0.0,
             prev_person_count: 0,
+            smoothed_classification_confidence: 0.0,
             smoothed_motion: 0.0,
             current_motion_level: "absent".to_string(),
             debounce_counter: 0,
@@ -1174,7 +1181,7 @@ fn build_node_features(
                 classification: ClassificationInfo {
                     motion_level: ns.current_motion_level.clone(),
                     presence: !matches!(ns.current_motion_level.as_str(), "absent"),
-                    confidence: ns.smoothed_person_score.clamp(0.0, 1.0),
+                    confidence: ns.smoothed_classification_confidence.clamp(0.0, 1.0),
                 },
                 rssi_dbm: ns.rssi_history.back().copied().unwrap_or(0.0),
                 last_seen_ms,
@@ -6818,6 +6825,7 @@ async fn udp_receiver_task(
                         classification.confidence =
                             (conf * 0.7 + classification.confidence * 0.3).clamp(0.0, 1.0);
                     }
+                    ns.smoothed_classification_confidence = classification.confidence;
 
                     ns.rssi_history.push_back(features.mean_rssi);
                     if ns.rssi_history.len() > 60 {
