@@ -60,18 +60,15 @@ pub fn node_frame_from_state(node_id: u8, ns: &NodeState) -> Option<MultiBandCsi
     let n_sub = amplitude.len();
     let phase = vec![0.0_f32; n_sub];
 
-    // Prefer the capture timestamp recovered from the node's mesh sync. This
-    // keeps UDP scheduling jitter out of the fuser's cross-node guard. Older
-    // firmware, stale sync state, and frames without the sync-valid bit retain
-    // the process-local host-arrival fallback.
-    let timestamp_us = ns
-        .mesh_aligned_us_for_latest_csi_frame()
-        .unwrap_or_else(|| {
-            last_time
-                .checked_duration_since(*EPOCH)
-                .unwrap_or_default()
-                .as_micros() as u64
-        });
+    // Use process-local host-arrival time only. Preferring each node's
+    // mesh-synced clock (#1669) regressed badly when a node's ESP-NOW mesh
+    // sync was unconverged or mid-re-election: timestamps flipped between
+    // corrected mesh time and raw boot-relative time, producing multi-hour
+    // spreads that blew the fuser's cross-node guard interval.
+    let timestamp_us = last_time
+        .checked_duration_since(*EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64;
 
     let canonical = CanonicalCsiFrame {
         amplitude,
@@ -266,20 +263,32 @@ mod tests {
         ns.observe_accepted_csi_frame(frame_sequence, true, host_arrival);
     }
 
+    // A node's ESP-NOW mesh-sync clock is not trusted as a timestamp source
+    // (reverted from #1669): unconverged or mid-re-election mesh sync flips
+    // between corrected mesh time and raw boot-relative time, producing
+    // multi-hour timestamp spreads in the field. Host-arrival time is used
+    // unconditionally, even when a node reports a nominally valid sync.
     #[test]
-    fn mesh_timestamp_replaces_skewed_host_arrival_time() {
+    fn mesh_timestamp_is_ignored_in_favor_of_host_arrival_time() {
         let mut history = VecDeque::new();
         history.push_back(vec![10.0, 20.0, 30.0]);
         let host_arrival = Instant::now();
         let mut ns = make_node_state(history, None, 0);
         mark_mesh_timed_frame(&mut ns, 1, 100, 101, 1_000_000, host_arrival);
 
-        let frame = node_frame_from_state(1, &ns).expect("mesh-timed frame");
-        assert_eq!(frame.timestamp_us, 1_050_000);
+        let frame = node_frame_from_state(1, &ns).expect("frame");
+        let expected_us = host_arrival
+            .checked_duration_since(*EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        assert_eq!(
+            frame.timestamp_us, expected_us,
+            "a valid mesh sync packet must not override the host-arrival timestamp"
+        );
     }
 
     #[test]
-    fn mesh_time_allows_fusion_despite_udp_arrival_skew() {
+    fn udp_arrival_skew_trips_guard_even_with_valid_mesh_sync() {
         let base = Instant::now() - Duration::from_millis(500);
         let mut states = HashMap::new();
 
@@ -305,10 +314,13 @@ mod tests {
         let frames = node_frames_from_states(&states);
         let spread = frames.iter().map(|f| f.timestamp_us).max().unwrap()
             - frames.iter().map(|f| f.timestamp_us).min().unwrap();
-        assert_eq!(spread, 5_000, "mesh capture spread, not 200 ms UDP skew");
+        assert_eq!(
+            spread, 200_000,
+            "spread must reflect the real 200 ms UDP arrival gap, not the 5 ms mesh clock gap"
+        );
         assert!(
-            MultistaticFuser::new().fuse(&frames).is_ok(),
-            "mesh-aligned frames inside the 60 ms guard must fuse"
+            MultistaticFuser::new().fuse(&frames).is_err(),
+            "200 ms UDP skew must trip the 60 ms guard now that mesh time is not trusted"
         );
     }
 
