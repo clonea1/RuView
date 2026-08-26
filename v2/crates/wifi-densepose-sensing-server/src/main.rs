@@ -1400,6 +1400,9 @@ struct AppStateInner {
     last_tracker_instant: Option<std::time::Instant>,
     /// Attention-weighted multi-node CSI fusion engine.
     multistatic_fuser: MultistaticFuser,
+    /// Node positions parsed from --node-positions, keyed by 0-based index
+    /// into the parsed list (which corresponds to node_id).
+    node_positions_config: HashMap<u8, [f32; 3]>,
     /// Governed trust-path bridge (ADR-135..146): runs the same live frames
     /// through the privacy/provenance/witness control plane. Does not alter
     /// person-count behavior; its trust state (witness, effective class,
@@ -1661,6 +1664,7 @@ impl AppStateInner {
             pose_tracker: PoseTracker::new(),
             last_tracker_instant: None,
             multistatic_fuser: MultistaticFuser::new(),
+            node_positions_config: HashMap::new(),
             engine_bridge: engine_bridge::EngineBridge::new(
                 wifi_densepose_bfld::PrivacyMode::PrivateHome,
                 1,
@@ -6461,7 +6465,11 @@ async fn udp_receiver_task(
                         .map(|(&id, n)| NodeInfo {
                             node_id: id,
                             rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
-                            position: [2.0, 0.0, 1.5],
+                            position: s
+                                .node_positions_config
+                                .get(&id)
+                                .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+                                .unwrap_or([2.0, 0.0, 1.5]),
                             amplitude: vec![],
                             subcarrier_count: 0,
                             // Vitals-only path; still expose the sync snapshot
@@ -6944,7 +6952,11 @@ async fn udp_receiver_task(
                         .map(|(&id, n)| NodeInfo {
                             node_id: id,
                             rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
-                            position: [2.0, 0.0, 1.5],
+                            position: s
+                                .node_positions_config
+                                .get(&id)
+                                .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+                                .unwrap_or([2.0, 0.0, 1.5]),
                             amplitude: if suppress_raw {
                                 vec![]
                             } else {
@@ -8515,7 +8527,7 @@ async fn main() {
     // threaded into `engine_bridge` so both fusion paths honor the same
     // WDP_TDM_SLOTS/WDP_GUARD_INTERVAL_US-derived guard (#1049/#1057).
     let mut engine_bridge_multistatic_cfg: Option<MultistaticConfig> = None;
-
+    let mut node_positions_config: HashMap<u8, [f32; 3]> = HashMap::new();
     let state: SharedState = Arc::new(RwLock::new(AppStateInner {
         latest_update: None,
         rssi_history: VecDeque::new(),
@@ -8606,6 +8618,9 @@ async fn main() {
                         "Configured {} node positions for multistatic fusion",
                         positions.len()
                     );
+                    for (idx, p) in positions.iter().enumerate() {
+                        node_positions_config.insert(idx as u8, *p);
+                    }
                     fuser.set_node_positions(positions);
                 }
             }
@@ -8615,6 +8630,7 @@ async fn main() {
             });
             fuser
         },
+        node_positions_config,
         engine_bridge: engine_bridge::EngineBridge::new(
             wifi_densepose_bfld::PrivacyMode::PrivateHome,
             1,
