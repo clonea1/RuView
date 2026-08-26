@@ -363,6 +363,15 @@ class SensingService {
   // ---- Data handling -----------------------------------------------------
 
   _handleData(data) {
+    // The server broadcasts several message shapes on the same channel
+    // (vendor_rf events, wasm_events, edge_vitals heartbeats, ...) besides
+    // full sensing_update snapshots. Without this filter, a non-sensing
+    // message (no `nodes`/`features`/`classification`) was rendered as if
+    // it were one, and every UI fallback fired at once: 0 nodes, "ABSENT",
+    // 0% confidence, -80 dBm RSSI — the intermittent "nodes dropping out"
+    // seen even while the server's own sensing state stayed stable.
+    if (data.type !== 'sensing_update') return;
+
     this._lastMessage = data;
 
     // Track the server's source field from each frame so the UI

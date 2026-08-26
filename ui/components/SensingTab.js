@@ -248,7 +248,7 @@ export class SensingTab {
     if (countEl) countEl.textContent = String(nodeCount);
 
     // RSSI
-    this._setText('sensingRssi', `${(f.mean_rssi || -80).toFixed(1)} dBm`);
+    this._setText('sensingRssi', `${(f.mean_rssi ?? -80).toFixed(1)} dBm`);
     this._setText('sensingSource', data.source || '');
 
     // Bars (scale to 0-100%)
