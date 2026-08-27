@@ -2792,6 +2792,21 @@ const NODE_BASELINE_TIME_CONSTANT_SECS: f64 = 33.28;
 /// [`smooth_and_classify_node`] (originally 50 frames at 10 FPS = 5s).
 const NODE_BASELINE_WARMUP_SECS: f64 = 5.0;
 
+/// Fraction of the learned "quiet room" baseline subtracted from the raw
+/// motion score before smoothing (`smooth_and_classify`/
+/// `smooth_and_classify_node`). Was `0.7`, always leaving 30% of the room's
+/// true noise floor as residual "motion" by construction — the concrete,
+/// still-unproven lead for the room reading `present_moving` continuously
+/// even when empty/still. Raised to `0.95` to test that theory: if the
+/// residual noise floor was the cause, `smoothed_motion` (and the
+/// motion-weighted centroid's `total_weight` log line) should now drop
+/// toward 0 in a genuinely empty room, and should meaningfully differ
+/// between nodes when someone stands near one vs. far from all three
+/// (previously it did not — walking up to each sensor didn't move the
+/// motion-centroid dot at all, consistent with the noise floor swamping any
+/// real per-node signal).
+const BASELINE_SUBTRACTION_FRACTION: f64 = 0.95;
+
 /// Apply EMA smoothing, adaptive baseline subtraction, and hysteresis debounce
 /// to the raw classification.  Mutates the smoothing state in `AppStateInner`.
 fn smooth_and_classify(state: &mut AppStateInner, raw: &mut ClassificationInfo, raw_motion: f64) {
@@ -2808,7 +2823,7 @@ fn smooth_and_classify(state: &mut AppStateInner, raw: &mut ClassificationInfo, 
     }
 
     // 2. Subtract baseline and clamp.
-    let adjusted = (raw_motion - state.baseline_motion * 0.7).max(0.0);
+    let adjusted = (raw_motion - state.baseline_motion * BASELINE_SUBTRACTION_FRACTION).max(0.0);
 
     // 3. EMA smooth the adjusted score.
     state.smoothed_motion =
@@ -2863,7 +2878,7 @@ fn smooth_and_classify_node(ns: &mut NodeState, raw: &mut ClassificationInfo, ra
             ns.baseline_motion * (1.0 - baseline_alpha) + raw_motion * baseline_alpha;
     }
 
-    let adjusted = (raw_motion - ns.baseline_motion * 0.7).max(0.0);
+    let adjusted = (raw_motion - ns.baseline_motion * BASELINE_SUBTRACTION_FRACTION).max(0.0);
 
     ns.smoothed_motion = ns.smoothed_motion * (1.0 - motion_alpha) + adjusted * motion_alpha;
     let sm = ns.smoothed_motion;
