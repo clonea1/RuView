@@ -17,6 +17,7 @@ const CANVAS_W = 640;
 const CANVAS_H = 480;
 const MARGIN = 32;
 const NODE_RADIUS = 9;
+const AP_RADIUS = 8;
 const LIVE_DOT_RADIUS = 8;
 const METERS_PER_FOOT = 0.3048;
 const UNITS_STORAGE_KEY = 'roombuilder-units';
@@ -25,19 +26,23 @@ export class RoomBuilderTab {
   /** @param {HTMLElement} container - the #roombuilder section element */
   constructor(container) {
     this.container = container;
-    this.config = { width_m: 5, depth_m: 4, nodes: [] };
+    this.config = { width_m: 5, depth_m: 4, nodes: [], ap_position: null };
     this._dragIndex = null;
+    this._draggingAp = false;
     this._loaded = false;
     // Live tracked-position overlay, fed by sensingService (/ws/sensing).
-    // `_liveDot` is only ever set from a `position_source: "motion_centroid"`
-    // estimate (real room-space meters, same convention as this.config.nodes,
-    // and a genuine — if heuristic — signal: nodes seeing more measured
-    // motion pull the estimate toward themselves) — a "field_peak" fix lives
-    // in the Observatory's own grid-centered coordinate frame (unrelated to
-    // this room's actual width_m/depth_m), so plotting it here would be a
-    // fabricated-looking position. `_liveStatus` explains why no dot is
-    // showing when that's the case.
+    // `_liveDot` is only ever set from a "doppler_centroid" or
+    // "motion_centroid" position_source (real room-space meters, same
+    // convention as this.config.nodes — both are genuine, if heuristic,
+    // signals: nodes seeing more measured disturbance pull the estimate
+    // toward themselves) — a "field_peak" fix lives in the Observatory's own
+    // grid-centered coordinate frame (unrelated to this room's actual
+    // width_m/depth_m), so plotting it here would be a fabricated-looking
+    // position. `_liveStatus` explains why no dot is showing when that's the
+    // case. `_liveDotSource` records which tier produced the current dot, so
+    // the canvas label can say which one is actually driving it.
     this._liveDot = null;
+    this._liveDotSource = null;
     this._liveStatus = 'Waiting for live sensing data…';
     this._unsubSensingData = null;
     // Display-only - this.config always stays in meters (that's what the
@@ -78,6 +83,7 @@ export class RoomBuilderTab {
     const persons = Array.isArray(data.persons) ? data.persons : [];
     if (persons.length === 0) {
       this._liveDot = null;
+      this._liveDotSource = null;
       this._liveStatus = 'No person currently detected.';
       const idleStatusEl = this.container.querySelector('#rbLiveStatus');
       if (idleStatusEl) idleStatusEl.textContent = this._liveStatus;
@@ -85,28 +91,35 @@ export class RoomBuilderTab {
       return;
     }
 
-    // With today's motion-weighted centroid, all persons share the one
-    // estimate (single-target only for now) — show just the first to avoid
-    // clutter from the tracker's occasional duplicate/ghost detections.
+    // With today's centroid methods, all persons share the one estimate
+    // (single-target only for now) — show just the first to avoid clutter
+    // from the tracker's occasional duplicate/ghost detections.
     const p = persons[0];
     const nodeCount = Array.isArray(data.nodes) ? data.nodes.length : 0;
+    const ROOM_SPACE_SOURCES = {
+      doppler_centroid: 'Live Doppler-weighted centroid — a heuristic estimate, not a calibrated fix.',
+      motion_centroid: 'Live motion-weighted centroid — a heuristic estimate, not a calibrated fix.',
+    };
 
-    if (p.position_source === 'motion_centroid' && Array.isArray(p.position)) {
+    if (ROOM_SPACE_SOURCES[p.position_source] && Array.isArray(p.position)) {
       const [x, y] = p.position;
       if (Number.isFinite(x) && Number.isFinite(y)) {
         this._liveDot = { x, y };
-        this._liveStatus = 'Live motion-weighted centroid — a heuristic estimate, not a calibrated fix.';
+        this._liveDotSource = p.position_source;
+        this._liveStatus = ROOM_SPACE_SOURCES[p.position_source];
       } else {
         this._liveDot = null;
-        this._liveStatus = 'Motion centroid reported non-finite coordinates — not plotted.';
+        this._liveDotSource = null;
+        this._liveStatus = `${p.position_source} reported non-finite coordinates — not plotted.`;
       }
     } else {
       // field_peak positions live in the Observatory's own grid-centered
       // coordinate frame, not this room's meters/NW-origin frame — plotting
       // them here would be misleading, so we explain instead of drawing.
       this._liveDot = null;
-      this._liveStatus = `No motion-weighted estimate yet — only ${nodeCount} node(s) reporting, `
-        + `or not enough measured motion right now (need ≥ 2 positioned nodes with real `
+      this._liveDotSource = null;
+      this._liveStatus = `No room-space estimate yet — only ${nodeCount} node(s) reporting, `
+        + `or not enough measured motion right now (need >= 2 positioned nodes with real `
         + `disturbance). Showing the Observatory's field-peak fallback instead, which isn't `
         + `in this room's coordinates.`;
     }
@@ -173,6 +186,23 @@ export class RoomBuilderTab {
             </div>
           </div>
           <div class="rb-card">
+            <div class="rb-card-title">Access Point</div>
+            <p class="rb-hint" style="margin-top:0;">
+              Optional — needed for Doppler-based position geometry. One AP,
+              same room-space meters as the nodes above (it's often outside
+              the room itself — a hallway, another floor — and that's fine).
+            </p>
+            <div class="rb-room-dims" id="rbApFields" style="${this.config.ap_position ? '' : 'display:none;'}">
+              <label><span>X (<span class="rb-unit-label">${this._unitLabel()}</span>)</span> <input type="number" id="rbApX" step="0.05" value="${this._toDisplay(this.config.ap_position?.[0] ?? 0).toFixed(2)}"></label>
+              <label><span>Y (<span class="rb-unit-label">${this._unitLabel()}</span>)</span> <input type="number" id="rbApY" step="0.05" value="${this._toDisplay(this.config.ap_position?.[1] ?? 0).toFixed(2)}"></label>
+              <label><span>Z (<span class="rb-unit-label">${this._unitLabel()}</span>)</span> <input type="number" id="rbApZ" step="0.05" value="${this._toDisplay(this.config.ap_position?.[2] ?? 0).toFixed(2)}"></label>
+            </div>
+            <div class="rb-actions" style="margin-top:${this.config.ap_position ? '10px' : '0'};">
+              <button class="rb-btn secondary" id="rbAddAp" style="${this.config.ap_position ? 'display:none;' : ''}">+ Set AP Position</button>
+              <button class="rb-btn secondary" id="rbRemoveAp" style="${this.config.ap_position ? '' : 'display:none;'}">Remove AP</button>
+            </div>
+          </div>
+          <div class="rb-card">
             <div class="rb-card-title">Sensor Nodes</div>
             <div class="rb-col-headers">
               <span>ID</span><span>Label</span><span>X (<span class="rb-unit-label">${this._unitLabel()}</span>)</span><span>Y (<span class="rb-unit-label">${this._unitLabel()}</span>)</span><span>Z (<span class="rb-unit-label">${this._unitLabel()}</span>)</span><span></span><span></span>
@@ -187,15 +217,17 @@ export class RoomBuilderTab {
             <button class="rb-btn secondary" id="rbReload" title="Discard unsaved changes and reload the last saved config">Reload from Saved</button>
           </div>
           <p class="rb-hint">
-            Drag a node on the canvas to reposition it (X/Y only — set height
-            with the Z field). Coordinates are in the same room-space meters
-            used by <code>--node-positions</code>.
+            Drag a node — or the AP marker (violet diamond), once set — on the
+            canvas to reposition it (X/Y only — set height with the Z field).
+            Coordinates are in the same room-space meters used by
+            <code>--node-positions</code>.
           </p>
           <p class="rb-hint">
             <strong>(0, 0)</strong> is the room's <strong>Northwest</strong> corner
             (the <strong>N</strong> arrow on the canvas points that way) — X increases
             going <strong>East</strong>, Y increases going <strong>South</strong>. Face
-            the room's actual north wall and match it up when you place nodes.
+            the room's actual north wall and match it up when you place nodes
+            and the access point.
           </p>
         </div>
       </div>
@@ -223,6 +255,22 @@ export class RoomBuilderTab {
     this.container.querySelector('#rbAddNode').addEventListener('click', () => {
       this._addNode();
     });
+    this.container.querySelector('#rbAddAp').addEventListener('click', () => {
+      this.config.ap_position = [this.config.width_m / 2, this.config.depth_m / 2, 2.5];
+      this._renderApFields();
+      this._render();
+    });
+    this.container.querySelector('#rbRemoveAp').addEventListener('click', () => {
+      this.config.ap_position = null;
+      this._renderApFields();
+      this._render();
+    });
+    ['rbApX', 'rbApY', 'rbApZ'].forEach((id) => {
+      this.container.querySelector(`#${id}`).addEventListener('input', () => {
+        this._syncApFromInputs();
+        this._render();
+      });
+    });
     this.container.querySelector('#rbSave').addEventListener('click', () => {
       this._save();
     });
@@ -234,7 +282,7 @@ export class RoomBuilderTab {
     const canvas = this.container.querySelector('#rbCanvas');
     canvas.addEventListener('mousedown', (e) => this._onCanvasDown(e));
     canvas.addEventListener('mousemove', (e) => this._onCanvasMove(e));
-    window.addEventListener('mouseup', () => { this._dragIndex = null; });
+    window.addEventListener('mouseup', () => { this._dragIndex = null; this._draggingAp = false; });
   }
 
   // ---- Data -----------------------------------------------------------------
@@ -247,6 +295,7 @@ export class RoomBuilderTab {
           width_m: data.width_m > 0 ? data.width_m : 5,
           depth_m: data.depth_m > 0 ? data.depth_m : 4,
           nodes: Array.isArray(data.nodes) ? data.nodes : [],
+          ap_position: Array.isArray(data.ap_position) ? data.ap_position : null,
         };
       }
     } catch (e) {
@@ -267,13 +316,43 @@ export class RoomBuilderTab {
     this.container.querySelector('#rbWidth').value = this._toDisplay(this.config.width_m).toFixed(2);
     this.container.querySelector('#rbDepth').value = this._toDisplay(this.config.depth_m).toFixed(2);
     this._renderNodeList();
+    this._renderApFields();
     this._render();
   }
 
+  /** Show/hide the AP X/Y/Z fields and Add/Remove buttons based on whether
+   * ap_position is set, and refresh the input values from this.config. */
+  _renderApFields() {
+    const fields = this.container.querySelector('#rbApFields');
+    const addBtn = this.container.querySelector('#rbAddAp');
+    const removeBtn = this.container.querySelector('#rbRemoveAp');
+    const has = Array.isArray(this.config.ap_position);
+    fields.style.display = has ? '' : 'none';
+    addBtn.style.display = has ? 'none' : '';
+    removeBtn.style.display = has ? '' : 'none';
+    if (has) {
+      const [x, y, z] = this.config.ap_position;
+      this.container.querySelector('#rbApX').value = this._toDisplay(x).toFixed(2);
+      this.container.querySelector('#rbApY').value = this._toDisplay(y).toFixed(2);
+      this.container.querySelector('#rbApZ').value = this._toDisplay(z).toFixed(2);
+    }
+  }
+
+  /** Pull edited values out of the AP X/Y/Z inputs back into
+   * this.config.ap_position, same pattern as _syncNodesFromInputs. */
+  _syncApFromInputs() {
+    if (!Array.isArray(this.config.ap_position)) return;
+    const x = this._fromDisplay(parseFloat(this.container.querySelector('#rbApX').value) || 0);
+    const y = this._fromDisplay(parseFloat(this.container.querySelector('#rbApY').value) || 0);
+    const z = this._fromDisplay(parseFloat(this.container.querySelector('#rbApZ').value) || 0);
+    this.config.ap_position = [x, y, z];
+  }
+
   async _save() {
-    // Pull the latest values out of the node-row inputs before sending -
+    // Pull the latest values out of the node-row/AP inputs before sending -
     // numeric fields don't write back into this.config until blur/save.
     this._syncNodesFromInputs();
+    this._syncApFromInputs();
     const ids = this.config.nodes.map((n) => n.id);
     if (new Set(ids).size !== ids.length) {
       toastManager.error('Cannot save: two or more nodes have the same ID. Give each a unique ID first.');
@@ -405,14 +484,20 @@ export class RoomBuilderTab {
     return { px: MARGIN + x * scale, py: MARGIN + y * scale, scale };
   }
 
-  /** Canvas pixel coordinates -> room-space (x,y) meters, clamped to the room. */
-  _toRoom(px, py) {
+  /** Canvas pixel coordinates -> room-space (x,y) meters. Clamped to the room
+   * by default (sensor nodes always live inside it); pass `clamp: false` for
+   * the AP marker, which is legitimately often outside the room. */
+  _toRoom(px, py, { clamp = true } = {}) {
     const scale = Math.min(
       (CANVAS_W - 2 * MARGIN) / this.config.width_m,
       (CANVAS_H - 2 * MARGIN) / this.config.depth_m
     );
-    const x = Math.min(this.config.width_m, Math.max(0, (px - MARGIN) / scale));
-    const y = Math.min(this.config.depth_m, Math.max(0, (py - MARGIN) / scale));
+    let x = (px - MARGIN) / scale;
+    let y = (py - MARGIN) / scale;
+    if (clamp) {
+      x = Math.min(this.config.width_m, Math.max(0, x));
+      y = Math.min(this.config.depth_m, Math.max(0, y));
+    }
     return { x, y };
   }
 
@@ -427,6 +512,13 @@ export class RoomBuilderTab {
 
   _onCanvasDown(e) {
     const pos = this._canvasPos(e);
+    if (Array.isArray(this.config.ap_position)) {
+      const { px, py } = this._toPixel(this.config.ap_position[0], this.config.ap_position[1]);
+      if (Math.hypot(px - pos.x, py - pos.y) <= AP_RADIUS + 4) {
+        this._draggingAp = true;
+        return;
+      }
+    }
     this.config.nodes.forEach((node, idx) => {
       const { px, py } = this._toPixel(node.x, node.y);
       if (this._dragIndex == null && Math.hypot(px - pos.x, py - pos.y) <= NODE_RADIUS + 4) {
@@ -436,6 +528,15 @@ export class RoomBuilderTab {
   }
 
   _onCanvasMove(e) {
+    if (this._draggingAp) {
+      const pos = this._canvasPos(e);
+      const room = this._toRoom(pos.x, pos.y, { clamp: false });
+      this.config.ap_position[0] = Math.round(room.x * 100) / 100;
+      this.config.ap_position[1] = Math.round(room.y * 100) / 100;
+      this._renderApFields();
+      this._render();
+      return;
+    }
     if (this._dragIndex == null) return;
     const node = this.config.nodes[this._dragIndex];
     if (!node) return;
@@ -500,12 +601,41 @@ export class RoomBuilderTab {
       ctx.fillText(label, px, py - NODE_RADIUS - 6);
     });
 
+    this._drawAp(ctx);
     this._drawLiveDot(ctx);
     this._drawCompass(ctx);
   }
 
-  /** Draw the live trilaterated person fix, when one exists. Pulses gently
-   * so it reads as "live" rather than a static marker like the sensor nodes. */
+  /** Draw the AP marker (a diamond, distinct from the round sensor nodes) —
+   * intentionally NOT clamped/warned about being outside the room rectangle,
+   * since a real AP very often is (see validate_room_config on the server). */
+  _drawAp(ctx) {
+    if (!Array.isArray(this.config.ap_position)) return;
+    const [x, y] = this.config.ap_position;
+    const { px, py } = this._toPixel(x, y);
+    if (!Number.isFinite(px) || !Number.isFinite(py)) return;
+
+    ctx.save();
+    ctx.translate(px, py);
+    ctx.rotate(Math.PI / 4);
+    const s = AP_RADIUS;
+    ctx.fillStyle = this._draggingAp ? '#ffd166' : '#a78bfa';
+    ctx.fillRect(-s, -s, s * 2, s * 2);
+    ctx.strokeStyle = '#0d1117';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(-s, -s, s * 2, s * 2);
+    ctx.restore();
+
+    ctx.fillStyle = '#e6e9ef';
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('AP', px, py - AP_RADIUS - 8);
+  }
+
+  /** Draw the live person-position estimate, when one exists. Pulses gently
+   * so it reads as "live" rather than a static marker like the sensor nodes.
+   * Label states which tier produced it (doppler vs motion) so it's never
+   * mistaken for a calibrated fix. */
   _drawLiveDot(ctx) {
     if (!this._liveDot) return;
     const { px, py } = this._toPixel(this._liveDot.x, this._liveDot.y);
@@ -523,7 +653,8 @@ export class RoomBuilderTab {
     ctx.fillStyle = '#ffd166';
     ctx.font = 'bold 12px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText('live', px, py - LIVE_DOT_RADIUS - 8);
+    const label = this._liveDotSource === 'doppler_centroid' ? 'live (doppler)' : 'live (motion)';
+    ctx.fillText(label, px, py - LIVE_DOT_RADIUS - 8);
 
     // Keep animating the pulse while a fix is present.
     if (!this._liveDotAnimHandle) {
