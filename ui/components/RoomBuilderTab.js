@@ -10,12 +10,14 @@
 
 import { apiService } from '../services/api.service.js';
 import { toastManager } from '../utils/toast.js';
+import { sensingService } from '../services/sensing.service.js';
 
 const ENDPOINT = '/api/v1/config/room';
 const CANVAS_W = 640;
 const CANVAS_H = 480;
 const MARGIN = 32;
 const NODE_RADIUS = 9;
+const LIVE_DOT_RADIUS = 8;
 const METERS_PER_FOOT = 0.3048;
 const UNITS_STORAGE_KEY = 'roombuilder-units';
 
@@ -26,6 +28,18 @@ export class RoomBuilderTab {
     this.config = { width_m: 5, depth_m: 4, nodes: [] };
     this._dragIndex = null;
     this._loaded = false;
+    // Live tracked-position overlay, fed by sensingService (/ws/sensing).
+    // `_liveDot` is only ever set from a `position_source: "motion_centroid"`
+    // estimate (real room-space meters, same convention as this.config.nodes,
+    // and a genuine — if heuristic — signal: nodes seeing more measured
+    // motion pull the estimate toward themselves) — a "field_peak" fix lives
+    // in the Observatory's own grid-centered coordinate frame (unrelated to
+    // this room's actual width_m/depth_m), so plotting it here would be a
+    // fabricated-looking position. `_liveStatus` explains why no dot is
+    // showing when that's the case.
+    this._liveDot = null;
+    this._liveStatus = 'Waiting for live sensing data…';
+    this._unsubSensingData = null;
     // Display-only - this.config always stays in meters (that's what the
     // server/API/saved file use); only input values and labels convert.
     this._units = 'metric';
@@ -53,6 +67,52 @@ export class RoomBuilderTab {
     this._buildDOM();
     this._wireEvents();
     await this._load();
+    // sensingService is a singleton started once globally (app.js); we just
+    // subscribe here, same pattern as DashboardTab's live-data subscription.
+    this._unsubSensingData = sensingService.onData((data) => this._onSensingData(data));
+  }
+
+  // ---- Live position overlay ---------------------------------------------
+
+  _onSensingData(data) {
+    const persons = Array.isArray(data.persons) ? data.persons : [];
+    if (persons.length === 0) {
+      this._liveDot = null;
+      this._liveStatus = 'No person currently detected.';
+      const idleStatusEl = this.container.querySelector('#rbLiveStatus');
+      if (idleStatusEl) idleStatusEl.textContent = this._liveStatus;
+      this._render();
+      return;
+    }
+
+    // With today's motion-weighted centroid, all persons share the one
+    // estimate (single-target only for now) — show just the first to avoid
+    // clutter from the tracker's occasional duplicate/ghost detections.
+    const p = persons[0];
+    const nodeCount = Array.isArray(data.nodes) ? data.nodes.length : 0;
+
+    if (p.position_source === 'motion_centroid' && Array.isArray(p.position)) {
+      const [x, y] = p.position;
+      if (Number.isFinite(x) && Number.isFinite(y)) {
+        this._liveDot = { x, y };
+        this._liveStatus = 'Live motion-weighted centroid — a heuristic estimate, not a calibrated fix.';
+      } else {
+        this._liveDot = null;
+        this._liveStatus = 'Motion centroid reported non-finite coordinates — not plotted.';
+      }
+    } else {
+      // field_peak positions live in the Observatory's own grid-centered
+      // coordinate frame, not this room's meters/NW-origin frame — plotting
+      // them here would be misleading, so we explain instead of drawing.
+      this._liveDot = null;
+      this._liveStatus = `No motion-weighted estimate yet — only ${nodeCount} node(s) reporting, `
+        + `or not enough measured motion right now (need ≥ 2 positioned nodes with real `
+        + `disturbance). Showing the Observatory's field-peak fallback instead, which isn't `
+        + `in this room's coordinates.`;
+    }
+    const statusEl = this.container.querySelector('#rbLiveStatus');
+    if (statusEl) statusEl.textContent = this._liveStatus;
+    this._render();
   }
 
   // ---- DOM ----------------------------------------------------------------
@@ -96,6 +156,7 @@ export class RoomBuilderTab {
       <div class="rb-layout">
         <div class="rb-canvas-wrap">
           <canvas id="rbCanvas" width="${CANVAS_W}" height="${CANVAS_H}"></canvas>
+          <p class="rb-hint" id="rbLiveStatus" style="margin:8px 2px 0;">Waiting for live sensing data…</p>
         </div>
         <div class="rb-panel">
           <div class="rb-card">
@@ -439,7 +500,40 @@ export class RoomBuilderTab {
       ctx.fillText(label, px, py - NODE_RADIUS - 6);
     });
 
+    this._drawLiveDot(ctx);
     this._drawCompass(ctx);
+  }
+
+  /** Draw the live trilaterated person fix, when one exists. Pulses gently
+   * so it reads as "live" rather than a static marker like the sensor nodes. */
+  _drawLiveDot(ctx) {
+    if (!this._liveDot) return;
+    const { px, py } = this._toPixel(this._liveDot.x, this._liveDot.y);
+    if (!Number.isFinite(px) || !Number.isFinite(py)) return;
+
+    const pulse = 1 + 0.15 * Math.sin(Date.now() / 300);
+    ctx.beginPath();
+    ctx.arc(px, py, LIVE_DOT_RADIUS * pulse, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255, 209, 102, 0.9)';
+    ctx.fill();
+    ctx.strokeStyle = '#0d1117';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    ctx.fillStyle = '#ffd166';
+    ctx.font = 'bold 12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('live', px, py - LIVE_DOT_RADIUS - 8);
+
+    // Keep animating the pulse while a fix is present.
+    if (!this._liveDotAnimHandle) {
+      const animate = () => {
+        if (!this._liveDot) { this._liveDotAnimHandle = null; return; }
+        this._render();
+        this._liveDotAnimHandle = requestAnimationFrame(animate);
+      };
+      this._liveDotAnimHandle = requestAnimationFrame(animate);
+    }
   }
 
   /** (0,0,0) is the room's Northwest corner by convention - X increases
