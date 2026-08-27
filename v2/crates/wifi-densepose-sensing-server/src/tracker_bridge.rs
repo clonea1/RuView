@@ -176,11 +176,13 @@ pub fn tracker_to_person_detections(tracker: &PoseTracker) -> Vec<PersonDetectio
                 keypoints,
                 bbox,
                 zone: "tracked".to_string(),
-                // Field-derived position/motion_score/pose are (re)attached from
-                // the live signal_field by `attach_field_positions` after this
-                // tracker step (#1050); the Kalman tracker smooths keypoints only,
-                // so we default here and let the field readout fill them in.
+                // Position/motion_score/pose are (re)attached from real
+                // trilateration or the live signal_field by `attach_positions`
+                // after this tracker step (#1050); the Kalman tracker smooths
+                // keypoints only, so we default here and let that fill them in.
                 position: [0.0, 0.0, 0.0],
+                position_source: "field_peak".to_string(),
+                position_uncertainty_m: None,
                 motion_score: 0.0,
                 pose: None,
             }
@@ -337,6 +339,8 @@ mod tests {
             },
             zone: "test".to_string(),
             position: [0.0, 0.0, 0.0],
+            position_source: "field_peak".to_string(),
+            position_uncertainty_m: None,
             motion_score: 0.0,
             pose: None,
         }

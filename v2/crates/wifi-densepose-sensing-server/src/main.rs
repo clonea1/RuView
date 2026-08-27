@@ -620,14 +620,25 @@ struct PersonDetection {
     keypoints: Vec<PoseKeypoint>,
     bbox: BoundingBox,
     zone: String,
-    /// Room-world position `[x, y, z]` (Observatory scene units / meters),
-    /// derived from the strongest `signal_field` peak this person sits on
-    /// (issue #1050). `y` is `0.0` — the field is a floor-plane grid. This is
-    /// a real field-peak readout, not calibrated triangulation; see
-    /// `field_localize` for the honesty caveat. Defaults to `[0,0,0]` until
-    /// field positions are attached by `attach_field_positions`.
+    /// Room-world position `[x, y, z]` (meters). Either a real RSSI
+    /// trilateration fix (`position_source == "trilateration"`) or, when
+    /// fewer than 3 positioned nodes are available, the strongest
+    /// `signal_field` peak this person sits on (issue #1050,
+    /// `position_source == "field_peak"`). Defaults to `[0,0,0]` until
+    /// positions are attached by `attach_positions`.
     #[serde(default)]
     position: [f64; 3],
+    /// Where `position` came from: `"trilateration"` (real RSSI
+    /// multilateration from ≥3 positioned nodes, see `triangulate_from_nodes`)
+    /// or `"field_peak"` (signal_field heuristic readout — not calibrated
+    /// triangulation, see `field_localize` for the honesty caveat).
+    #[serde(default = "default_position_source")]
+    position_source: String,
+    /// Horizontal 95%-confidence error radius (meters) from the trilateration
+    /// solver's least-squares residuals. `None` when `position_source` is
+    /// `"field_peak"` (no comparable error model exists for that path).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    position_uncertainty_m: Option<f64>,
     /// Motion magnitude on the Observatory's `0..100` scale, passed through
     /// from the measured `motion_band_power` (issue #1050).
     #[serde(default)]
@@ -3336,8 +3347,8 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
         if !tracked.is_empty() {
             update.persons = Some(tracked);
         }
-        // #1050: attach real signal_field-peak positions to each person.
-        attach_field_positions(&mut update);
+        // Single-node path — no multi-node geometry to trilaterate from.
+        attach_positions(&mut update, None);
         assess_legacy_image_pose(&mut s, &update);
 
         if let Ok(json) = serde_json::to_string(&update) {
@@ -3496,8 +3507,8 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
     if !tracked.is_empty() {
         update.persons = Some(tracked);
     }
-    // #1050: attach real signal_field-peak positions to each person.
-    attach_field_positions(&mut update);
+    // Single-node path — no multi-node geometry to trilaterate from.
+    attach_positions(&mut update, None);
     assess_legacy_image_pose(&mut s, &update);
 
     if let Ok(json) = serde_json::to_string(&update) {
@@ -3959,6 +3970,8 @@ async fn handle_ws_pose_client(mut socket: WebSocket, state: SharedState) {
                                             keypoints,
                                             zone: "zone_1".into(),
                                             position: peak.map_or([0.0, 0.0, 0.0], |p| p.position),
+                                            position_source: "field_peak".to_string(),
+                                            position_uncertainty_m: None,
                                             motion_score: field_localize::motion_score_from_power(
                                                 sensing.features.motion_band_power,
                                             ),
@@ -4857,10 +4870,13 @@ fn derive_single_person_pose(
             height: (max_y - min_y).max(160.0),
         },
         zone: format!("zone_{}", person_idx + 1),
-        // Position/motion_score/pose are attached from the real signal_field
-        // peaks by `attach_field_positions` after the tracker step (#1050);
-        // default here so the synthetic-skeleton geometry stays unchanged.
+        // Position/motion_score/pose are attached from real trilateration or
+        // signal_field peaks by `attach_positions` after the tracker step
+        // (#1050); default here so the synthetic-skeleton geometry stays
+        // unchanged.
         position: [0.0, 0.0, 0.0],
+        position_source: "field_peak".to_string(),
+        position_uncertainty_m: None,
         motion_score: 0.0,
         pose: None,
     }
@@ -4952,7 +4968,141 @@ fn emit_rufield_event(s: &AppStateInner, update: &SensingUpdate, node_id: u8) {
     }
 }
 
-fn attach_field_positions(update: &mut SensingUpdate) {
+/// Default `PersonDetection::position_source` for construction sites that
+/// predate `attach_positions` running (it always overwrites this before the
+/// frame ships).
+fn default_position_source() -> String {
+    "field_peak".to_string()
+}
+
+/// Minimum combined `smoothed_motion` weight across usable nodes before a
+/// centroid is considered meaningful. `smoothed_motion` crosses ~0.04 at the
+/// "present_still" classification threshold ([`raw_classify`]), so this is
+/// roughly "two nodes barely registering presence" or "one node solidly into
+/// present_moving" — high enough that near-zero background noise across all
+/// nodes doesn't produce an arbitrary-looking centroid, low enough to engage
+/// whenever there's real classified presence.
+const MIN_TOTAL_MOTION_WEIGHT: f64 = 0.08;
+
+/// Throttle for the diagnostic centroid log below — this runs once per
+/// sensing cycle (tens of Hz), so logging every attempt would flood the
+/// terminal. One line every couple of seconds is enough to see what's driving
+/// (or blocking) the estimate.
+static LAST_CENTROID_LOG: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// A person position estimated as a motion-weighted centroid of node
+/// positions (meters, same frame as `node_positions_config` / Room Builder).
+/// NOT real geometric trilateration — see [`motion_weighted_centroid`].
+#[derive(Debug, Clone, Copy)]
+struct MotionCentroid {
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+/// Estimate a rough person position as a motion-weighted centroid of node
+/// positions: nodes whose link shows more measured motion disturbance
+/// (`smoothed_motion`) pull the estimate toward themselves.
+///
+/// This is deliberately **not** real trilateration. An earlier version of
+/// this function fed each node's `mean_rssi` (its WiFi link strength to the
+/// access point) into an RSSI-based device-localization solver — but RuView
+/// is device-free (no transmitter on the person for nodes to range against),
+/// so `mean_rssi` barely varies with person position at all; on real
+/// hardware that produced position fixes off by hundreds to hundreds of
+/// thousands of meters and was reverted. `smoothed_motion` is a better-
+/// grounded proxy: it's the same baseline-subtracted, EMA-smoothed "how much
+/// is this node currently seeing beyond its quiet-room floor" signal already
+/// used for classification, so a node with more of it genuinely means more
+/// disturbance on *that node's* link — plausibly correlated with proximity,
+/// though still a heuristic, not calibrated geometry. Real multistatic
+/// position estimation (Doppler/CIR-based ranging) remains unbuilt.
+///
+/// Deliberately does **not** reuse the `active_nodes: Vec<NodeInfo>` list
+/// built for display, which defaults an unconfigured node's position to
+/// `[2.0, 0.0, 1.5]` — that default would poison the centroid with a fake
+/// sensor location. Only nodes with a *real* `node_positions_config` entry
+/// are ever included.
+///
+/// Returns `None` when fewer than 2 positioned, fresh nodes are available, or
+/// their combined motion weight is below [`MIN_TOTAL_MOTION_WEIGHT`] (nothing
+/// moving ⇒ no meaningful centroid, not a fabricated one at an arbitrary
+/// point) — callers must fall back to the field-peak position instead.
+fn motion_weighted_centroid(
+    node_states: &HashMap<u8, NodeState>,
+    node_positions_config: &HashMap<u8, [f32; 3]>,
+    now: std::time::Instant,
+) -> Option<MotionCentroid> {
+    let mut weighted = [0.0_f64; 3];
+    let mut total_weight = 0.0_f64;
+    let mut usable_nodes = 0usize;
+
+    for (&id, n) in node_states {
+        let fresh = n
+            .last_frame_time
+            .is_some_and(|t| now.duration_since(t).as_secs() < 10);
+        if !fresh {
+            continue;
+        }
+        let Some(pos) = node_positions_config.get(&id) else {
+            continue;
+        };
+        let weight = n.smoothed_motion.max(0.0);
+        usable_nodes += 1;
+        weighted[0] += weight * pos[0] as f64;
+        weighted[1] += weight * pos[1] as f64;
+        weighted[2] += weight * pos[2] as f64;
+        total_weight += weight;
+    }
+
+    let mut last = LAST_CENTROID_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    let should_log = last.is_none_or(|t| now.duration_since(t).as_secs() >= 2);
+    if should_log {
+        *last = Some(now);
+        drop(last);
+        info!(
+            "motion centroid: {usable_nodes} positioned node(s), total_weight={total_weight:.3} \
+             (need >= {MIN_TOTAL_MOTION_WEIGHT} and >= 2 nodes)"
+        );
+    }
+
+    if usable_nodes < 2 || total_weight < MIN_TOTAL_MOTION_WEIGHT {
+        return None;
+    }
+
+    Some(MotionCentroid {
+        x: weighted[0] / total_weight,
+        y: weighted[1] / total_weight,
+        z: weighted[2] / total_weight,
+    })
+}
+
+/// Attach per-person world positions to a `SensingUpdate`'s `persons`
+/// (issue #1050, extended with a motion-weighted-centroid position).
+///
+/// When `centroid` is `Some` (≥2 real nodes with configured positions and
+/// measurable motion, see [`motion_weighted_centroid`]), every person is
+/// placed at that single estimate — with only 3 nodes we cannot yet separate
+/// multiple simultaneous targets, so all persons share it — and
+/// `position_source` is stamped `"motion_centroid"`. This is a heuristic, not
+/// calibrated geometry, so `position_uncertainty_m` stays `None` (no
+/// comparable error model exists for it, same as the field-peak path below).
+///
+/// Otherwise, falls back to the original field-peak behavior: for each
+/// detected person we read a strongest-peak position out of the frame's real
+/// `signal_field` (the same grid the Observatory already renders) and map it
+/// to room-world coordinates via `field_localize::cell_to_world`.
+/// `position_source` is stamped `"field_peak"` with no uncertainty. Persons
+/// beyond the number of resolvable field peaks fall back to the strongest
+/// peak so they remain co-located with real energy rather than at a fake
+/// origin; if the field has no peak above threshold the position stays at
+/// `[0,0,0]`.
+///
+/// In both cases `motion_score` is passed through from the measured
+/// `motion_band_power`, and `pose` is taken from the real aggregate `posture`
+/// estimate when present, else left `None` (never fabricated).
+fn attach_positions(update: &mut SensingUpdate, centroid: Option<MotionCentroid>) {
     let Some(persons) = update.persons.as_mut() else {
         return;
     };
@@ -4960,24 +5110,137 @@ fn attach_field_positions(update: &mut SensingUpdate) {
         return;
     }
 
-    let [nx, _ny, nz] = update.signal_field.grid_size;
-    let peaks = field_localize::extract_peaks(
-        &update.signal_field.values,
-        nx,
-        nz,
-        persons.len().max(1),
-        3.0,
-    );
+    if let Some(c) = centroid {
+        for person in persons.iter_mut() {
+            person.position = [c.x, c.y, c.z];
+            person.position_source = "motion_centroid".to_string();
+            person.position_uncertainty_m = None;
+        }
+    } else {
+        let [nx, _ny, nz] = update.signal_field.grid_size;
+        let peaks = field_localize::extract_peaks(
+            &update.signal_field.values,
+            nx,
+            nz,
+            persons.len().max(1),
+            3.0,
+        );
+        for (i, person) in persons.iter_mut().enumerate() {
+            if let Some(peak) = peaks.get(i).or_else(|| peaks.first()) {
+                person.position = peak.position;
+            }
+            person.position_source = "field_peak".to_string();
+            person.position_uncertainty_m = None;
+        }
+    }
 
     let motion_score = field_localize::motion_score_from_power(update.features.motion_band_power);
     let pose_label = update.posture.clone();
-
-    for (i, person) in persons.iter_mut().enumerate() {
-        if let Some(peak) = peaks.get(i).or_else(|| peaks.first()) {
-            person.position = peak.position;
-        }
+    for person in persons.iter_mut() {
         person.motion_score = motion_score;
         person.pose = pose_label.clone();
+    }
+}
+
+#[cfg(test)]
+mod motion_weighted_centroid_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    /// A fresh (just-reported), positioned node with the given smoothed
+    /// motion weight.
+    fn fresh_node(motion: f64) -> NodeState {
+        let mut n = NodeState::new();
+        n.smoothed_motion = motion;
+        n.last_frame_time = Some(Instant::now());
+        n
+    }
+
+    #[test]
+    fn two_positioned_fresh_nodes_yield_a_weighted_position() {
+        // Node 1 sees 3x the motion of node 2, so the centroid should sit at
+        // the weighted average, pulled toward node 1: (0*0.3 + 4*0.1)/0.4 = 1.0.
+        let mut node_states = HashMap::new();
+        node_states.insert(1u8, fresh_node(0.3));
+        node_states.insert(2u8, fresh_node(0.1));
+
+        let mut positions = HashMap::new();
+        positions.insert(1u8, [0.0f32, 0.0, 1.0]);
+        positions.insert(2u8, [4.0f32, 0.0, 1.0]);
+
+        let result = motion_weighted_centroid(&node_states, &positions, Instant::now());
+        let c = result.expect("2 fresh, positioned, moving nodes must produce a centroid");
+        assert!((c.x - 1.0).abs() < 1e-6, "x={}", c.x);
+        assert!((c.y - 0.0).abs() < 1e-6, "y={}", c.y);
+    }
+
+    #[test]
+    fn fewer_than_two_positioned_nodes_yields_none() {
+        let mut node_states = HashMap::new();
+        node_states.insert(1u8, fresh_node(0.3));
+
+        let mut positions = HashMap::new();
+        positions.insert(1u8, [0.0f32, 0.0, 1.0]);
+
+        assert!(
+            motion_weighted_centroid(&node_states, &positions, Instant::now()).is_none(),
+            "only 1 positioned node — need at least 2 for a meaningful centroid"
+        );
+    }
+
+    #[test]
+    fn node_without_configured_position_is_excluded_not_defaulted() {
+        // 2 nodes report, but only 1 has a real Room Builder position — the
+        // other must be dropped, not silently defaulted to a fake location.
+        let mut node_states = HashMap::new();
+        node_states.insert(1u8, fresh_node(0.3));
+        node_states.insert(2u8, fresh_node(0.2));
+
+        let mut positions = HashMap::new();
+        positions.insert(1u8, [0.0f32, 0.0, 1.0]);
+        // node 2 intentionally has no entry in `positions`.
+
+        assert!(
+            motion_weighted_centroid(&node_states, &positions, Instant::now()).is_none(),
+            "an unpositioned node must be excluded, leaving only 1 usable sensor"
+        );
+    }
+
+    #[test]
+    fn stale_node_is_excluded() {
+        let mut node_states = HashMap::new();
+        node_states.insert(1u8, fresh_node(0.3));
+        let mut stale = fresh_node(0.2);
+        stale.last_frame_time = Some(Instant::now() - Duration::from_secs(20));
+        node_states.insert(2u8, stale);
+
+        let mut positions = HashMap::new();
+        positions.insert(1u8, [0.0f32, 0.0, 1.0]);
+        positions.insert(2u8, [4.0f32, 0.0, 1.0]);
+
+        assert!(
+            motion_weighted_centroid(&node_states, &positions, Instant::now()).is_none(),
+            "a node stale beyond the 10s freshness window must be excluded"
+        );
+    }
+
+    #[test]
+    fn near_zero_motion_across_all_nodes_yields_none() {
+        // Both nodes technically report *some* motion, but it's background
+        // noise below MIN_TOTAL_MOTION_WEIGHT — must not fabricate a centroid.
+        let mut node_states = HashMap::new();
+        node_states.insert(1u8, fresh_node(0.01));
+        node_states.insert(2u8, fresh_node(0.01));
+
+        let mut positions = HashMap::new();
+        positions.insert(1u8, [0.0f32, 0.0, 1.0]);
+        positions.insert(2u8, [4.0f32, 0.0, 1.0]);
+
+        assert!(
+            motion_weighted_centroid(&node_states, &positions, Instant::now()).is_none(),
+            "combined motion weight below MIN_TOTAL_MOTION_WEIGHT must not produce a centroid"
+        );
     }
 }
 
@@ -6793,8 +7056,13 @@ async fn udp_receiver_task(
                     if !tracked.is_empty() {
                         update.persons = Some(tracked);
                     }
-                    // #1050: attach real signal_field-peak positions to each person.
-                    attach_field_positions(&mut update);
+                    // Real multistatic path: prefer a motion-weighted centroid
+                    // from the actual node positions (Room Builder) over the
+                    // field-peak fallback when enough positioned nodes have
+                    // measurable motion.
+                    let centroid =
+                        motion_weighted_centroid(&s.node_states, &s.node_positions_config, now);
+                    attach_positions(&mut update, centroid);
                     assess_legacy_image_pose(&mut s, &update);
 
                     if s.last_broadcast_at
@@ -7259,8 +7527,13 @@ async fn udp_receiver_task(
                     if !tracked.is_empty() {
                         update.persons = Some(tracked);
                     }
-                    // #1050: attach real signal_field-peak positions to each person.
-                    attach_field_positions(&mut update);
+                    // Real multistatic path: prefer a motion-weighted centroid
+                    // from the actual node positions (Room Builder) over the
+                    // field-peak fallback when enough positioned nodes have
+                    // measurable motion.
+                    let centroid =
+                        motion_weighted_centroid(&s.node_states, &s.node_positions_config, now);
+                    attach_positions(&mut update, centroid);
                     assess_legacy_image_pose(&mut s, &update);
 
                     if s.last_broadcast_at
@@ -7525,8 +7798,8 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
         if !tracked.is_empty() {
             update.persons = Some(tracked);
         }
-        // #1050: attach real signal_field-peak positions to each person.
-        attach_field_positions(&mut update);
+        // Single-node path — no multi-node geometry to trilaterate from.
+        attach_positions(&mut update, None);
         assess_legacy_image_pose(&mut s, &update);
 
         if update.classification.presence {
@@ -10259,7 +10532,7 @@ mod observatory_persons_field_position_tests {
 
         // Pipeline order: derive raw skeleton, then attach real field positions.
         update.persons = Some(derive_pose_from_sensing(&update));
-        attach_field_positions(&mut update);
+        attach_positions(&mut update, None);
 
         let persons = update.persons.as_ref().expect("persons should be Some");
         assert!(!persons.is_empty(), "a present person must be emitted");
@@ -10273,6 +10546,8 @@ mod observatory_persons_field_position_tests {
 
         // motion_score is the measured motion_band_power passed through (≤100).
         assert!((p0.motion_score - 63.3).abs() < 1e-6, "motion_score={}", p0.motion_score);
+        assert_eq!(p0.position_source, "field_peak");
+        assert!(p0.position_uncertainty_m.is_none(), "no error model for the field-peak path");
 
         // The serialized WS frame must carry the new fields by their exact
         // contract names the Observatory UI reads.
@@ -10285,6 +10560,31 @@ mod observatory_persons_field_position_tests {
         assert!((pj["position"][0].as_f64().unwrap() - 3.0).abs() < 1e-6);
         assert!((pj["position"][2].as_f64().unwrap() - (-3.0)).abs() < 1e-6);
         assert!((pj["motion_score"].as_f64().unwrap() - 63.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn attach_positions_prefers_motion_centroid_over_field_peak() {
+        // Same peak-bearing field as the field-derived test, so we can prove
+        // the centroid wins over it, not just that it's present.
+        let mut update = base_update(field_with_peak(15, 4), true, 63.3);
+        update.persons = Some(derive_pose_from_sensing(&update));
+
+        let centroid = MotionCentroid { x: 2.5, y: 1.75, z: 0.0 };
+        attach_positions(&mut update, Some(centroid));
+
+        let p0 = &update.persons.as_ref().unwrap()[0];
+        assert_eq!(p0.position, [2.5, 1.75, 0.0], "motion centroid must win over the field peak");
+        assert_eq!(p0.position_source, "motion_centroid");
+        assert!(
+            p0.position_uncertainty_m.is_none(),
+            "motion_centroid is a heuristic — no calibrated error model exists for it"
+        );
+        // motion_score/pose are still attached the same way regardless of source.
+        assert!((p0.motion_score - 63.3).abs() < 1e-6);
+
+        let v = serde_json::to_value(&update).unwrap();
+        assert_eq!(v["persons"][0]["position_source"], "motion_centroid");
+        assert!(v["persons"][0].get("position_uncertainty_m").is_none());
     }
 
     #[test]
@@ -10315,7 +10615,7 @@ mod observatory_persons_field_position_tests {
         // No aggregate posture estimate → pose is None (never fabricated).
         let mut no_posture = base_update(field_with_peak(10, 10), true, 40.0);
         no_posture.persons = Some(derive_pose_from_sensing(&no_posture));
-        attach_field_positions(&mut no_posture);
+        attach_positions(&mut no_posture, None);
         let p = &no_posture.persons.as_ref().unwrap()[0];
         assert!(p.pose.is_none(), "pose must stay None when no real posture exists");
         // skip_serializing_if drops the key entirely (UI defaults to 'standing').
@@ -10326,7 +10626,7 @@ mod observatory_persons_field_position_tests {
         let mut with_posture = base_update(field_with_peak(10, 10), true, 40.0);
         with_posture.posture = Some("lying".to_string());
         with_posture.persons = Some(derive_pose_from_sensing(&with_posture));
-        attach_field_positions(&mut with_posture);
+        attach_positions(&mut with_posture, None);
         let p2 = &with_posture.persons.as_ref().unwrap()[0];
         assert_eq!(p2.pose.as_deref(), Some("lying"));
         let v2 = serde_json::to_value(&with_posture).unwrap();
@@ -10338,7 +10638,7 @@ mod observatory_persons_field_position_tests {
         // No presence → derive_pose_from_sensing returns no persons at all.
         let mut update = base_update(empty_field(), false, 2.0);
         update.persons = Some(derive_pose_from_sensing(&update));
-        attach_field_positions(&mut update);
+        attach_positions(&mut update, None);
 
         let persons = update.persons.as_ref().unwrap();
         assert!(
@@ -10360,7 +10660,7 @@ mod observatory_persons_field_position_tests {
         // the honest degenerate case (no localizable hotspot to report).
         let mut update = base_update(empty_field(), true, 55.0);
         update.persons = Some(derive_pose_from_sensing(&update));
-        attach_field_positions(&mut update);
+        attach_positions(&mut update, None);
 
         let p = &update.persons.as_ref().unwrap()[0];
         assert_eq!(p.position, [0.0, 0.0, 0.0], "no peak → default origin, not fabricated coords");

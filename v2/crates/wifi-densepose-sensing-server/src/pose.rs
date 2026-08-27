@@ -192,8 +192,11 @@ pub fn derive_single_person_pose(
             height: (max_y - min_y).max(160.0),
         },
         zone: format!("zone_{}", person_idx + 1),
-        // Field-derived fields (#1050) — defaulted here; the live `/ws/sensing`
-        // path attaches real positions via `attach_field_positions`.
+        // Field-derived fields (#1050) — defaulted here. Note: this
+        // `types::PersonDetection` is a separate struct from the one embedded
+        // in the live `main.rs::SensingUpdate`; the live `/ws/sensing` path
+        // uses main.rs's own `derive_pose_from_sensing`/`attach_positions`,
+        // not this module.
         position: [0.0, 0.0, 0.0],
         motion_score: 0.0,
         pose: None,
