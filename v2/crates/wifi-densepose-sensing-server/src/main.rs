@@ -620,23 +620,26 @@ struct PersonDetection {
     keypoints: Vec<PoseKeypoint>,
     bbox: BoundingBox,
     zone: String,
-    /// Room-world position `[x, y, z]` (meters). Either a real RSSI
-    /// trilateration fix (`position_source == "trilateration"`) or, when
-    /// fewer than 3 positioned nodes are available, the strongest
-    /// `signal_field` peak this person sits on (issue #1050,
-    /// `position_source == "field_peak"`). Defaults to `[0,0,0]` until
-    /// positions are attached by `attach_positions`.
+    /// Room-world position `[x, y, z]` (meters), same frame as Room
+    /// Builder's node positions. One of three tiers, best available first
+    /// (see `attach_positions`, `PositionEstimate`):
+    /// `"doppler_centroid"` (Doppler/BVP-weighted node centroid, see
+    /// `doppler_weighted_centroid`), `"motion_centroid"` (amplitude-
+    /// variance-weighted node centroid, see `motion_weighted_centroid`), or
+    /// `"field_peak"` (the `signal_field` heuristic readout — not calibrated
+    /// geometry at all, see `field_localize` for the honesty caveat).
+    /// Defaults to `[0,0,0]` until positions are attached by
+    /// `attach_positions`.
     #[serde(default)]
     position: [f64; 3],
-    /// Where `position` came from: `"trilateration"` (real RSSI
-    /// multilateration from ≥3 positioned nodes, see `triangulate_from_nodes`)
-    /// or `"field_peak"` (signal_field heuristic readout — not calibrated
-    /// triangulation, see `field_localize` for the honesty caveat).
+    /// Which tier produced `position` — see the field's own doc comment for
+    /// what each value means and where it's computed.
     #[serde(default = "default_position_source")]
     position_source: String,
-    /// Horizontal 95%-confidence error radius (meters) from the trilateration
-    /// solver's least-squares residuals. `None` when `position_source` is
-    /// `"field_peak"` (no comparable error model exists for that path).
+    /// Horizontal error radius (meters), when a calibrated error model
+    /// exists for `position_source`. Currently always `None` — none of the
+    /// three tiers has one (both centroid methods are heuristics, not
+    /// calibrated geometry; `field_peak` never claimed one either).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     position_uncertainty_m: Option<f64>,
     /// Motion magnitude on the Observatory's `0..100` scale, passed through
@@ -1319,6 +1322,20 @@ pub(crate) struct RoomConfig {
     pub width_m: f32,
     pub depth_m: f32,
     pub nodes: Vec<RoomNode>,
+    /// The WiFi access point's position, same room-space meters/NW-origin
+    /// convention as `nodes`. Optional — `None` means not yet configured, not
+    /// "AP is at the origin". Needed for bistatic Doppler-geometry position
+    /// estimation (a link's Doppler shift decomposes into a 2D velocity
+    /// constraint only once both endpoints — AP and node — are known; see
+    /// `doppler_weighted_centroid`'s doc comment for why raw per-node Doppler
+    /// magnitude alone isn't full geometric triangulation). Deliberately a
+    /// single point, not a list: real position estimation needs one known,
+    /// fixed link endpoint per node, and supporting multiple candidate APs
+    /// would require knowing which AP each CSI frame's traffic actually came
+    /// from, which isn't tracked anywhere today. A house with more rooms is
+    /// future scope; this stays "one room, one AP, up to a few nodes."
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ap_position: Option<[f32; 3]>,
 }
 
 /// Load persisted room config from `<data_dir>/room_config.json`.
@@ -1376,6 +1393,7 @@ mod room_config_tests {
                 RoomNode { id: 0, x: 0.0, y: 0.0, z: 0.4, label: Some("front-right".into()) },
                 RoomNode { id: 1, x: 3.66, y: 0.0, z: 0.4, label: None },
             ],
+            ap_position: Some([2.5, -1.0, 2.2]),
         };
         save_room_config(dir.path(), &saved);
         let loaded = load_room_config(dir.path());
@@ -1385,6 +1403,21 @@ mod room_config_tests {
         assert_eq!(loaded.nodes[0].id, 0);
         assert_eq!(loaded.nodes[0].label.as_deref(), Some("front-right"));
         assert_eq!(loaded.nodes[1].label, None);
+        assert_eq!(loaded.ap_position, Some([2.5, -1.0, 2.2]));
+    }
+
+    #[test]
+    fn room_config_without_ap_position_field_loads_as_none() {
+        // An old room_config.json saved before ap_position existed must still
+        // load fine, with ap_position defaulting to None (#[serde(default)]).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("room_config.json"),
+            r#"{"width_m": 5.0, "depth_m": 4.0, "nodes": []}"#,
+        )
+        .unwrap();
+        let loaded = load_room_config(dir.path());
+        assert_eq!(loaded.ap_position, None);
     }
 
     fn valid_config() -> RoomConfig {
@@ -1395,6 +1428,7 @@ mod room_config_tests {
                 RoomNode { id: 0, x: 0.0, y: 0.0, z: 0.4, label: None },
                 RoomNode { id: 1, x: 3.66, y: 0.0, z: 0.4, label: None },
             ],
+            ap_position: None,
         }
     }
 
@@ -1440,6 +1474,30 @@ mod room_config_tests {
     fn validate_allows_empty_node_list() {
         let mut cfg = valid_config();
         cfg.nodes.clear();
+        assert!(validate_room_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_non_finite_ap_position() {
+        let mut cfg = valid_config();
+        cfg.ap_position = Some([f32::NAN, 0.0, 0.0]);
+        assert!(validate_room_config(&cfg).is_err());
+        cfg.ap_position = Some([0.0, f32::INFINITY, 0.0]);
+        assert!(validate_room_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_ap_position_outside_room_bounds() {
+        // A real AP is very often physically outside the sensed room.
+        let mut cfg = valid_config();
+        cfg.ap_position = Some([100.0, -50.0, 3.0]);
+        assert!(validate_room_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_no_ap_position() {
+        let cfg = valid_config();
+        assert_eq!(cfg.ap_position, None);
         assert!(validate_room_config(&cfg).is_ok());
     }
 }
@@ -1574,6 +1632,10 @@ struct AppStateInner {
     /// Node positions parsed from --node-positions, keyed by 0-based index
     /// into the parsed list (which corresponds to node_id).
     node_positions_config: HashMap<u8, [f32; 3]>,
+    /// The WiFi access point's position, set via Room Builder
+    /// (`POST /api/v1/config/room`) and loaded from `room_config.json` at
+    /// startup, mirroring `node_positions_config`. `None` until configured.
+    ap_position: Option<[f32; 3]>,
     /// Governed trust-path bridge (ADR-135..146): runs the same live frames
     /// through the privacy/provenance/witness control plane. Does not alter
     /// person-count behavior; its trust state (witness, effective class,
@@ -1837,6 +1899,7 @@ impl AppStateInner {
             last_tracker_instant: None,
             multistatic_fuser: MultistaticFuser::new(),
             node_positions_config: HashMap::new(),
+            ap_position: None,
             engine_bridge: engine_bridge::EngineBridge::new(
                 wifi_densepose_bfld::PrivacyMode::PrivateHome,
                 1,
@@ -5006,14 +5069,211 @@ const MIN_TOTAL_MOTION_WEIGHT: f64 = 0.08;
 static LAST_CENTROID_LOG: std::sync::Mutex<Option<std::time::Instant>> =
     std::sync::Mutex::new(None);
 
-/// A person position estimated as a motion-weighted centroid of node
-/// positions (meters, same frame as `node_positions_config` / Room Builder).
-/// NOT real geometric trilateration — see [`motion_weighted_centroid`].
+/// A person position estimated as a weighted centroid of node positions
+/// (meters, same frame as `node_positions_config` / Room Builder). NOT real
+/// geometric trilateration — see [`doppler_weighted_centroid`] and
+/// [`motion_weighted_centroid`], the two producers of this type.
 #[derive(Debug, Clone, Copy)]
 struct MotionCentroid {
     x: f64,
     y: f64,
     z: f64,
+}
+
+/// Which signal produced a [`MotionCentroid`] — threaded through to
+/// `PersonDetection::position_source` so the wire format states plainly which
+/// method estimated the position, per this repo's accuracy-labeling rule
+/// (`CLAUDE.md`: never present WiFi sensing as camera-grade; tag by source).
+enum PositionEstimate {
+    /// From [`doppler_weighted_centroid`] — weighted by real Doppler-shifted
+    /// motion energy per node (Body Velocity Profile). Preferred when
+    /// available: it's a genuinely different physical quantity than
+    /// amplitude-variance motion (frequency-domain, from phase change over
+    /// time), not just a re-tuned version of the same heuristic.
+    Doppler(MotionCentroid),
+    /// From [`motion_weighted_centroid`] — weighted by raw baseline-
+    /// subtracted amplitude motion energy. Confirmed live (2026-08-27) to
+    /// respond to overall room activity but NOT to distinguish which of the
+    /// 3 nodes a person is actually near — kept as the fallback tier below
+    /// Doppler, not because it was fixed, but because Doppler needs enough
+    /// CSI history per node (`MIN_BVP_SAMPLES`) that it won't always be
+    /// available on a node that's otherwise fresh and positioned.
+    Motion(MotionCentroid),
+}
+
+/// STFT window for Doppler/BVP extraction (`doppler_weighted_centroid`).
+/// Chosen to fit within `FRAME_HISTORY_CAPACITY` (100 frames) with room for
+/// at least one hop, not derived from any particular Doppler-resolution
+/// target — UNTUNED, revisit once live BVP output has been inspected.
+const BVP_WINDOW_SIZE: usize = 64;
+/// STFT hop for Doppler/BVP extraction — see `BVP_WINDOW_SIZE`.
+const BVP_HOP_SIZE: usize = 32;
+/// Minimum CSI frames of per-node history required before attempting Doppler
+/// extraction (one window plus one hop, so `extract_bvp` has at least 2 time
+/// frames to work with rather than rejecting for insufficient samples).
+const MIN_BVP_SAMPLES: usize = BVP_WINDOW_SIZE + BVP_HOP_SIZE;
+/// Velocity magnitude (m/s) below which a BVP velocity bin is treated as
+/// near-DC leakage / static multipath rather than genuine Doppler-shifted
+/// motion, when summing a node's "moving energy" fraction.
+const BVP_ZERO_VELOCITY_DEADBAND_MPS: f64 = 0.05;
+/// Minimum combined per-node Doppler "moving energy" fraction (each node
+/// contributes a ratio in `[0, 1]`, see `node_doppler_weight`) before a
+/// Doppler centroid is considered meaningful. UNTUNED — picked as a starting
+/// point pending live calibration; the diagnostic log below exists so this
+/// can be adjusted from real numbers instead of guessed further.
+const MIN_TOTAL_DOPPLER_WEIGHT: f64 = 0.05;
+
+/// Build a chronological `(n_samples, n_subcarriers)` matrix from a node's
+/// rolling amplitude history, taking the most recent `n_samples` frames.
+/// Returns `None` if there isn't enough history yet, or (defensively, should
+/// never happen since `NodeState::accept_grid` already locks a node onto one
+/// subcarrier grid) if frame lengths within the window aren't uniform.
+fn build_csi_temporal(
+    frame_history: &std::collections::VecDeque<Vec<f64>>,
+    n_samples: usize,
+) -> Option<ndarray::Array2<f64>> {
+    if frame_history.len() < n_samples {
+        return None;
+    }
+    let skip = frame_history.len() - n_samples;
+    let n_sc = frame_history.back()?.len();
+    if n_sc == 0 {
+        return None;
+    }
+    let mut data = Vec::with_capacity(n_samples * n_sc);
+    for frame in frame_history.iter().skip(skip) {
+        if frame.len() != n_sc {
+            return None;
+        }
+        data.extend_from_slice(frame);
+    }
+    ndarray::Array2::from_shape_vec((n_samples, n_sc), data).ok()
+}
+
+/// Fraction of a node's most recent Body Velocity Profile time-frame that
+/// falls outside the near-zero-velocity deadband — i.e. how much of this
+/// node's link energy right now is genuinely Doppler-shifted (moving)
+/// rather than static multipath. Returns `None` when there isn't enough CSI
+/// history yet ([`MIN_BVP_SAMPLES`]) or BVP extraction otherwise fails
+/// (never panics on a bad/edge-case frame — falls through to the caller's
+/// next tier instead).
+///
+/// Carrier frequency is hardcoded to 2.4 GHz: RuView's ESP32 nodes sense
+/// 2.4 GHz WiFi traffic (`BvpConfig::default()`'s own 5 GHz assumption would
+/// be wrong here and silently mis-scale every velocity bin).
+fn node_doppler_weight(n: &NodeState) -> Option<f64> {
+    let temporal = build_csi_temporal(&n.frame_history, MIN_BVP_SAMPLES)?;
+    let sample_rate = n.csi_fps_ema.max(1.0);
+    let config = wifi_densepose_signal::bvp::BvpConfig {
+        window_size: BVP_WINDOW_SIZE,
+        hop_size: BVP_HOP_SIZE,
+        carrier_frequency: 2.4e9,
+        ..wifi_densepose_signal::bvp::BvpConfig::default()
+    };
+    let bvp = wifi_densepose_signal::bvp::extract_bvp(&temporal, sample_rate, &config).ok()?;
+    if bvp.n_time == 0 {
+        return None;
+    }
+    let last_col = bvp.data.column(bvp.n_time - 1);
+    let mut moving = 0.0_f64;
+    let mut total = 0.0_f64;
+    for (i, &v) in bvp.velocity_bins.iter().enumerate() {
+        let energy = last_col[i];
+        total += energy;
+        if v.abs() > BVP_ZERO_VELOCITY_DEADBAND_MPS {
+            moving += energy;
+        }
+    }
+    if total < 1e-9 {
+        return None;
+    }
+    Some((moving / total).clamp(0.0, 1.0))
+}
+
+/// Throttle for the diagnostic Doppler-centroid log — same rationale as
+/// `LAST_CENTROID_LOG`.
+static LAST_DOPPLER_LOG: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// Estimate a rough person position as a Doppler-weighted centroid of node
+/// positions: nodes whose link shows more genuinely Doppler-shifted (moving)
+/// energy — via [`node_doppler_weight`]'s Body Velocity Profile fraction —
+/// pull the estimate toward themselves.
+///
+/// This is the preferred tier over [`motion_weighted_centroid`], which
+/// weights by raw baseline-subtracted amplitude variance and was confirmed
+/// live (2026-08-27) to respond to overall room activity but not to which
+/// specific node a person is actually near — plausible root cause: amplitude
+/// variance doesn't distinguish real body motion from residual multipath
+/// noise as cleanly as frequency-domain Doppler energy does. Whether Doppler
+/// weighting actually differentiates better is **not yet live-validated** —
+/// this is a real, physically-motivated hypothesis (Doppler needs only
+/// observation *time*, not RF bandwidth, unlike the time-of-flight ranging
+/// this repo's hardware structurally cannot do at 20 MHz — see
+/// `wifi_densepose_signal::ruvsense::cir`'s `ranging_min_bw_hz`), not a
+/// proven fix. Still NOT real geometric trilateration — no angle-of-arrival
+/// or absolute-position information exists per node, only a relative
+/// "how much is moving here" weight per link.
+///
+/// Deliberately does **not** reuse the `active_nodes: Vec<NodeInfo>` list
+/// built for display, which defaults an unconfigured node's position to
+/// `[2.0, 0.0, 1.5]` — that default would poison the centroid with a fake
+/// sensor location. Only nodes with a *real* `node_positions_config` entry
+/// are ever included.
+///
+/// Returns `None` when fewer than 2 positioned, fresh nodes have enough CSI
+/// history for Doppler extraction, or their combined weight is below
+/// [`MIN_TOTAL_DOPPLER_WEIGHT`] — callers must fall back to
+/// [`motion_weighted_centroid`] instead.
+fn doppler_weighted_centroid(
+    node_states: &HashMap<u8, NodeState>,
+    node_positions_config: &HashMap<u8, [f32; 3]>,
+    now: std::time::Instant,
+) -> Option<MotionCentroid> {
+    let mut weighted = [0.0_f64; 3];
+    let mut total_weight = 0.0_f64;
+    let mut usable_nodes = 0usize;
+
+    for (&id, n) in node_states {
+        let fresh = n
+            .last_frame_time
+            .is_some_and(|t| now.duration_since(t).as_secs() < 10);
+        if !fresh {
+            continue;
+        }
+        let Some(pos) = node_positions_config.get(&id) else {
+            continue;
+        };
+        let Some(weight) = node_doppler_weight(n) else {
+            continue;
+        };
+        usable_nodes += 1;
+        weighted[0] += weight * pos[0] as f64;
+        weighted[1] += weight * pos[1] as f64;
+        weighted[2] += weight * pos[2] as f64;
+        total_weight += weight;
+    }
+
+    let mut last = LAST_DOPPLER_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    let should_log = last.is_none_or(|t| now.duration_since(t).as_secs() >= 2);
+    if should_log {
+        *last = Some(now);
+        drop(last);
+        info!(
+            "doppler centroid: {usable_nodes} node(s) with enough CSI history, \
+             total_weight={total_weight:.3} (need >= {MIN_TOTAL_DOPPLER_WEIGHT} and >= 2 nodes)"
+        );
+    }
+
+    if usable_nodes < 2 || total_weight < MIN_TOTAL_DOPPLER_WEIGHT {
+        return None;
+    }
+
+    Some(MotionCentroid {
+        x: weighted[0] / total_weight,
+        y: weighted[1] / total_weight,
+        z: weighted[2] / total_weight,
+    })
 }
 
 /// Estimate a rough person position as a motion-weighted centroid of node
@@ -5094,15 +5354,16 @@ fn motion_weighted_centroid(
 }
 
 /// Attach per-person world positions to a `SensingUpdate`'s `persons`
-/// (issue #1050, extended with a motion-weighted-centroid position).
+/// (issue #1050, extended with Doppler/motion-weighted-centroid positions).
 ///
-/// When `centroid` is `Some` (≥2 real nodes with configured positions and
-/// measurable motion, see [`motion_weighted_centroid`]), every person is
-/// placed at that single estimate — with only 3 nodes we cannot yet separate
-/// multiple simultaneous targets, so all persons share it — and
-/// `position_source` is stamped `"motion_centroid"`. This is a heuristic, not
-/// calibrated geometry, so `position_uncertainty_m` stays `None` (no
-/// comparable error model exists for it, same as the field-peak path below).
+/// When `estimate` is `Some`, every person is placed at that single estimate
+/// — with only 3 nodes we cannot yet separate multiple simultaneous targets,
+/// so all persons share it — and `position_source` is stamped
+/// `"doppler_centroid"` or `"motion_centroid"` depending on which tier
+/// produced it (see [`PositionEstimate`], [`doppler_weighted_centroid`],
+/// [`motion_weighted_centroid`]). Both are heuristics, not calibrated
+/// geometry, so `position_uncertainty_m` stays `None` (no comparable error
+/// model exists for either, same as the field-peak path below).
 ///
 /// Otherwise, falls back to the original field-peak behavior: for each
 /// detected person we read a strongest-peak position out of the frame's real
@@ -5117,7 +5378,7 @@ fn motion_weighted_centroid(
 /// In both cases `motion_score` is passed through from the measured
 /// `motion_band_power`, and `pose` is taken from the real aggregate `posture`
 /// estimate when present, else left `None` (never fabricated).
-fn attach_positions(update: &mut SensingUpdate, centroid: Option<MotionCentroid>) {
+fn attach_positions(update: &mut SensingUpdate, estimate: Option<PositionEstimate>) {
     let Some(persons) = update.persons.as_mut() else {
         return;
     };
@@ -5125,10 +5386,14 @@ fn attach_positions(update: &mut SensingUpdate, centroid: Option<MotionCentroid>
         return;
     }
 
-    if let Some(c) = centroid {
+    if let Some(est) = estimate {
+        let (c, source) = match est {
+            PositionEstimate::Doppler(c) => (c, "doppler_centroid"),
+            PositionEstimate::Motion(c) => (c, "motion_centroid"),
+        };
         for person in persons.iter_mut() {
             person.position = [c.x, c.y, c.z];
-            person.position_source = "motion_centroid".to_string();
+            person.position_source = source.to_string();
             person.position_uncertainty_m = None;
         }
     } else {
@@ -5256,6 +5521,154 @@ mod motion_weighted_centroid_tests {
             motion_weighted_centroid(&node_states, &positions, Instant::now()).is_none(),
             "combined motion weight below MIN_TOTAL_MOTION_WEIGHT must not produce a centroid"
         );
+    }
+}
+
+#[cfg(test)]
+mod doppler_weighted_centroid_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    const N_SUBCARRIERS: usize = 8;
+
+    /// A node with `MIN_BVP_SAMPLES` frames of constant (non-moving)
+    /// amplitude — after `extract_bvp`'s per-subcarrier DC removal this
+    /// leaves ~nothing in any velocity bin, real or fabricated.
+    fn static_node() -> NodeState {
+        let mut n = NodeState::new();
+        n.csi_fps_ema = 44.0;
+        n.last_frame_time = Some(Instant::now());
+        for _ in 0..MIN_BVP_SAMPLES {
+            n.frame_history.push_back(vec![10.0; N_SUBCARRIERS]);
+        }
+        n
+    }
+
+    /// A node whose amplitude oscillates sinusoidally frame-to-frame — a
+    /// synthetic stand-in for genuine Doppler-modulated CSI, so
+    /// `node_doppler_weight` has something real to detect.
+    fn oscillating_node() -> NodeState {
+        let mut n = NodeState::new();
+        n.csi_fps_ema = 44.0;
+        n.last_frame_time = Some(Instant::now());
+        let freq_hz = 2.0_f64;
+        let dt = 1.0 / n.csi_fps_ema;
+        for i in 0..MIN_BVP_SAMPLES {
+            let t = i as f64 * dt;
+            let amp = 10.0 + 3.0 * (2.0 * std::f64::consts::PI * freq_hz * t).sin();
+            n.frame_history.push_back(vec![amp; N_SUBCARRIERS]);
+        }
+        n
+    }
+
+    #[test]
+    fn build_csi_temporal_insufficient_history_returns_none() {
+        let mut history = std::collections::VecDeque::new();
+        history.push_back(vec![1.0; N_SUBCARRIERS]);
+        assert!(build_csi_temporal(&history, MIN_BVP_SAMPLES).is_none());
+    }
+
+    #[test]
+    fn build_csi_temporal_builds_correct_shape() {
+        let mut history = std::collections::VecDeque::new();
+        for i in 0..MIN_BVP_SAMPLES {
+            history.push_back(vec![i as f64; N_SUBCARRIERS]);
+        }
+        let m = build_csi_temporal(&history, MIN_BVP_SAMPLES).expect("enough history");
+        assert_eq!(m.shape(), &[MIN_BVP_SAMPLES, N_SUBCARRIERS]);
+        // Most recent frame (i = MIN_BVP_SAMPLES - 1) must land in the last row.
+        assert_eq!(m[[MIN_BVP_SAMPLES - 1, 0]], (MIN_BVP_SAMPLES - 1) as f64);
+    }
+
+    #[test]
+    fn build_csi_temporal_rejects_nonuniform_frame_length() {
+        // Defensive only — NodeState::accept_grid should prevent this in
+        // practice, but build_csi_temporal must not panic or silently
+        // truncate if it ever happens.
+        let mut history = std::collections::VecDeque::new();
+        for _ in 0..(MIN_BVP_SAMPLES - 1) {
+            history.push_back(vec![1.0; N_SUBCARRIERS]);
+        }
+        history.push_back(vec![1.0; N_SUBCARRIERS + 1]);
+        assert!(build_csi_temporal(&history, MIN_BVP_SAMPLES).is_none());
+    }
+
+    #[test]
+    fn node_doppler_weight_insufficient_samples_returns_none() {
+        let mut n = NodeState::new();
+        n.csi_fps_ema = 44.0;
+        n.frame_history.push_back(vec![1.0; N_SUBCARRIERS]);
+        assert!(node_doppler_weight(&n).is_none());
+    }
+
+    #[test]
+    fn node_doppler_weight_constant_amplitude_yields_none() {
+        // Perfectly static input has nothing left after DC removal — must not
+        // fabricate a moving-energy fraction from pure noise-floor leakage.
+        let n = static_node();
+        assert!(
+            node_doppler_weight(&n).is_none(),
+            "constant amplitude must not produce a fabricated Doppler weight"
+        );
+    }
+
+    #[test]
+    fn node_doppler_weight_detects_synthetic_oscillation() {
+        let n = oscillating_node();
+        let weight = node_doppler_weight(&n).expect("oscillating input should yield a real weight");
+        assert!(
+            weight > 0.05,
+            "a genuinely oscillating signal should show meaningful moving-energy \
+             fraction, got {weight}"
+        );
+    }
+
+    #[test]
+    fn doppler_weighted_centroid_fewer_than_two_yields_none() {
+        let mut node_states = HashMap::new();
+        node_states.insert(1u8, oscillating_node());
+
+        let mut positions = HashMap::new();
+        positions.insert(1u8, [0.0f32, 0.0, 1.0]);
+
+        assert!(
+            doppler_weighted_centroid(&node_states, &positions, Instant::now()).is_none(),
+            "only 1 usable node — need at least 2"
+        );
+    }
+
+    #[test]
+    fn doppler_weighted_centroid_all_static_yields_none() {
+        let mut node_states = HashMap::new();
+        node_states.insert(1u8, static_node());
+        node_states.insert(2u8, static_node());
+
+        let mut positions = HashMap::new();
+        positions.insert(1u8, [0.0f32, 0.0, 1.0]);
+        positions.insert(2u8, [4.0f32, 0.0, 1.0]);
+
+        assert!(
+            doppler_weighted_centroid(&node_states, &positions, Instant::now()).is_none(),
+            "no node has any detectable Doppler energy — must not fabricate a centroid"
+        );
+    }
+
+    #[test]
+    fn doppler_weighted_centroid_two_oscillating_nodes_yields_a_position() {
+        let mut node_states = HashMap::new();
+        node_states.insert(1u8, oscillating_node());
+        node_states.insert(2u8, oscillating_node());
+
+        let mut positions = HashMap::new();
+        positions.insert(1u8, [0.0f32, 0.0, 1.0]);
+        positions.insert(2u8, [4.0f32, 0.0, 1.0]);
+
+        let result = doppler_weighted_centroid(&node_states, &positions, Instant::now());
+        let c = result.expect("2 nodes with real synthetic motion should produce a centroid");
+        // Both nodes oscillate identically, so the centroid should sit at
+        // their midpoint.
+        assert!((c.x - 2.0).abs() < 0.5, "x={}", c.x);
     }
 }
 
@@ -7071,13 +7484,17 @@ async fn udp_receiver_task(
                     if !tracked.is_empty() {
                         update.persons = Some(tracked);
                     }
-                    // Real multistatic path: prefer a motion-weighted centroid
-                    // from the actual node positions (Room Builder) over the
-                    // field-peak fallback when enough positioned nodes have
-                    // measurable motion.
-                    let centroid =
-                        motion_weighted_centroid(&s.node_states, &s.node_positions_config, now);
-                    attach_positions(&mut update, centroid);
+                    // Real multistatic path: prefer a Doppler-weighted centroid,
+                    // fall back to the amplitude-based motion-weighted centroid,
+                    // then to field_peak — see `attach_positions` and
+                    // `PositionEstimate` for what each tier means and why.
+                    let estimate = doppler_weighted_centroid(&s.node_states, &s.node_positions_config, now)
+                        .map(PositionEstimate::Doppler)
+                        .or_else(|| {
+                            motion_weighted_centroid(&s.node_states, &s.node_positions_config, now)
+                                .map(PositionEstimate::Motion)
+                        });
+                    attach_positions(&mut update, estimate);
                     assess_legacy_image_pose(&mut s, &update);
 
                     if s.last_broadcast_at
@@ -7542,13 +7959,17 @@ async fn udp_receiver_task(
                     if !tracked.is_empty() {
                         update.persons = Some(tracked);
                     }
-                    // Real multistatic path: prefer a motion-weighted centroid
-                    // from the actual node positions (Room Builder) over the
-                    // field-peak fallback when enough positioned nodes have
-                    // measurable motion.
-                    let centroid =
-                        motion_weighted_centroid(&s.node_states, &s.node_positions_config, now);
-                    attach_positions(&mut update, centroid);
+                    // Real multistatic path: prefer a Doppler-weighted centroid,
+                    // fall back to the amplitude-based motion-weighted centroid,
+                    // then to field_peak — see `attach_positions` and
+                    // `PositionEstimate` for what each tier means and why.
+                    let estimate = doppler_weighted_centroid(&s.node_states, &s.node_positions_config, now)
+                        .map(PositionEstimate::Doppler)
+                        .or_else(|| {
+                            motion_weighted_centroid(&s.node_states, &s.node_positions_config, now)
+                                .map(PositionEstimate::Motion)
+                        });
+                    attach_positions(&mut update, estimate);
                     assess_legacy_image_pose(&mut s, &update);
 
                     if s.last_broadcast_at
@@ -9050,6 +9471,10 @@ async fn main() {
     // WDP_TDM_SLOTS/WDP_GUARD_INTERVAL_US-derived guard (#1049/#1057).
     let mut engine_bridge_multistatic_cfg: Option<MultistaticConfig> = None;
     let mut node_positions_config: HashMap<u8, [f32; 3]> = HashMap::new();
+    // Populated inside the `multistatic_fuser` field initializer below, from
+    // room_config.json (Room Builder) — same source and load order as
+    // `node_positions_config`.
+    let mut ap_position: Option<[f32; 3]> = None;
     let state: SharedState = Arc::new(RwLock::new(AppStateInner {
         latest_update: None,
         last_broadcast_at: None,
@@ -9171,6 +9596,10 @@ async fn main() {
                 }
                 fuser.set_node_positions(positions);
             }
+            if let Some(ap) = room_config.ap_position {
+                info!("Loaded AP position from room_config.json: {ap:?}");
+                ap_position = Some(ap);
+            }
             engine_bridge_multistatic_cfg = Some(MultistaticConfig {
                 min_nodes: 1,
                 ..cfg
@@ -9178,6 +9607,7 @@ async fn main() {
             fuser
         },
         node_positions_config,
+        ap_position,
         engine_bridge: engine_bridge::EngineBridge::new(
             wifi_densepose_bfld::PrivacyMode::PrivateHome,
             1,
@@ -10108,6 +10538,7 @@ async fn config_get_room(State(state): State<SharedState>) -> Json<serde_json::V
         "width_m": saved.width_m,
         "depth_m": saved.depth_m,
         "nodes": nodes,
+        "ap_position": s.ap_position,
     }))
 }
 
@@ -10136,6 +10567,16 @@ pub(crate) fn validate_room_config(config: &RoomConfig) -> Result<(), String> {
             return Err(format!("node {} has a non-finite coordinate", n.id));
         }
     }
+    if let Some([x, y, z]) = config.ap_position {
+        if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+            return Err("ap_position has a non-finite coordinate".to_string());
+        }
+        // Deliberately no room-bounds check here (unlike nothing else checks
+        // node bounds either, but worth stating): a real AP is very often
+        // physically outside the sensed room (another floor, a hallway
+        // closet), and that's fine — ap_position only needs to be a real,
+        // finite point in the same coordinate frame, not inside width_m/depth_m.
+    }
     Ok(())
 }
 
@@ -10156,6 +10597,7 @@ async fn config_set_room(
         positions[n.id as usize] = [n.x, n.y, n.z];
     }
     s.multistatic_fuser.set_node_positions(positions);
+    s.ap_position = config.ap_position;
     let data_dir = s.data_dir.clone();
     drop(s);
     save_room_config(&data_dir, &config);
@@ -10164,6 +10606,7 @@ async fn config_set_room(
         "width_m": config.width_m,
         "depth_m": config.depth_m,
         "nodes": config.nodes,
+        "ap_position": config.ap_position,
     }))
 }
 
@@ -10585,7 +11028,7 @@ mod observatory_persons_field_position_tests {
         update.persons = Some(derive_pose_from_sensing(&update));
 
         let centroid = MotionCentroid { x: 2.5, y: 1.75, z: 0.0 };
-        attach_positions(&mut update, Some(centroid));
+        attach_positions(&mut update, Some(PositionEstimate::Motion(centroid)));
 
         let p0 = &update.persons.as_ref().unwrap()[0];
         assert_eq!(p0.position, [2.5, 1.75, 0.0], "motion centroid must win over the field peak");
