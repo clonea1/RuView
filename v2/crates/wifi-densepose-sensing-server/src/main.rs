@@ -1333,6 +1333,106 @@ pub(crate) fn save_room_config(data_dir: &std::path::Path, config: &RoomConfig) 
     }
 }
 
+#[cfg(test)]
+mod room_config_tests {
+    use super::*;
+
+    #[test]
+    fn load_missing_file_returns_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = load_room_config(dir.path());
+        assert_eq!(cfg.width_m, 0.0);
+        assert_eq!(cfg.depth_m, 0.0);
+        assert!(cfg.nodes.is_empty());
+    }
+
+    #[test]
+    fn load_malformed_file_falls_back_to_default() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("room_config.json"), "{ not valid json").unwrap();
+        let cfg = load_room_config(dir.path());
+        assert_eq!(cfg.width_m, 0.0);
+        assert!(cfg.nodes.is_empty());
+    }
+
+    #[test]
+    fn save_then_load_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = RoomConfig {
+            width_m: 5.0,
+            depth_m: 4.0,
+            nodes: vec![
+                RoomNode { id: 0, x: 0.0, y: 0.0, z: 0.4, label: Some("front-right".into()) },
+                RoomNode { id: 1, x: 3.66, y: 0.0, z: 0.4, label: None },
+            ],
+        };
+        save_room_config(dir.path(), &saved);
+        let loaded = load_room_config(dir.path());
+        assert_eq!(loaded.width_m, 5.0);
+        assert_eq!(loaded.depth_m, 4.0);
+        assert_eq!(loaded.nodes.len(), 2);
+        assert_eq!(loaded.nodes[0].id, 0);
+        assert_eq!(loaded.nodes[0].label.as_deref(), Some("front-right"));
+        assert_eq!(loaded.nodes[1].label, None);
+    }
+
+    fn valid_config() -> RoomConfig {
+        RoomConfig {
+            width_m: 5.0,
+            depth_m: 4.0,
+            nodes: vec![
+                RoomNode { id: 0, x: 0.0, y: 0.0, z: 0.4, label: None },
+                RoomNode { id: 1, x: 3.66, y: 0.0, z: 0.4, label: None },
+            ],
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_sane_config() {
+        assert!(validate_room_config(&valid_config()).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_non_positive_width() {
+        let mut cfg = valid_config();
+        cfg.width_m = 0.0;
+        assert!(validate_room_config(&cfg).is_err());
+        cfg.width_m = -1.0;
+        assert!(validate_room_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_non_finite_depth() {
+        let mut cfg = valid_config();
+        cfg.depth_m = f32::NAN;
+        assert!(validate_room_config(&cfg).is_err());
+        cfg.depth_m = f32::INFINITY;
+        assert!(validate_room_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_node_ids() {
+        let mut cfg = valid_config();
+        cfg.nodes[1].id = 0; // collide with nodes[0]
+        let err = validate_room_config(&cfg).unwrap_err();
+        assert!(err.contains("duplicate"), "unexpected error message: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_non_finite_node_coordinate() {
+        let mut cfg = valid_config();
+        cfg.nodes[0].x = f32::NAN;
+        assert!(validate_room_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn validate_allows_empty_node_list() {
+        let mut cfg = valid_config();
+        cfg.nodes.clear();
+        assert!(validate_room_config(&cfg).is_ok());
+    }
+}
+
 /// Shared application state
 struct AppStateInner {
     latest_update: Option<SensingUpdate>,
@@ -9729,24 +9829,34 @@ async fn config_get_room(State(state): State<SharedState>) -> Json<serde_json::V
 /// `<data_dir>/room_config.json` so it's picked up on the next launch too.
 ///
 /// Body: a full `RoomConfig` (`{ "width_m", "depth_m", "nodes": [...] }`).
-async fn config_set_room(
-    State(state): State<SharedState>,
-    Json(config): Json<RoomConfig>,
-) -> Json<serde_json::Value> {
+/// Validate a `RoomConfig` submitted via `POST /api/v1/config/room`. Pure
+/// and side-effect-free so it's directly unit-testable without standing up
+/// a full `SharedState`/axum test harness.
+pub(crate) fn validate_room_config(config: &RoomConfig) -> Result<(), String> {
     if !config.width_m.is_finite() || config.width_m <= 0.0 {
-        return Json(serde_json::json!({"error": "width_m must be a positive, finite number"}));
+        return Err("width_m must be a positive, finite number".to_string());
     }
     if !config.depth_m.is_finite() || config.depth_m <= 0.0 {
-        return Json(serde_json::json!({"error": "depth_m must be a positive, finite number"}));
+        return Err("depth_m must be a positive, finite number".to_string());
     }
     let mut seen = std::collections::HashSet::new();
     for n in &config.nodes {
         if !seen.insert(n.id) {
-            return Json(serde_json::json!({"error": format!("duplicate node id {}", n.id)}));
+            return Err(format!("duplicate node id {}", n.id));
         }
         if !n.x.is_finite() || !n.y.is_finite() || !n.z.is_finite() {
-            return Json(serde_json::json!({"error": format!("node {} has a non-finite coordinate", n.id)}));
+            return Err(format!("node {} has a non-finite coordinate", n.id));
         }
+    }
+    Ok(())
+}
+
+async fn config_set_room(
+    State(state): State<SharedState>,
+    Json(config): Json<RoomConfig>,
+) -> Json<serde_json::Value> {
+    if let Err(e) = validate_room_config(&config) {
+        return Json(serde_json::json!({"error": e}));
     }
 
     let mut s = state.write().await;
