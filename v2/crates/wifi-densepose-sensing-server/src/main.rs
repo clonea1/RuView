@@ -5112,10 +5112,22 @@ const BVP_HOP_SIZE: usize = 32;
 /// extraction (one window plus one hop, so `extract_bvp` has at least 2 time
 /// frames to work with rather than rejecting for insufficient samples).
 const MIN_BVP_SAMPLES: usize = BVP_WINDOW_SIZE + BVP_HOP_SIZE;
-/// Velocity magnitude (m/s) below which a BVP velocity bin is treated as
-/// near-DC leakage / static multipath rather than genuine Doppler-shifted
-/// motion, when summing a node's "moving energy" fraction.
-const BVP_ZERO_VELOCITY_DEADBAND_MPS: f64 = 0.05;
+/// How many BVP velocity bins on either side of zero count as "static" (DC
+/// leakage / non-moving), when summing a node's "moving energy" fraction.
+///
+/// BUG FOUND LIVE (2026-08-27): this was originally a fixed
+/// `BVP_ZERO_VELOCITY_DEADBAND_MPS = 0.05` m/s deadband. With the default
+/// `BvpConfig` (`max_velocity: 2.0`, `n_velocity_bins: 64`), the bin spacing
+/// is `2.0 * 2.0 / 64 = 0.0625` m/s — *wider* than that deadband. So the
+/// fixed threshold excluded only the single exact-zero bin; every other bin,
+/// including the immediate ±1 neighbors that a Hann-windowed STFT always
+/// leaks real DC/static energy into, counted as "moving". Live logs showed
+/// `total_weight` pinned near its theoretical max (~2.0 for 2 nodes) almost
+/// constantly, including while covering a sensor with a hand — a saturated,
+/// non-differentiating metric, not real motion. Excluding a *bin count*
+/// (derived from each call's actual `bvp.velocity_resolution`) instead of a
+/// fixed m/s threshold keeps this correct regardless of `BvpConfig` changes.
+const BVP_ZERO_VELOCITY_DEADBAND_BINS: usize = 2;
 /// Minimum combined per-node Doppler "moving energy" fraction (each node
 /// contributes a ratio in `[0, 1]`, see `node_doppler_weight`) before a
 /// Doppler centroid is considered meaningful. UNTUNED — picked as a starting
@@ -5175,12 +5187,21 @@ fn node_doppler_weight(n: &NodeState) -> Option<f64> {
         return None;
     }
     let last_col = bvp.data.column(bvp.n_time - 1);
+    // Index of the bin closest to v=0 (robust to even/odd n_velocity_bins and
+    // float rounding, unlike comparing velocity magnitudes against a fixed
+    // m/s threshold — see BVP_ZERO_VELOCITY_DEADBAND_BINS's doc comment).
+    let zero_idx = bvp
+        .velocity_bins
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| a.abs().partial_cmp(&b.abs()).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
     let mut moving = 0.0_f64;
     let mut total = 0.0_f64;
-    for (i, &v) in bvp.velocity_bins.iter().enumerate() {
-        let energy = last_col[i];
+    for (i, &energy) in last_col.iter().enumerate() {
         total += energy;
-        if v.abs() > BVP_ZERO_VELOCITY_DEADBAND_MPS {
+        if i.abs_diff(zero_idx) > BVP_ZERO_VELOCITY_DEADBAND_BINS {
             moving += energy;
         }
     }
@@ -5193,6 +5214,10 @@ fn node_doppler_weight(n: &NodeState) -> Option<f64> {
 /// Throttle for the diagnostic Doppler-centroid log — same rationale as
 /// `LAST_CENTROID_LOG`.
 static LAST_DOPPLER_LOG: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// Throttle for the diagnostic `attach_positions` log — see its call site.
+static LAST_ATTACH_LOG: std::sync::Mutex<Option<std::time::Instant>> =
     std::sync::Mutex::new(None);
 
 /// Estimate a rough person position as a Doppler-weighted centroid of node
@@ -5379,6 +5404,32 @@ fn motion_weighted_centroid(
 /// `motion_band_power`, and `pose` is taken from the real aggregate `posture`
 /// estimate when present, else left `None` (never fabricated).
 fn attach_positions(update: &mut SensingUpdate, estimate: Option<PositionEstimate>) {
+    // Diagnostic (2026-08-28): total_weight in the doppler/motion centroid
+    // logs was consistently well above threshold, yet the live dot rarely
+    // showed. This pins down *why*: attach_positions is a no-op whenever
+    // `persons` is empty, which is decided entirely by a different pipeline
+    // (presence classification + tracker) that has nothing to do with the
+    // centroid math — if that's the actual bottleneck, this log proves it
+    // instead of continuing to guess at the centroid functions.
+    {
+        let n_persons = update.persons.as_ref().map_or(0, |p| p.len());
+        let estimate_kind = match &estimate {
+            Some(PositionEstimate::Doppler(_)) => "doppler",
+            Some(PositionEstimate::Motion(_)) => "motion",
+            None => "none",
+        };
+        let mut last = LAST_ATTACH_LOG.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        if last.is_none_or(|t| now.duration_since(t).as_secs() >= 2) {
+            *last = Some(now);
+            drop(last);
+            info!(
+                "attach_positions: persons={n_persons} presence={} estimate={estimate_kind}",
+                update.classification.presence
+            );
+        }
+    }
+
     let Some(persons) = update.persons.as_mut() else {
         return;
     };
