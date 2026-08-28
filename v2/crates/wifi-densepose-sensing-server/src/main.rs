@@ -5289,12 +5289,16 @@ const MIN_BVP_SAMPLES: usize = BVP_WINDOW_SIZE + BVP_HOP_SIZE;
 /// (derived from each call's actual `bvp.velocity_resolution`) instead of a
 /// fixed m/s threshold keeps this correct regardless of `BvpConfig` changes.
 const BVP_ZERO_VELOCITY_DEADBAND_BINS: usize = 2;
-/// Minimum combined per-node Doppler "moving energy" fraction (each node
-/// contributes a ratio in `[0, 1]`, see `node_doppler_weight`) before a
-/// Doppler centroid is considered meaningful. UNTUNED — picked as a starting
-/// point pending live calibration; the diagnostic log below exists so this
-/// can be adjusted from real numbers instead of guessed further.
-const MIN_TOTAL_DOPPLER_WEIGHT: f64 = 0.05;
+/// Minimum combined per-node raw moving-energy magnitude (see
+/// `node_doppler_weight` — changed live 2026-08-28 from a `[0, 1]` ratio to
+/// raw magnitude, to test whether that preserves proximity information the
+/// ratio was throwing away) before a Doppler centroid is considered
+/// meaningful. Deliberately left near-zero (effectively "any nonzero total
+/// counts") rather than guessing a threshold in a unit scale that hasn't
+/// been observed live yet — the old `0.05` was calibrated for the `[0, 1]`
+/// ratio and is meaningless at raw-magnitude scale. Recalibrate from the
+/// diagnostic log below once real numbers are in.
+const MIN_TOTAL_DOPPLER_WEIGHT: f64 = 1e-6;
 
 /// Build a chronological `(n_samples, n_subcarriers)` matrix from a node's
 /// rolling amplitude history, taking the most recent `n_samples` frames.
@@ -5323,13 +5327,15 @@ fn build_csi_temporal(
     ndarray::Array2::from_shape_vec((n_samples, n_sc), data).ok()
 }
 
-/// Fraction of a node's most recent Body Velocity Profile time-frame that
-/// falls outside the near-zero-velocity deadband — i.e. how much of this
-/// node's link energy right now is genuinely Doppler-shifted (moving)
-/// rather than static multipath. Returns `None` when there isn't enough CSI
-/// history yet ([`MIN_BVP_SAMPLES`]) or BVP extraction otherwise fails
-/// (never panics on a bad/edge-case frame — falls through to the caller's
-/// next tier instead).
+/// Raw moving-energy magnitude from a node's most recent Body Velocity
+/// Profile time-frame — the energy summed over bins outside the near-zero-
+/// velocity deadband, i.e. how much of this node's link energy right now is
+/// genuinely Doppler-shifted (moving) rather than static multipath. NOT
+/// normalized to this node's own total energy (see [`MIN_TOTAL_DOPPLER_WEIGHT`]
+/// for why that changed). Returns `None` when there isn't enough CSI history
+/// yet ([`MIN_BVP_SAMPLES`]) or BVP extraction otherwise fails (never panics
+/// on a bad/edge-case frame — falls through to the caller's next tier
+/// instead).
 ///
 /// Carrier frequency is hardcoded to 2.4 GHz: RuView's ESP32 nodes sense
 /// 2.4 GHz WiFi traffic (`BvpConfig::default()`'s own 5 GHz assumption would
@@ -5369,7 +5375,18 @@ fn node_doppler_weight(n: &NodeState) -> Option<f64> {
     if total < 1e-9 {
         return None;
     }
-    Some((moving / total).clamp(0.0, 1.0))
+    // Raw moving-energy magnitude, NOT normalized to this node's own total
+    // energy. Was `moving / total` (a [0,1] ratio) — changed live
+    // (2026-08-28) after confirmed evidence the ratio doesn't spatially
+    // differentiate at all: covering each of 3 sensors by hand individually,
+    // and moving the whole body, produced zero change in the resulting
+    // centroid position, even though the ratio itself responds to motion in
+    // general. Hypothesis: normalizing to each node's own total energy
+    // throws away real magnitude differences a closer node should show
+    // (more absolute Doppler energy from a stronger, shorter-path
+    // reflection) — raw magnitude preserves that. NOT yet live-validated;
+    // this is the next real test, not a confirmed fix.
+    Some(moving.max(0.0))
 }
 
 /// Throttle for the diagnostic Doppler-centroid log — same rationale as
@@ -5827,12 +5844,13 @@ mod doppler_weighted_centroid_tests {
 
     #[test]
     fn node_doppler_weight_detects_synthetic_oscillation() {
+        // Raw magnitude, not a [0,1] ratio (changed live 2026-08-28) — just
+        // check it's a real, positive, finite detection, not a specific scale.
         let n = oscillating_node();
         let weight = node_doppler_weight(&n).expect("oscillating input should yield a real weight");
         assert!(
-            weight > 0.05,
-            "a genuinely oscillating signal should show meaningful moving-energy \
-             fraction, got {weight}"
+            weight > 0.0 && weight.is_finite(),
+            "a genuinely oscillating signal should yield positive, finite moving energy, got {weight}"
         );
     }
 
