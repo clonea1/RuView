@@ -2857,18 +2857,24 @@ const NODE_BASELINE_WARMUP_SECS: f64 = 5.0;
 
 /// Fraction of the learned "quiet room" baseline subtracted from the raw
 /// motion score before smoothing (`smooth_and_classify`/
-/// `smooth_and_classify_node`). Was `0.7`, always leaving 30% of the room's
-/// true noise floor as residual "motion" by construction — the concrete,
-/// still-unproven lead for the room reading `present_moving` continuously
-/// even when empty/still. Raised to `0.95` to test that theory: if the
-/// residual noise floor was the cause, `smoothed_motion` (and the
-/// motion-weighted centroid's `total_weight` log line) should now drop
-/// toward 0 in a genuinely empty room, and should meaningfully differ
-/// between nodes when someone stands near one vs. far from all three
-/// (previously it did not — walking up to each sensor didn't move the
-/// motion-centroid dot at all, consistent with the noise floor swamping any
-/// real per-node signal).
-const BASELINE_SUBTRACTION_FRACTION: f64 = 0.95;
+/// `smooth_and_classify_node`).
+///
+/// History: was `0.7`, always leaving 30% of the room's true noise floor as
+/// residual "motion" by construction — confirmed live (2026-08-27) as the
+/// cause of the room reading `present_moving` continuously even when empty
+/// (`total_weight` dropped from a steady ~0.42-0.46 to ~0.06-0.13 after
+/// raising this to `0.95`). But `0.95` then swung the other way: per-node
+/// classification confidence sat borderline (~42-43%, right at the
+/// absent/present_still line) on 2 of 3 nodes even while real disturbance
+/// was clearly happening (Doppler weight staying elevated the whole time),
+/// and `fuse_room`'s plurality vote (`inference.rs`) picked "absent" 2-to-1
+/// as a result — `presence` stayed `false` almost all the time despite a
+/// real person genuinely present and moving. `0.85` is a live-evidence-
+/// driven middle ground between the two confirmed failure modes, not a
+/// guess: enough baseline removal to keep the empty-room floor near zero,
+/// less than `0.95`'s over-correction that pinned real per-node confidence
+/// right at the classification boundary.
+const BASELINE_SUBTRACTION_FRACTION: f64 = 0.85;
 
 /// Apply EMA smoothing, adaptive baseline subtraction, and hysteresis debounce
 /// to the raw classification.  Mutates the smoothing state in `AppStateInner`.
