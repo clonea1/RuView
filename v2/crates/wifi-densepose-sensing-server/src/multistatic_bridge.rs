@@ -333,7 +333,7 @@ mod tests {
                 },
                 local_us: 10_000_000,
                 epoch_us: mesh_epoch_us,
-                sequence: sync_sequence,
+                sequence: sync_sequence, health: Default::default(),
             },
             Instant::now(),
         );

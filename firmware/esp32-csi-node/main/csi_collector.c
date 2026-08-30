@@ -12,6 +12,9 @@
  */
 
 #include "csi_collector.h"
+#include "thermal.h"
+#include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "nvs_config.h"
 #include "stream_sender.h"
 #include "edge_processing.h"
@@ -400,8 +403,33 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
             memcpy(&sync[8],  &local_us, 8);
             memcpy(&sync[16], &epoch_us, 8);
             memcpy(&sync[24], &s_sequence, 4);    /* high-water seq for pairing */
-            uint32_t zero32 = 0;
-            memcpy(&sync[28], &zero32, 4);        /* reserved (room for leader_id low32) */
+            /* Node health, in bytes that were reserved-zero.
+             *
+             * These nodes live on walls with no console, so a serial log line
+             * reaches nobody. The sync packet is the right carrier: it already
+             * leaves every node on a priority path at ~2 Hz and the server
+             * already stores it per node, so health rides along for free.
+             *
+             * Backward compatible in both directions -- an older server reads
+             * these as the zeros it always ignored, and a node that has
+             * thermal monitoring compiled out still sends zeros.
+             *
+             *   [7]  minimum free heap / 2048 (0 = unknown; ~510 KB range)
+             *   [28] reset reason (esp_reset_reason_t)
+             *   [29] thermal state (0 ok, 1 warn, 2 throttled, 3 critical)
+             *   [30] die temperature, signed whole degrees C
+             *   [31] current WiFi transmit ceiling, whole dBm
+             *
+             * Byte 31 matters as much as byte 30: a thermally throttled node's
+             * RSSI drops at both ends, which is indistinguishable from an
+             * obstruction unless the reader can see the transmit power fell. */
+            size_t minheap = esp_get_minimum_free_heap_size() / 2048;
+            sync[7]  = (uint8_t)(minheap > 255 ? 255 : minheap);
+            sync[28] = (uint8_t)esp_reset_reason();
+            sync[29] = (uint8_t)thermal_state();
+            float dc = thermal_celsius();
+            sync[30] = (dc < -100.0f) ? 0 : (uint8_t)(int8_t)dc;
+            sync[31] = (uint8_t)thermal_tx_dbm();
             /* Sync packets are 32 B at ~0.5 Hz — priority path so the CSI
              * ENOMEM backoff can't starve cross-node time alignment (#1183). */
             int sr = stream_sender_send_priority(sync, sizeof(sync));
