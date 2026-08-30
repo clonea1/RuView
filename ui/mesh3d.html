@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RF Distance Map</title>
+<!--
+  Orbitable 3D map of the mesh, laid out by RF distance rather than geometry.
+  No dependencies, so it works with the internet down — same as mark.html and
+  mesh.html.
+
+  Pipeline: RSSI -> distance (log-distance path loss) -> 3D positions
+  (gradient-descent MDS) -> projection you can orbit.
+
+  WHAT THIS IS NOT: architectural truth. Through walls and floors the signal
+  diffracts and bounces, so the path really is longer than the straight line
+  and every such link reads long. The reconstruction puffs up wherever
+  material intervenes.
+
+  WHAT IT IS: a map where distance means RF isolation. Two nodes in one room
+  sit close; two separated by a floor sit far apart *because the floor
+  attenuates*. Floors separate on their own without being told they exist,
+  and the gap between them measures what that floor costs. For sensing that
+  is the more useful quantity — RF coupling, not metres, is what decides
+  whether a link can see anything. It is also why the geometric link-line
+  model failed on this fleet: physical distance is not what matters.
+
+  The payoff is the comparison. Enter what you know to be physically true and
+  a link reading 80 ft across a 45 ft span is telling you something is in the
+  way — in feet, which is actionable, rather than dBm, which is not.
+
+  MDS by gradient descent rather than eigendecomposition: it needs no matrix
+  library, tolerates missing pairs (a link that cannot be heard is simply not
+  a constraint), and for N <= 16 converges in milliseconds.
+
+  At three nodes this is degenerate — three points always form a triangle, so
+  it fits perfectly and proves nothing. It starts testing itself at nine,
+  where 36 distances constrain 21 free parameters.
+-->
+<style>
+  :root{
+    --bg:#0d1117; --fg:#e6edf3; --dim:#8b949e; --line:#30363d; --card:#161b22;
+    --ok:#2ea043; --warn:#d29922; --bad:#f85149; --accent:#388bfd;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0; background:var(--bg); color:var(--fg);
+       font:13.5px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+       display:flex; flex-direction:column; height:100vh; overflow:hidden;}
+  header{padding:12px 16px 10px; border-bottom:1px solid var(--line); flex:0 0 auto;}
+  h1{font-size:15px; margin:0 0 2px;}
+  .sub{color:var(--dim); font-size:11.5px;}
+  .wrap{flex:1 1 auto; display:flex; min-height:0;}
+  #stage{flex:1 1 auto; position:relative; min-width:0;}
+  canvas{display:block; width:100%; height:100%; cursor:grab;}
+  canvas:active{cursor:grabbing;}
+  aside{flex:0 0 288px; border-left:1px solid var(--line); padding:14px;
+        overflow-y:auto; background:var(--card);}
+  @media (max-width:760px){ .wrap{flex-direction:column;} aside{flex:0 0 auto; border-left:none; border-top:1px solid var(--line);} }
+  h2{font-size:11px; letter-spacing:.1em; text-transform:uppercase;
+     color:var(--dim); margin:0 0 8px; font-weight:600;}
+  .grp{margin-bottom:18px;}
+  label{display:block; font-size:12px; color:var(--dim); margin:9px 0 3px;}
+  input[type=range]{width:100%;}
+  input[type=number]{width:100%; background:#0d1117; color:var(--fg);
+    border:1px solid var(--line); border-radius:5px; padding:5px 7px; font:inherit;}
+  .val{color:var(--fg); font-weight:600;}
+  table{width:100%; border-collapse:collapse; font-size:11.5px;}
+  td{padding:3px 4px; border-bottom:1px solid var(--line);}
+  td.n{text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap;}
+  .hint{color:var(--dim); font-size:11px; margin-top:7px; line-height:1.45;}
+  button{font:inherit; font-size:12px; padding:6px 11px; border-radius:6px;
+    cursor:pointer; border:1px solid var(--line); background:#21262d; color:var(--fg);}
+  .err{color:var(--bad);}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>RF Distance Map</h1>
+  <div class="sub">Laid out by signal isolation, not geometry. Drag to orbit, scroll to zoom.</div>
+</header>
+
+<div class="wrap">
+  <div id="stage"><canvas id="cv"></canvas></div>
+  <aside>
+    <div class="grp">
+      <h2>Path loss</h2>
+      <label>reference power at 1 ft <span class="val" id="p0v"></span></label>
+      <input type="range" id="p0" min="-60" max="-20" step="1" value="-40">
+      <label>exponent <span class="val" id="nv"></span> <span class="sub">(2 = open air, 3&ndash;4 = walls)</span></label>
+      <input type="range" id="n" min="15" max="45" step="1" value="30">
+      <div class="hint">Calibrate: pick two nodes whose real separation you
+      know, then move the exponent until the map agrees. Everything else
+      follows.</div>
+    </div>
+
+    <div class="grp">
+      <h2>Known distance <span class="sub">(optional)</span></h2>
+      <label>between node <input type="number" id="ka" value="0" style="width:52px;display:inline-block"> and <input type="number" id="kb" value="1" style="width:52px;display:inline-block"></label>
+      <label>actually <input type="number" id="kd" placeholder="feet" style="width:80px;display:inline-block"> ft apart</label>
+      <button id="solve">Fit exponent to this</button>
+      <div class="hint" id="fitnote"></div>
+    </div>
+
+    <div class="grp">
+      <h2>Links, in feet</h2>
+      <table id="tbl"></table>
+    </div>
+    <div class="sub" id="stamp"></div>
+  </aside>
+</div>
+
+<script>
+// ---- state ---------------------------------------------------------------
+var links = [], ids = [], pos = {}, az = 0.6, el = 0.4, zoom = 1, drag = null;
+var P0 = -40, PLE = 3.0;   // dBm at 1 ft, path-loss exponent
+
+function rssiToFeet(dbm){
+  // d = d0 * 10^((P0 - RSSI) / (10 * n)), d0 = 1 ft
+  return Math.pow(10, (P0 - dbm) / (10 * PLE));
+}
+
+// ---- MDS by gradient descent --------------------------------------------
+// Positions are pushed toward satisfying every observed distance. Missing
+// pairs contribute nothing rather than being guessed at.
+function layout(pairs, idlist){
+  var p = {};
+  idlist.forEach(function(id, i){
+    // Deterministic spread, so the map does not jump on every refresh.
+    var a = i * 2.399, r = 20 + i * 3;
+    p[id] = {x: Math.cos(a) * r, y: Math.sin(a) * r, z: ((i % 3) - 1) * 12};
+  });
+  for (var it = 0; it < 600; it++){
+    var lr = 0.10 * (1 - it / 600);
+    pairs.forEach(function(pr){
+      var A = p[pr.a], B = p[pr.b];
+      var dx = B.x - A.x, dy = B.y - A.y, dz = B.z - A.z;
+      var d = Math.sqrt(dx*dx + dy*dy + dz*dz) || 1e-6;
+      var err = (d - pr.d) / d * lr * 0.5;
+      A.x += dx * err; A.y += dy * err; A.z += dz * err;
+      B.x -= dx * err; B.y -= dy * err; B.z -= dz * err;
+    });
+  }
+  // Centre it so orbiting feels natural.
+  var c = {x:0,y:0,z:0}, k = idlist.length || 1;
+  idlist.forEach(function(id){ c.x+=p[id].x; c.y+=p[id].y; c.z+=p[id].z; });
+  idlist.forEach(function(id){ p[id].x-=c.x/k; p[id].y-=c.y/k; p[id].z-=c.z/k; });
+  return p;
+}
+
+function residual(pairs, p){
+  var s = 0, n = 0;
+  pairs.forEach(function(pr){
+    var A=p[pr.a], B=p[pr.b];
+    var d = Math.sqrt(Math.pow(B.x-A.x,2)+Math.pow(B.y-A.y,2)+Math.pow(B.z-A.z,2));
+    s += Math.abs(d - pr.d) / pr.d; n++;
+  });
+  return n ? s / n : 0;
+}
+
+// ---- render --------------------------------------------------------------
+var cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+
+function project(pt, w, h){
+  var ca=Math.cos(az), sa=Math.sin(az), ce=Math.cos(el), se=Math.sin(el);
+  var x = pt.x*ca - pt.z*sa;
+  var z = pt.x*sa + pt.z*ca;
+  var y = pt.y*ce - z*se;
+  var depth = pt.y*se + z*ce;
+  var s = zoom * Math.min(w,h) / 140;
+  return {x: w/2 + x*s, y: h/2 - y*s, d: depth};
+}
+
+function draw(){
+  var w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== w || cv.height !== h){ cv.width = w; cv.height = h; }
+  ctx.clearRect(0,0,w,h);
+  if (!ids.length){
+    ctx.fillStyle = '#8b949e'; ctx.font = '13px ui-monospace';
+    ctx.fillText('waiting for links…', 18, 26); return;
+  }
+
+  var pairs = buildPairs();
+  // Edges first, far ones dimmer.
+  pairs.forEach(function(pr){
+    var A = project(pos[pr.a], w, h), B = project(pos[pr.b], w, h);
+    var far = pr.d > 40, mid = pr.d > 20;
+    ctx.strokeStyle = far ? 'rgba(248,81,73,.55)'
+                     : mid ? 'rgba(210,153,34,.55)' : 'rgba(46,160,67,.65)';
+    ctx.lineWidth = far ? 1 : 1.8;
+    ctx.beginPath(); ctx.moveTo(A.x,A.y); ctx.lineTo(B.x,B.y); ctx.stroke();
+    var mx=(A.x+B.x)/2, my=(A.y+B.y)/2;
+    ctx.fillStyle = '#8b949e'; ctx.font = '10px ui-monospace';
+    ctx.fillText(pr.d.toFixed(0) + " ft", mx + 3, my - 3);
+  });
+
+  ids.map(function(id){ return {id:id, p:project(pos[id], w, h)}; })
+     .sort(function(a,b){ return a.p.d - b.p.d; })
+     .forEach(function(o){
+       var r = 9 + o.p.d * 0.02;
+       ctx.beginPath(); ctx.arc(o.p.x, o.p.y, Math.max(5,r), 0, Math.PI*2);
+       ctx.fillStyle = o.id === 'AP' ? '#388bfd' : '#e6edf3';
+       ctx.fill();
+       ctx.fillStyle = '#0d1117'; ctx.font = 'bold 10px ui-monospace';
+       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+       ctx.fillText(o.id === 'AP' ? 'AP' : o.id, o.p.x, o.p.y);
+       ctx.textAlign = 'start'; ctx.textBaseline = 'alphabetic';
+     });
+}
+
+function buildPairs(){
+  var best = {};
+  links.forEach(function(l){
+    var tx = (l.tx_node_inferred === null || l.tx_node_inferred === undefined)
+             ? 'AP' : String(l.tx_node_inferred);
+    var rx = String(l.rx_node);
+    if (tx === rx) return;
+    var k = [rx,tx].sort().join('|');
+    // Average the two directions where both exist — propagation is reciprocal,
+    // so disagreement is noise and the mean is the better estimate.
+    if (!best[k]) best[k] = {a:k.split('|')[0], b:k.split('|')[1], v:[]};
+    best[k].v.push(l.rssi_dbm);
+  });
+  return Object.keys(best).map(function(k){
+    var e = best[k];
+    var mean = e.v.reduce(function(s,x){return s+x;},0) / e.v.length;
+    return {a:e.a, b:e.b, d:rssiToFeet(mean), rssi:mean};
+  });
+}
+
+function recompute(){
+  var pairs = buildPairs();
+  var set = {};
+  pairs.forEach(function(p){ set[p.a]=1; set[p.b]=1; });
+  ids = Object.keys(set).sort();
+  pos = layout(pairs, ids);
+
+  var rows = '<tr><td>pair</td><td class="n">dBm</td><td class="n">ft</td></tr>';
+  pairs.sort(function(a,b){ return a.d - b.d; }).forEach(function(p){
+    rows += '<tr><td>' + p.a + ' &harr; ' + p.b + '</td><td class="n">' +
+            p.rssi.toFixed(0) + '</td><td class="n">' + p.d.toFixed(0) + '</td></tr>';
+  });
+  document.getElementById('tbl').innerHTML = rows;
+  document.getElementById('stamp').textContent =
+    ids.length + ' nodes · ' + pairs.length + ' links · fit residual ' +
+    (residual(pairs, pos)*100).toFixed(1) + '%' +
+    (ids.length <= 3 ? ' — degenerate below 4 nodes' : '');
+  draw();
+}
+
+// ---- controls ------------------------------------------------------------
+function syncLabels(){
+  document.getElementById('p0v').textContent = P0 + ' dBm';
+  document.getElementById('nv').textContent = PLE.toFixed(1);
+}
+document.getElementById('p0').oninput = function(){
+  P0 = +this.value; syncLabels(); recompute();
+};
+document.getElementById('n').oninput = function(){
+  PLE = +this.value / 10; syncLabels(); recompute();
+};
+document.getElementById('solve').onclick = function(){
+  var a = document.getElementById('ka').value.trim();
+  var b = document.getElementById('kb').value.trim();
+  var want = parseFloat(document.getElementById('kd').value);
+  var note = document.getElementById('fitnote');
+  if (!(want > 0)) { note.innerHTML = '<span class="err">enter a distance in feet</span>'; return; }
+  var pr = buildPairs().filter(function(p){
+    return (p.a===a&&p.b===b) || (p.a===b&&p.b===a); })[0];
+  if (!pr) { note.innerHTML = '<span class="err">no link between those two</span>'; return; }
+  // Solve n directly: want = 10^((P0 - rssi)/(10n))  ->  n = (P0-rssi)/(10*log10(want))
+  var lg = Math.log(want) / Math.LN10;
+  if (Math.abs(lg) < 1e-6) { note.innerHTML = '<span class="err">pick a pair not 1 ft apart</span>'; return; }
+  var n = (P0 - pr.rssi) / (10 * lg);
+  if (!(n > 1.5 && n < 4.5)) {
+    note.innerHTML = '<span class="err">that implies exponent ' + n.toFixed(2) +
+      ', outside the physical 1.5&ndash;4.5 range. Check the node numbers or the distance.</span>';
+    return;
+  }
+  PLE = n; document.getElementById('n').value = Math.round(n*10);
+  syncLabels(); recompute();
+  note.textContent = 'exponent set to ' + n.toFixed(2) +
+    ' — every other distance is now scaled against that pair.';
+};
+
+cv.addEventListener('mousedown', function(e){ drag = {x:e.clientX, y:e.clientY}; });
+window.addEventListener('mouseup', function(){ drag = null; });
+window.addEventListener('mousemove', function(e){
+  if (!drag) return;
+  az += (e.clientX - drag.x) * 0.01;
+  el += (e.clientY - drag.y) * 0.01;
+  el = Math.max(-1.4, Math.min(1.4, el));
+  drag = {x:e.clientX, y:e.clientY};
+  draw();
+});
+cv.addEventListener('wheel', function(e){
+  e.preventDefault();
+  zoom *= e.deltaY > 0 ? 0.92 : 1.08;
+  zoom = Math.max(0.2, Math.min(6, zoom));
+  draw();
+}, {passive:false});
+window.addEventListener('resize', draw);
+
+function load(){
+  fetch('/api/v1/links', {cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){ links = d.links || []; recompute(); })
+    .catch(function(){
+      document.getElementById('stamp').innerHTML = '<span class="err">server unreachable</span>';
+    });
+}
+syncLabels(); load(); setInterval(load, 5000);
+</script>
+</body>
+</html>
