@@ -16,10 +16,13 @@ mod engine_bridge;
 mod field_bridge;
 mod field_localize;
 mod model_format;
+mod links;
 mod multistatic_bridge;
+mod phase_diag;
 mod mediatek_csi;
 mod qualcomm_csi;
 mod realtek_radar;
+mod rti;
 mod path_safety;
 pub mod pose;
 pub mod pose_physics;
@@ -124,6 +127,30 @@ struct Args {
     /// Path to UI static files (repo `ui/`; from `v2/` use `../ui` or rely on auto-detect)
     #[arg(long, default_value = "../ui")]
     ui_path: PathBuf,
+
+    /// Write phase-channel diagnostics (CSV) to this directory. Records the
+    /// common-mode phase and STO slope of every raw CSI frame *before*
+    /// sanitization, plus bounded raw-I/Q capture windows, to determine
+    /// whether single-antenna ESP32 phase can carry Doppler at all. Off by
+    /// default; adds no work to the signal path when unset. Output is
+    /// CSI-derived — never commit it (`CLAUDE.md`).
+    #[arg(long, value_name = "DIR")]
+    phase_diagnostics: Option<PathBuf>,
+
+    /// Re-enable the bistatic phase-Doppler position tier, which is disabled
+    /// by default. It requires a signed per-link radial velocity, and the CSI
+    /// phase component that would carry one was measured to be uniform-random
+    /// per packet on this hardware — see `bistatic_tier_enabled` for the data.
+    /// Only meaningful on hardware that can supply real signed Doppler.
+    #[arg(long)]
+    enable_bistatic_tier: bool,
+
+    /// Record every frame to the raw phase-diagnostics sink instead of the
+    /// default duty-cycled bursts (1.4 min in every 10). Needed for a
+    /// deliberate-motion test, which the duty cycle would mostly miss. Costs
+    /// ~275 MB/hour at 3 nodes — use it for a bounded, attended experiment.
+    #[arg(long, requires = "phase_diagnostics")]
+    phase_diagnostics_continuous: bool,
 
     /// Tick interval in milliseconds (default 100 ms = 10 fps for smooth pose animation)
     #[arg(long, default_value = "100")]
@@ -306,6 +333,16 @@ struct Esp32Frame {
     /// ADR-110 byte 19 metadata, including whether this frame was captured
     /// while the node had a valid IEEE 802.15.4 mesh-time solution.
     adr018_flags: wifi_densepose_hardware::Adr018Flags,
+    /// Transmitter (addr2) of the frame this CSI was sampled from — wire v2
+    /// (`CSI_MAGIC_V2`) only; `None` from v1 firmware.
+    ///
+    /// Without this the server cannot tell which link a frame describes. A
+    /// node in promiscuous MGMT+DATA mode with no `filter_mac` captures the
+    /// AP, its peer nodes, and unrelated household traffic into one
+    /// unlabelled sequence — measured 2026-08-28 at roughly 75% non-AP on a
+    /// normal home channel. Interleaving links with different geometry
+    /// corrupts any temporal statistic built from `frame_history`.
+    source_mac: Option<[u8; 6]>,
     amplitudes: Vec<f64>,
     phases: Vec<f64>,
 }
@@ -827,6 +864,13 @@ struct BoundingBox {
 /// sign detector so that data from different nodes is never mixed.
 struct NodeState {
     pub(crate) frame_history: VecDeque<Vec<f64>>,
+    /// Sanitized per-frame phase, in lockstep with `frame_history` (same
+    /// length, same eviction — pushed together at the one real ESP32
+    /// ingestion site). "Sanitized" means `sanitize_phase_linear_detrend`
+    /// has already removed the dominant packet-timing-offset trend across
+    /// subcarrier index; this is NOT raw `atan2` output. See
+    /// `build_csi_temporal_complex`/`node_doppler_sample` for what it feeds.
+    pub(crate) phase_history: VecDeque<Vec<f64>>,
     smoothed_person_score: f64,
     pub(crate) prev_person_count: usize,
     /// Confidence in `current_motion_level`, from `smooth_and_classify_node`'s
@@ -840,6 +884,13 @@ struct NodeState {
     debounce_candidate: String,
     baseline_motion: f64,
     baseline_frames: u64,
+    /// Slow EMA of this node's resting-state `mean_radial_velocity` (see
+    /// `node_doppler_sample`) — tracks per-node CFO/oscillator phase bias so
+    /// `bistatic_links` can subtract it before the geometry solve. Same
+    /// baseline-subtraction principle as `baseline_motion`, applied to the
+    /// phase-velocity channel instead of amplitude.
+    radial_velocity_baseline: f64,
+    radial_velocity_baseline_ticks: u64,
     smoothed_hr: f64,
     smoothed_br: f64,
     smoothed_hr_conf: f64,
@@ -916,36 +967,71 @@ const NOVELTY_HISTORY_CAPACITY: usize = 64;
 /// subcarrier ordering / normalisation so banks reject stale data.
 const NOVELTY_SKETCH_VERSION: u16 = 1;
 
-/// Lower plausibility floor (seconds) for a CSI inter-frame delta.
+/// Upper plausibility bound (seconds) for a CSI inter-frame delta. Anything
+/// longer is a connection gap, not a frame-rate sample.
+pub(crate) const MAX_PLAUSIBLE_CSI_DT_SEC: f64 = 1.0;
+
+/// The firmware's hard production ceiling, in fps.
 ///
-/// The firmware caps CSI sends at `CSI_MIN_SEND_INTERVAL_US = 20 ms`
-/// (`csi_collector.c`), so a single node cannot physically produce frames
-/// faster than 50 fps. UDP/OS buffering, however, delivers frames in tight
-/// bursts whose intra-burst arrival deltas are tens of microseconds apart —
-/// a 36 µs delta yields `1/dt ≈ 27 kHz`, which the old `< 1 s` guard let
-/// straight into the EMA and inflated `csi_fps_ema` by 1–3 orders of
-/// magnitude (issue #1180). We reject any delta implying more than 200 fps
-/// (4× the physical ceiling, leaving slack for benign arrival jitter); such
-/// deltas are burst artifacts, not distinct production intervals.
-pub(crate) const MIN_PLAUSIBLE_CSI_DT_SEC: f64 = 0.005;
+/// `csi_collector.c` gates sends on `CSI_MIN_SEND_INTERVAL_US = 20 ms`, so a
+/// single node cannot produce frames faster than this. Used only to assert
+/// the estimator stays physically possible — see `update_csi_fps_ema`.
+pub(crate) const CSI_PRODUCTION_CEILING_FPS: f64 = 50.0;
 
 /// ADR-110 iter 18 — EMA update for per-node CSI fps tracking.
 ///
-/// Returns the new EMA value, or `None` if the delta is implausible
-/// (below [`MIN_PLAUSIBLE_CSI_DT_SEC`] — a sub-ms burst artifact, see
-/// issue #1180 — or `> 1 second`, likely a connection gap rather than a
-/// real frame-rate sample). α = 1/8 fixed shift, ~8-sample effective
-/// window, matching the firmware-side ESP-NOW offset smoother in §A0.10.
+/// Smooths the **inter-frame delta**, then reports its reciprocal. This is
+/// deliberate, and is the fix for the residual half of issue #1180.
 ///
+/// The estimator we want is `frames / elapsed`. Over any window that is
+/// exactly the reciprocal of the *arithmetic mean* of the inter-arrival
+/// deltas, because those deltas sum to the elapsed time by construction —
+/// so a mean-of-`dt` estimator is immune to how the arrivals clump. A
+/// mean-of-`1/dt` estimator is not: `1/x` is convex, so by Jensen it is
+/// biased upward by any variance in `dt`, and UDP burst delivery supplies
+/// plenty. That bias is why the original code reported 1,670–36,076 Hz
+/// against a ~40 fps ground truth (#1180).
+///
+/// The first fix (PR #1193) kept the reciprocal average and added a 5 ms
+/// floor. That removed the worst of it but left ~20 %: measured on a live
+/// 3-node C6 fleet on 2026-08-28, `csi_fps_ema` read 43.2 while the node's
+/// own `sequence` counter advanced at 35.7 fps, and **21 % of samples
+/// exceeded the 50 fps physical ceiling** (max 73.7) — a rate the firmware
+/// cannot produce. A floor also cannot fix this, because discarding short
+/// deltas drops terms from the sum and breaks the identity above, trading
+/// an over-estimate for an under-estimate.
+///
+/// So: no lower floor. A sub-millisecond intra-burst delta is a real
+/// (if clumped) arrival and contributes its true, near-zero share to the
+/// mean. Only non-positive deltas and connection-length gaps are rejected.
+///
+/// Smoothing constant, and why it is not the 1/8 used elsewhere.
+///
+/// Mean-of-`dt` is unbiased at any α — simulated over realistic burst
+/// patterns the long-run mean lands within 1 % of ground truth even at 1/8.
+/// What α controls is the swing of the *instantaneous* value, and that is
+/// the value both `/api/v1/mesh` and `mesh_aligned_us_for_sequence` read.
+/// Against a 40 fps node delivered in bursts of three, peak error is +15 %
+/// at α=1/8, +7 % at 1/16, +3 % at 1/32. 1/32 is ~0.9 s of response at
+/// 36 fps, which is ample for a quantity used to interpolate timestamps.
+const CSI_FPS_EMA_ALPHA: f64 = 1.0 / 32.0;
+
 /// Free function for testability — every transformation that doesn't
 /// touch the rest of `NodeState` lives outside the `impl` block.
 pub(crate) fn update_csi_fps_ema(prev_fps: f64, dt_sec: f64) -> Option<f64> {
-    if !(dt_sec >= MIN_PLAUSIBLE_CSI_DT_SEC && dt_sec < 1.0) {
+    if !(dt_sec > 0.0 && dt_sec < MAX_PLAUSIBLE_CSI_DT_SEC) {
         return None;
     }
-    let instantaneous = 1.0 / dt_sec;
-    // y[n] = y[n-1] + (x - y[n-1]) / 8
-    Some(prev_fps + (instantaneous - prev_fps) / 8.0)
+    if !(prev_fps.is_finite() && prev_fps > 0.0) {
+        return None;
+    }
+    // Smooth in the delta domain: y[n] = y[n-1] + α (dt - y[n-1]).
+    let prev_dt = 1.0 / prev_fps;
+    let dt_ema = prev_dt + (dt_sec - prev_dt) * CSI_FPS_EMA_ALPHA;
+    if dt_ema <= 0.0 {
+        return None;
+    }
+    Some(1.0 / dt_ema)
 }
 
 #[cfg(test)]
@@ -955,7 +1041,7 @@ mod fps_ema_tests {
     #[test]
     fn steady_10hz_converges_toward_10() {
         let mut fps = 20.0;
-        for _ in 0..40 {
+        for _ in 0..400 {
             fps = update_csi_fps_ema(fps, 0.100).unwrap();
         }
         assert!((fps - 10.0).abs() < 0.1,
@@ -965,7 +1051,7 @@ mod fps_ema_tests {
     #[test]
     fn steady_20hz_stays_near_20() {
         let mut fps = 20.0;
-        for _ in 0..20 {
+        for _ in 0..200 {
             fps = update_csi_fps_ema(fps, 0.050).unwrap();
         }
         assert!((fps - 20.0).abs() < 0.05, "expected ~20 Hz, got {fps}");
@@ -983,31 +1069,63 @@ mod fps_ema_tests {
     }
 
     #[test]
-    fn subms_burst_delta_rejected() {
-        // Issue #1180: a 36 µs intra-burst delta implies ~27 kHz and must
-        // not enter the EMA. Anything below the 5 ms floor is rejected.
-        assert!(update_csi_fps_ema(40.0, 0.000_036).is_none());
-        assert!(update_csi_fps_ema(40.0, 0.001).is_none());
-        // Just above the floor is accepted.
+    fn subms_burst_delta_is_accepted_not_discarded() {
+        // Superseded model. The old test asserted a 5 ms floor rejected
+        // intra-burst deltas; that floor is what made the estimator biased,
+        // because dropping terms breaks `sum(dt) == elapsed`. A sub-ms delta
+        // is a real arrival and contributes its true near-zero share.
+        assert!(update_csi_fps_ema(40.0, 0.000_036).is_some());
+        assert!(update_csi_fps_ema(40.0, 0.001).is_some());
         assert!(update_csi_fps_ema(40.0, 0.005).is_some());
     }
 
     #[test]
-    fn burst_interleaved_with_nominal_stays_in_band() {
-        // A true ~40 fps node whose frames arrive in sub-ms bursts: feeding
-        // only the plausible (nominal-cadence) deltas keeps the EMA near the
-        // ground truth instead of blowing up. Burst deltas are rejected by
-        // the caller (see NodeState::observe_csi_frame_arrival), so the EMA
-        // only ever sees the ~25 ms inter-group gaps.
+    fn burst_delivery_recovers_true_production_rate() {
+        // Issue #1180, residual half. A node truly producing 40 fps whose
+        // frames are delivered by UDP in pairs: two arrive ~40 µs apart,
+        // then a ~50 ms gap. Four frames per 100 ms is 40 fps.
+        //
+        // The old reciprocal-average blew up on the 40 µs deltas; the old
+        // floor-plus-keep-anchor scheme saw one 50 ms delta per two frames
+        // and read ~20 fps. Averaging dt with every arrival anchored
+        // recovers the truth.
         let mut fps = 40.0;
-        for _ in 0..40 {
-            // nominal 25 ms gap (40 fps); intervening sub-ms bursts skipped
-            fps = update_csi_fps_ema(fps, 0.025).unwrap();
-            assert!(update_csi_fps_ema(fps, 0.000_040).is_none());
+        for _ in 0..400 {
+            fps = update_csi_fps_ema(fps, 0.000_040).unwrap();
+            fps = update_csi_fps_ema(fps, 0.049_960).unwrap();
         }
         assert!(
-            (fps - 40.0).abs() < 1.0,
-            "EMA should stay within ~1 Hz of the 40 fps ground truth, got {fps}"
+            (fps - 40.0).abs() < 1.5,
+            "burst-delivered 40 fps must read ~40, got {fps}"
+        );
+    }
+
+    #[test]
+    fn estimator_cannot_exceed_the_firmware_production_ceiling() {
+        // The regression that motivated this change: on the live 3-node C6
+        // fleet, 21 % of `csi_fps_ema` samples exceeded 50 fps (max 73.7),
+        // which `CSI_MIN_SEND_INTERVAL_US = 20 ms` makes physically
+        // impossible. Drive the estimator with the worst realistic burst
+        // pattern for a 35.7 fps node and assert it stays under the ceiling.
+        let mut fps = 35.7;
+        let mut worst: f64 = 0.0;
+        for i in 0..2_000 {
+            // Every 4th frame arrives as a tight burst pair; the rest pace
+            // out so the long-run mean stays 28 ms (35.7 fps).
+            let dt = if i % 4 == 0 { 0.000_050 } else { 0.037_317 };
+            fps = update_csi_fps_ema(fps, dt).unwrap();
+            if i > 50 {
+                worst = worst.max(fps);
+            }
+        }
+        assert!(
+            worst < super::CSI_PRODUCTION_CEILING_FPS,
+            "estimator reported {worst} fps, above the {} fps firmware ceiling",
+            super::CSI_PRODUCTION_CEILING_FPS
+        );
+        assert!(
+            (fps - 35.7).abs() < 4.0,
+            "should track the 35.7 fps ground truth, got {fps}"
         );
     }
 }
@@ -1121,15 +1239,20 @@ impl NodeState {
         let first_sensing_frame = self.last_frame_time.is_none();
         if let Some(prev) = self.last_frame_time {
             let dt = now.duration_since(prev).as_secs_f64();
-            // Burst arrivals (sub-floor dt, issue #1180): do NOT re-anchor on
-            // them. Keeping the previous anchor means the next genuine
-            // inter-frame gap measures the true cadence across the whole
-            // burst instead of intra-burst jitter — so a 50 fps node whose
-            // frames arrive in 36 µs bursts every 25 ms still reads ~40 fps,
-            // not 27 kHz.
-            if dt < MIN_PLAUSIBLE_CSI_DT_SEC {
-                return false;
-            }
+            // Re-anchor on EVERY arrival, including intra-burst ones.
+            //
+            // The previous code skipped sub-floor deltas *and* kept the old
+            // anchor, so a burst of N frames contributed a single delta
+            // spanning the whole burst — the estimator saw one interval where
+            // N frames had been produced, an N-fold under-count. That masked
+            // the reciprocal-averaging over-count in `update_csi_fps_ema`
+            // rather than cancelling it; on the 3-node C6 fleet the net was
+            // still +21 % against the `sequence` ground truth.
+            //
+            // Anchoring on every frame keeps the deltas summing to the
+            // elapsed time with one term per frame, which is exactly the
+            // condition that makes the mean-of-`dt` estimator equal
+            // `frames / elapsed`.
             if let Some(new_ema) = update_csi_fps_ema(self.csi_fps_ema, dt) {
                 self.csi_fps_ema = new_ema;
                 self.csi_fps_samples = self.csi_fps_samples.saturating_add(1);
@@ -1157,6 +1280,7 @@ impl NodeState {
     pub(crate) fn new() -> Self {
         Self {
             frame_history: VecDeque::new(),
+            phase_history: VecDeque::new(),
             smoothed_person_score: 0.0,
             prev_person_count: 0,
             smoothed_classification_confidence: 0.0,
@@ -1166,6 +1290,8 @@ impl NodeState {
             debounce_candidate: "absent".to_string(),
             baseline_motion: 0.0,
             baseline_frames: 0,
+            radial_velocity_baseline: 0.0,
+            radial_velocity_baseline_ticks: 0,
             smoothed_hr: 0.0,
             smoothed_br: 0.0,
             smoothed_hr_conf: 0.0,
@@ -1692,6 +1818,14 @@ struct AppStateInner {
     latest_qualcomm_csi: Option<qualcomm_csi::QualcommCsiSnapshot>,
     /// Instant of the last validated Qualcomm CSI UDP frame.
     last_qualcomm_frame: Option<std::time::Instant>,
+    /// Per-(receiver, transmitter) link state. Populated only from wire v2
+    /// frames, which carry the transmitter MAC. This is the layer node<->node
+    /// ranging is built on; see `links` for why it exists alongside, not
+    /// instead of, the per-node model.
+    link_table: links::LinkTable,
+    /// Latest per-slot vitals per node (magic 0xC511_0009). Distinct from
+    /// `edge_vitals`, which carries only the aggregate.
+    latest_vitals_slots: HashMap<u8, Esp32VitalsSlotsPacket>,
     /// Latest bounded ADR-270 event per vendor. Complex CSI uses dedicated transports.
     latest_vendor_rf: BTreeMap<String, wifi_densepose_sensing_server::vendor_rf::VendorEventSnapshot>,
     tx: broadcast::Sender<String>,
@@ -1796,6 +1930,11 @@ struct AppStateInner {
     /// (`POST /api/v1/config/room`) and loaded from `room_config.json` at
     /// startup, mirroring `node_positions_config`. `None` until configured.
     ap_position: Option<[f32; 3]>,
+    /// Room bounds `(width_m, depth_m)` from Room Builder — `(0.0, 0.0)`
+    /// when never configured. Used only by `step_bistatic_filter` to clamp
+    /// its dead-reckoned position to "inside the room"; every other tier is
+    /// unaffected by this field.
+    room_bounds: (f32, f32),
     /// Debounced room-level classification state — see
     /// `debounce_room_classification`. `fuse_room` is a fresh, memoryless
     /// plurality vote every cycle with no debounce of its own (unlike each
@@ -1805,6 +1944,21 @@ struct AppStateInner {
     room_debounced_level: String,
     room_debounce_candidate: String,
     room_debounce_since: Option<std::time::Instant>,
+    /// Persisted state for `step_bistatic_filter` — a dead-reckoning filter
+    /// that integrates `solve_bistatic_velocity`'s per-tick velocity solve
+    /// (real bistatic Doppler-ellipse geometry, using `ap_position` +
+    /// `node_positions_config`) and softly corrects toward the existing
+    /// Doppler/motion centroid to bound drift. `None` whenever nobody's been
+    /// present long enough to seed an estimate (see
+    /// `BISTATIC_PRESENCE_TIMEOUT_SECS`).
+    bistatic_position: Option<(f64, f64)>,
+    /// Self-reported filter uncertainty (meters) — grows with dead-reckoned
+    /// time since the last correction, shrinks when a correction lands.
+    /// NOT a calibrated physical error bound (`CLAUDE.md`: label as
+    /// `CLAIMED`, never `MEASURED`, until live-validated against ground
+    /// truth).
+    bistatic_uncertainty_m: f64,
+    bistatic_last_update: Option<std::time::Instant>,
     /// Governed trust-path bridge (ADR-135..146): runs the same live frames
     /// through the privacy/provenance/witness control plane. Does not alter
     /// person-count behavior; its trust state (witness, effective class,
@@ -2011,6 +2165,8 @@ impl AppStateInner {
     /// build the training router without the full server boot.
     pub(crate) fn minimal() -> Self {
         AppStateInner {
+            link_table: links::LinkTable::new(),
+            latest_vitals_slots: HashMap::new(),
             latest_update: None,
             last_broadcast_at: None,
             rssi_history: VecDeque::new(),
@@ -2069,9 +2225,13 @@ impl AppStateInner {
             multistatic_fuser: MultistaticFuser::new(),
             node_positions_config: HashMap::new(),
             ap_position: None,
+            room_bounds: (0.0, 0.0),
             room_debounced_level: "absent".to_string(),
             room_debounce_candidate: "absent".to_string(),
             room_debounce_since: None,
+            bistatic_position: None,
+            bistatic_uncertainty_m: 0.0,
+            bistatic_last_update: None,
             engine_bridge: engine_bridge::EngineBridge::new(
                 wifi_densepose_bfld::PrivacyMode::PrivateHome,
                 1,
@@ -2145,6 +2305,132 @@ fn parse_esp32_vitals(buf: &[u8]) -> Option<Esp32VitalsPacket> {
         presence_score,
         timestamp_ms,
     })
+}
+
+// ── Per-slot vitals packet (magic 0xC511_0009) ───────────────────────────────
+
+/// One detection slot's independently-estimated vitals.
+#[derive(Debug, Clone, Copy, Serialize)]
+struct VitalsSlot {
+    slot: u8,
+    active: bool,
+    breathing_bpm: f64,
+    heartrate_bpm: f64,
+    /// Subcarrier group this slot tracks — slots on the same group are not
+    /// independent observations.
+    subcarrier_idx: u8,
+}
+
+/// Per-slot vitals, sent alongside the aggregate 32-byte vitals packet.
+///
+/// The firmware's slot count is a subcarrier-energy-cluster heuristic with no
+/// size or species discrimination, so calling it "persons" overclaims what is
+/// measured (`CLAUDE.md`). Per-slot breathing rates are the evidence that can
+/// distinguish what a slot actually is: a resting human sits near 12-20 BPM,
+/// smaller animals considerably higher.
+#[derive(Debug, Clone, Serialize)]
+struct Esp32VitalsSlotsPacket {
+    node_id: u8,
+    n_active: u8,
+    max_slots: u8,
+    timestamp_ms: u32,
+    slots: Vec<VitalsSlot>,
+}
+
+/// Parse a 32-byte per-slot vitals packet (magic 0xC511_0009).
+fn parse_esp32_vitals_slots(buf: &[u8]) -> Option<Esp32VitalsSlotsPacket> {
+    if buf.len() < 32 {
+        return None;
+    }
+    if u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) != 0xC511_0009 {
+        return None;
+    }
+    let node_id = buf[4];
+    let n_active = buf[5];
+    let max_slots = buf[6];
+    let active_mask = buf[7];
+    let timestamp_ms = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+
+    // The firmware's EDGE_MAX_PERSONS is 4; trust the packet's own declaration
+    // but bound it to what the fixed 32-byte layout can actually hold.
+    const WIRE_SLOTS: usize = 4;
+    let n = (max_slots as usize).min(WIRE_SLOTS);
+
+    let mut slots = Vec::with_capacity(n);
+    for p in 0..n {
+        let br = u16::from_le_bytes([buf[12 + p * 2], buf[13 + p * 2]]);
+        let hr = u16::from_le_bytes([buf[20 + p * 2], buf[21 + p * 2]]);
+        slots.push(VitalsSlot {
+            slot: p as u8,
+            active: (active_mask & (1 << p)) != 0,
+            breathing_bpm: br as f64 / 100.0,
+            heartrate_bpm: hr as f64 / 100.0,
+            subcarrier_idx: buf[28 + p],
+        });
+    }
+
+    Some(Esp32VitalsSlotsPacket {
+        node_id,
+        n_active,
+        max_slots,
+        timestamp_ms,
+        slots,
+    })
+}
+
+#[cfg(test)]
+mod vitals_slots_tests {
+    use super::*;
+
+    fn pkt(active_mask: u8, br: [u16; 4], hr: [u16; 4]) -> Vec<u8> {
+        let mut b = vec![0u8; 32];
+        b[0..4].copy_from_slice(&0xC511_0009u32.to_le_bytes());
+        b[4] = 2; // node_id
+        b[5] = active_mask.count_ones() as u8;
+        b[6] = 4; // max_slots
+        b[7] = active_mask;
+        b[8..12].copy_from_slice(&12345u32.to_le_bytes());
+        for p in 0..4 {
+            b[12 + p * 2..14 + p * 2].copy_from_slice(&br[p].to_le_bytes());
+            b[20 + p * 2..22 + p * 2].copy_from_slice(&hr[p].to_le_bytes());
+            b[28 + p] = p as u8 * 7;
+        }
+        b
+    }
+
+    #[test]
+    fn parses_per_slot_rates_and_active_mask() {
+        // Slot 0 human-plausible (16 BPM), slot 1 animal-plausible (48 BPM).
+        let p = pkt(0b0011, [1600, 4800, 0, 0], [7200, 24000, 0, 0]);
+        let v = parse_esp32_vitals_slots(&p).expect("parses");
+        assert_eq!(v.node_id, 2);
+        assert_eq!(v.n_active, 2);
+        assert_eq!(v.slots.len(), 4);
+        assert!(v.slots[0].active && v.slots[1].active);
+        assert!(!v.slots[2].active && !v.slots[3].active);
+        assert!((v.slots[0].breathing_bpm - 16.0).abs() < 1e-9);
+        assert!((v.slots[1].breathing_bpm - 48.0).abs() < 1e-9);
+        assert!((v.slots[1].heartrate_bpm - 240.0).abs() < 1e-9);
+        assert_eq!(v.slots[2].subcarrier_idx, 14);
+    }
+
+    #[test]
+    fn rejects_other_magics_and_short_buffers() {
+        let mut p = pkt(0b0001, [1200; 4], [7000; 4]);
+        p[0..4].copy_from_slice(&0xC511_0002u32.to_le_bytes());
+        assert!(parse_esp32_vitals_slots(&p).is_none(), "must not claim the aggregate packet");
+        assert!(parse_esp32_vitals_slots(&[0u8; 12]).is_none());
+    }
+
+    /// A slot count larger than the fixed 32-byte layout can hold must not
+    /// read past the buffer.
+    #[test]
+    fn oversized_max_slots_is_clamped_not_trusted() {
+        let mut p = pkt(0xFF, [1000; 4], [6000; 4]);
+        p[6] = 200; // absurd max_slots
+        let v = parse_esp32_vitals_slots(&p).expect("still parses");
+        assert_eq!(v.slots.len(), 4, "must clamp to what the wire format holds");
+    }
 }
 
 // ── ADR-040: WASM Output Packet (magic 0xC511_0007 — reassigned per #928) ─────
@@ -2386,15 +2672,70 @@ mod issue_928_magic_collision_tests {
 
 // ── ESP32 UDP frame parser ───────────────────────────────────────────────────
 
+/// Process-wide phase-diagnostic sink, set once at startup from
+/// `--phase-diagnostics`. A `OnceLock` rather than a field on `AppStateInner`
+/// because this is opt-in instrumentation with no bearing on sensing state —
+/// threading it through `udp_receiver_task`'s signature would put diagnostic
+/// plumbing into the signal path's type surface for no benefit. Same
+/// process-wide-static pattern as the throttled diagnostic logs.
+static PHASE_DIAG: std::sync::OnceLock<Option<std::sync::Arc<phase_diag::PhaseDiagnostics>>> =
+    std::sync::OnceLock::new();
+
+/// Borrow the diagnostic sink, if one was configured.
+fn phase_diagnostics() -> Option<&'static std::sync::Arc<phase_diag::PhaseDiagnostics>> {
+    PHASE_DIAG.get().and_then(|o| o.as_ref())
+}
+
+/// `GET /api/v1/diag/mark/{label}` — timestamp a ground-truth event into the
+/// phase-diagnostics marker sink, so an attended walk test can be aligned
+/// against the signal without reconstructing timings afterwards. No-op with a
+/// clear message when `--phase-diagnostics` is not enabled.
+async fn diag_mark(axum::extract::Path(label): axum::extract::Path<String>) -> Json<serde_json::Value> {
+    match phase_diagnostics() {
+        Some(d) => {
+            let t_s = d.mark(&label);
+            Json(serde_json::json!({ "ok": true, "t_s": t_s, "label": label }))
+        }
+        None => Json(serde_json::json!({
+            "ok": false,
+            "error": "phase diagnostics not enabled; start with --phase-diagnostics <DIR>"
+        })),
+    }
+}
+
+/// Wire v1 CSI frame magic — 20-byte header, no transmitter identity.
+const CSI_MAGIC_V1: u32 = 0xC511_0001;
+/// Wire v2 CSI frame magic — v1 header plus a 6-byte transmitter MAC.
+///
+/// `0xC511_0002`..`0xC511_0007` were already taken by the vitals, feature and
+/// other edge packets (see `issue_928_magic_collision_tests` for why that
+/// matters), so v2 claims the next free value rather than an adjacent one.
+const CSI_MAGIC_V2: u32 = 0xC511_0008;
+/// v1 header length; also the I/Q offset for a v1 frame.
+const CSI_HEADER_V1: usize = 20;
+/// v2 header length: v1 plus `source_mac` at bytes 20..25.
+const CSI_HEADER_V2: usize = 26;
+
 fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
-    if buf.len() < 20 {
+    if buf.len() < CSI_HEADER_V1 {
         return None;
     }
 
     let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    if magic != 0xC511_0001 {
-        return None;
-    }
+    // Both versions are accepted so a mixed fleet keeps working: a node
+    // running older firmware simply reports no transmitter identity.
+    let (iq_start, source_mac) = match magic {
+        CSI_MAGIC_V1 => (CSI_HEADER_V1, None),
+        CSI_MAGIC_V2 => {
+            if buf.len() < CSI_HEADER_V2 {
+                return None;
+            }
+            let mut mac = [0u8; 6];
+            mac.copy_from_slice(&buf[20..26]);
+            (CSI_HEADER_V2, Some(mac))
+        }
+        _ => return None,
+    };
 
     // Frame layout (must match firmware csi_collector.c):
     //   [0..3]   magic (u32 LE)
@@ -2429,7 +2770,6 @@ fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
     let ppdu_type = wifi_densepose_hardware::PpduType::from_byte(buf[18]);
     let adr018_flags = wifi_densepose_hardware::Adr018Flags::from_byte(buf[19]);
 
-    let iq_start = 20;
     let n_pairs = n_antennas as usize * n_subcarriers as usize;
     let expected_len = iq_start + n_pairs * 2;
 
@@ -2458,9 +2798,104 @@ fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
         noise_floor,
         ppdu_type,
         adr018_flags,
+        source_mac,
         amplitudes,
         phases,
     })
+}
+
+#[cfg(test)]
+mod csi_wire_v2_source_mac_tests {
+    //! Wire v2 (`CSI_MAGIC_V2`) adds a 6-byte transmitter MAC after the v1
+    //! header, so the server can tell which link each frame describes.
+    //!
+    //! Motivation, measured 2026-08-28: a node in promiscuous MGMT+DATA mode
+    //! with no `filter_mac` captured roughly 75% non-AP traffic. Those frames
+    //! are real measurements of *other* links, but interleaving them into one
+    //! unlabelled `frame_history` mixes geometries. v1 offers no way to
+    //! separate them; v2 does.
+    use super::*;
+
+    fn frame(magic: u32, header: usize, n_sub: u16, mac: Option<[u8; 6]>) -> Vec<u8> {
+        let mut buf = vec![0u8; header + n_sub as usize * 2];
+        buf[0..4].copy_from_slice(&magic.to_le_bytes());
+        buf[4] = 3; // node_id
+        buf[5] = 1; // n_antennas
+        buf[6..8].copy_from_slice(&n_sub.to_le_bytes());
+        buf[8..12].copy_from_slice(&2412u32.to_le_bytes());
+        buf[12..16].copy_from_slice(&99u32.to_le_bytes());
+        buf[16] = (-64i8) as u8;
+        buf[17] = (-92i8) as u8;
+        if let Some(m) = mac {
+            buf[20..26].copy_from_slice(&m);
+        }
+        for k in 0..n_sub as usize {
+            buf[header + k * 2] = 10;
+            buf[header + k * 2 + 1] = 0;
+        }
+        buf
+    }
+
+    #[test]
+    fn v2_frame_yields_the_transmitter_mac() {
+        let mac = [0x8c, 0x30, 0x66, 0x86, 0xa4, 0x21];
+        let f = parse_esp32_frame(&frame(CSI_MAGIC_V2, CSI_HEADER_V2, 64, Some(mac)))
+            .expect("v2 frame parses");
+        assert_eq!(f.source_mac, Some(mac));
+        assert_eq!(f.node_id, 3);
+        assert_eq!(f.sequence, 99);
+        assert_eq!(f.amplitudes.len(), 64);
+    }
+
+    #[test]
+    fn v1_frame_still_parses_and_reports_no_mac() {
+        let f = parse_esp32_frame(&frame(CSI_MAGIC_V1, CSI_HEADER_V1, 64, None))
+            .expect("v1 frame must keep working for older firmware");
+        assert_eq!(f.source_mac, None);
+        assert_eq!(f.amplitudes.len(), 64);
+    }
+
+    /// The I/Q payload starts 6 bytes later in v2. Reading it at the v1 offset
+    /// would silently shift every sample and corrupt amplitude and phase, so
+    /// pin that the payload is recovered from the correct offset.
+    #[test]
+    fn v2_iq_payload_is_read_at_the_v2_offset() {
+        let mut buf = frame(CSI_MAGIC_V2, CSI_HEADER_V2, 8, Some([1, 2, 3, 4, 5, 6]));
+        // Distinctive first sample: I=100, Q=0 -> amplitude 100.
+        buf[CSI_HEADER_V2] = 100;
+        buf[CSI_HEADER_V2 + 1] = 0;
+        let f = parse_esp32_frame(&buf).expect("parses");
+        assert!(
+            (f.amplitudes[0] - 100.0).abs() < 1e-9,
+            "first sample read from the wrong offset: got {}",
+            f.amplitudes[0]
+        );
+    }
+
+    #[test]
+    fn v2_frame_truncated_before_the_mac_is_rejected() {
+        let mut buf = frame(CSI_MAGIC_V2, CSI_HEADER_V2, 8, Some([1, 2, 3, 4, 5, 6]));
+        buf.truncate(24); // past the v1 header, short of the v2 one
+        assert!(parse_esp32_frame(&buf).is_none());
+    }
+
+    /// v2 must not collide with any other edge packet magic. 0xC511_0002..0007
+    /// are taken (vitals, features, and others) — see
+    /// `issue_928_magic_collision_tests`.
+    #[test]
+    fn v2_magic_does_not_collide_with_known_packet_magics() {
+        for taken in [
+            0xC511_0001u32, 0xC511_0002, 0xC511_0003, 0xC511_0004,
+            0xC511_0005, 0xC511_0006, 0xC511_0007,
+        ] {
+            assert_ne!(CSI_MAGIC_V2, taken, "CSI v2 magic collides with {taken:#X}");
+        }
+    }
+
+    #[test]
+    fn unknown_magic_is_still_rejected() {
+        assert!(parse_esp32_frame(&frame(0xDEAD_BEEF, CSI_HEADER_V1, 64, None)).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -3456,7 +3891,9 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
         let _first_signal_pct = observations.first().map(|o| o.signal_pct).unwrap_or(40.0);
 
         let frame = Esp32Frame {
-            magic: 0xC511_0001,
+            magic: CSI_MAGIC_V1,
+            // Synthetic/adapter frame, not a real capture: no transmitter identity.
+            source_mac: None,
             node_id: 0,
             n_antennas: 1,
             n_subcarriers: obs_count.min(u16::MAX as usize) as u16,
@@ -3645,7 +4082,9 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
     };
 
     let frame = Esp32Frame {
-        magic: 0xC511_0001,
+        magic: CSI_MAGIC_V1,
+        // Synthetic/adapter frame, not a real capture: no transmitter identity.
+        source_mac: None,
         node_id: 0,
         n_antennas: 1,
         n_subcarriers: 1,
@@ -4021,7 +4460,9 @@ fn generate_simulated_frame(tick: u64) -> Esp32Frame {
     }
 
     Esp32Frame {
-        magic: 0xC511_0001,
+        magic: CSI_MAGIC_V1,
+        // Synthetic/adapter frame, not a real capture: no transmitter identity.
+        source_mac: None,
         node_id: 1,
         n_antennas: 1,
         n_subcarriers: n_sub as u16,
@@ -5263,6 +5704,18 @@ struct MotionCentroid {
 /// method estimated the position, per this repo's accuracy-labeling rule
 /// (`CLAUDE.md`: never present WiFi sensing as camera-grade; tag by source).
 enum PositionEstimate {
+    /// From [`step_bistatic_filter`] — a dead-reckoning filter integrating
+    /// [`solve_bistatic_velocity`]'s per-tick least-squares solve of the
+    /// person's 2D velocity from each link's *signed* radial Doppler
+    /// velocity (real bistatic-ellipse geometry: AP↔person↔node, using the
+    /// actual `ap_position`/`node_positions_config` layout — not a
+    /// node-proximity weight like the two tiers below). Preferred over
+    /// both when available. Unlike them, carries a real (filter-internal,
+    /// `CLAIMED` not `MEASURED`) `uncertainty_m`.
+    Bistatic {
+        c: MotionCentroid,
+        uncertainty_m: f64,
+    },
     /// From [`doppler_weighted_centroid`] — weighted by real Doppler-shifted
     /// motion energy per node (Body Velocity Profile). Preferred when
     /// available: it's a genuinely different physical quantity than
@@ -5322,6 +5775,10 @@ const MIN_TOTAL_DOPPLER_WEIGHT: f64 = 1e-6;
 /// Returns `None` if there isn't enough history yet, or (defensively, should
 /// never happen since `NodeState::accept_grid` already locks a node onto one
 /// subcarrier grid) if frame lengths within the window aren't uniform.
+///
+/// Amplitude-only — feeds nothing directional. Kept for any caller that only
+/// needs magnitude; [`node_doppler_sample`] uses the complex counterpart
+/// below so it can report a real signed velocity.
 fn build_csi_temporal(
     frame_history: &std::collections::VecDeque<Vec<f64>>,
     n_samples: usize,
@@ -5344,21 +5801,310 @@ fn build_csi_temporal(
     ndarray::Array2::from_shape_vec((n_samples, n_sc), data).ok()
 }
 
-/// Raw moving-energy magnitude from a node's most recent Body Velocity
-/// Profile time-frame — the energy summed over bins outside the near-zero-
-/// velocity deadband, i.e. how much of this node's link energy right now is
-/// genuinely Doppler-shifted (moving) rather than static multipath. NOT
-/// normalized to this node's own total energy (see [`MIN_TOTAL_DOPPLER_WEIGHT`]
-/// for why that changed). Returns `None` when there isn't enough CSI history
-/// yet ([`MIN_BVP_SAMPLES`]) or BVP extraction otherwise fails (never panics
-/// on a bad/edge-case frame — falls through to the caller's next tier
-/// instead).
+/// Removes the dominant linear-vs-subcarrier-index phase trend from one raw
+/// CSI phase vector (`atan2(Q, I)` per subcarrier) — the packet-detection /
+/// timing-offset (STO) artifact that dominates raw commodity-WiFi CSI phase
+/// on a receiver with no shared clock reference to the transmitter.
+///
+/// The standard fix (Widar3/IndoTrack-style CSI sanitization) is conjugate
+/// multiplication between two antennas on the *same* receiver — their common
+/// CFO/SFO cancels in the ratio. RuView's ESP32 nodes are single-antenna, so
+/// that trick isn't available; per-frame linear-detrend across the
+/// subcarrier axis is the single-antenna fallback, removing the largest
+/// component of packet-to-packet timing jitter. It does **not** remove drift
+/// over *time* between frames (slow CFO drift from the node's free-running
+/// oscillator relative to the AP's) — that's a distinct, unaddressed noise
+/// source. `node_doppler_sample`'s `mean_radial_velocity` is therefore
+/// `CLAIMED`, not `MEASURED` (`CLAUDE.md`), until validated against real
+/// motion with a known direction.
+fn sanitize_phase_linear_detrend(raw_phase: &[f64]) -> Vec<f64> {
+    if raw_phase.len() < 2 {
+        return raw_phase.to_vec();
+    }
+    // Unwrap across subcarrier index: atan2's output is wrapped to
+    // (-pi, pi], but true propagation + STO phase can accumulate more than
+    // one full turn across the subcarrier axis.
+    let mut unwrapped = Vec::with_capacity(raw_phase.len());
+    unwrapped.push(raw_phase[0]);
+    for i in 1..raw_phase.len() {
+        let mut delta = raw_phase[i] - raw_phase[i - 1];
+        while delta > std::f64::consts::PI {
+            delta -= 2.0 * std::f64::consts::PI;
+        }
+        while delta < -std::f64::consts::PI {
+            delta += 2.0 * std::f64::consts::PI;
+        }
+        unwrapped.push(unwrapped[i - 1] + delta);
+    }
+
+    // Ordinary least squares: unwrapped[k] ≈ a*k + b. Closed form (2
+    // unknowns) — no linalg dependency needed.
+    let n = unwrapped.len() as f64;
+    let sum_k: f64 = (0..unwrapped.len()).map(|k| k as f64).sum();
+    let sum_y: f64 = unwrapped.iter().sum();
+    let sum_kk: f64 = (0..unwrapped.len()).map(|k| (k * k) as f64).sum();
+    let sum_ky: f64 = unwrapped.iter().enumerate().map(|(k, &y)| k as f64 * y).sum();
+    let denom = n * sum_kk - sum_k * sum_k;
+    let (a, b) = if denom.abs() > 1e-12 {
+        let a = (n * sum_ky - sum_k * sum_y) / denom;
+        let b = (sum_y - a * sum_k) / n;
+        (a, b)
+    } else {
+        (0.0, sum_y / n)
+    };
+
+    unwrapped
+        .iter()
+        .enumerate()
+        .map(|(k, &y)| y - (a * k as f64 + b))
+        .collect()
+}
+
+#[cfg(test)]
+mod phase_sanitization_annihilates_doppler_tests {
+    //! 2026-08-28 — why the bistatic tier reads flat on real hardware.
+    //!
+    //! [`sanitize_phase_linear_detrend`] fits `a*k + b` across subcarrier
+    //! index and subtracts **both** terms. Removing the slope `a` is the
+    //! intended STO/packet-timing fix. Removing the intercept `b` forces each
+    //! frame's mean phase to zero — and the intercept is exactly where a
+    //! moving target's Doppler phase lives.
+    //!
+    //! A dynamic path contributes phase `-2*pi*f_k*tau(t)`. Across HT20 at
+    //! 2.4 GHz, `f_k` spans +/-8.75 MHz on a 2412 MHz center: +/-0.36%. So a
+    //! body's Doppler phase shift is common-mode across subcarriers to within
+    //! a third of a percent, i.e. almost pure intercept. The detrend deletes
+    //! it every frame; what survives into `phase_history` is second-order
+    //! delay-profile structure and noise.
+    //!
+    //! `doppler_weighted_centroid_tests::directional_oscillating_node` builds
+    //! its synthetic Doppler as `vec![phase; N_SUBCARRIERS]` and pushes it
+    //! **straight into `phase_history`**, bypassing the sanitizer. Its comment
+    //! asserts the sanitizer "leaves it untouched ... exactly like a real
+    //! target's Doppler phase would". These tests pin that this reasoning is
+    //! false in both halves: the sanitizer annihilates that vector, and it
+    //! annihilates a physically-modelled Doppler frame too.
+    use super::*;
+
+    const N_SC: usize = 56;
+
+    /// OLS on a constant series returns slope 0, intercept c, residual 0.
+    /// A phase vector that is constant across subcarriers is *pure intercept*,
+    /// so the sanitizer zeroes it exactly — regardless of its value.
+    #[test]
+    fn constant_across_subcarrier_phase_is_zeroed_exactly() {
+        for &phase in &[0.3_f64, 1.0, -2.5, 0.05] {
+            let out = sanitize_phase_linear_detrend(&vec![phase; N_SC]);
+            assert_eq!(out.len(), N_SC);
+            for (k, v) in out.iter().enumerate() {
+                assert!(
+                    v.abs() < 1e-9,
+                    "phase {phase} subcarrier {k}: expected ~0 after detrend, got {v}"
+                );
+            }
+        }
+    }
+
+    /// The exact vector the existing synthetic Doppler helper pushes into
+    /// `phase_history`, run through the sanitizer the real ingestion site
+    /// applies. If the helper's comment were right, this would survive.
+    #[test]
+    fn synthetic_doppler_helper_vector_does_not_survive_the_real_ingestion_path() {
+        let doppler_rotation_per_frame = 0.3_f64;
+        let mut max_surviving = 0.0_f64;
+        for i in 0..96 {
+            let phase = doppler_rotation_per_frame * i as f64;
+            let sanitized = sanitize_phase_linear_detrend(&vec![phase; N_SC]);
+            for v in sanitized {
+                max_surviving = max_surviving.max(v.abs());
+            }
+        }
+        assert!(
+            max_surviving < 1e-9,
+            "the synthetic Doppler signal the BVP tests rely on is fully removed by \
+             sanitize_phase_linear_detrend (max surviving magnitude {max_surviving:e}); \
+             those tests inject past the sanitizer and so do not exercise the real path"
+        );
+    }
+
+    /// Physically-modelled frame: phase = -2*pi*f_k*tau, with a real HT20
+    /// subcarrier plan, a static timing offset (the STO the detrend is meant
+    /// to remove) and a dynamic path delay (the Doppler it must preserve).
+    /// Measures how much of the Doppler term survives.
+    fn ht20_frame_phase(tau_dynamic_s: f64, tau_sto_s: f64) -> Vec<f64> {
+        const F_CENTER_HZ: f64 = 2.412e9;
+        const SUBCARRIER_SPACING_HZ: f64 = 312.5e3;
+        (0..N_SC)
+            .map(|idx| {
+                let k = idx as f64 - (N_SC as f64 - 1.0) / 2.0;
+                let f_k = F_CENTER_HZ + k * SUBCARRIER_SPACING_HZ;
+                -2.0 * std::f64::consts::PI * f_k * (tau_dynamic_s + tau_sto_s)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn detrend_removes_over_99_percent_of_a_physically_modelled_doppler_shift() {
+        // A 1 m/s bistatic radial velocity over one 20 ms frame interval
+        // changes path length by ~0.02 m => tau change ~66.7 ps, i.e. ~1 rad
+        // of Doppler phase at 2.4 GHz. This is the signal we must keep.
+        let path_delta_m = 0.02_f64;
+        let tau_dynamic = path_delta_m / 2.998e8;
+        // A typical packet-detection timing offset, orders of magnitude
+        // larger, producing the across-subcarrier slope the detrend targets.
+        let tau_sto = 50e-9_f64;
+
+        let reference = ht20_frame_phase(0.0, tau_sto);
+        let with_doppler = ht20_frame_phase(tau_dynamic, tau_sto);
+
+        // True Doppler phase introduced, before any sanitization.
+        let injected: f64 = with_doppler
+            .iter()
+            .zip(reference.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f64>()
+            / N_SC as f64;
+
+        let sanitized_ref = sanitize_phase_linear_detrend(&reference);
+        let sanitized_dop = sanitize_phase_linear_detrend(&with_doppler);
+        let surviving: f64 = sanitized_dop
+            .iter()
+            .zip(sanitized_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f64>()
+            / N_SC as f64;
+
+        assert!(
+            injected > 0.5,
+            "test setup: expected ~1 rad of injected Doppler phase, got {injected}"
+        );
+        let surviving_fraction = surviving / injected;
+        assert!(
+            surviving_fraction < 0.01,
+            "sanitize_phase_linear_detrend is expected to destroy >99% of a real \
+             Doppler phase shift (it is common-mode across subcarriers, i.e. pure \
+             intercept); surviving fraction was {surviving_fraction:e}. If this \
+             assertion ever fails the sanitizer has been changed - re-read the \
+             module docs before updating the bound."
+        );
+    }
+
+    /// End-to-end: the same synthetic node the BVP tests use, but with phase
+    /// pushed through the sanitizer the way `udp_receiver_task` really does.
+    /// The signed velocity the bypassing test measures must collapse.
+    #[test]
+    fn signed_radial_velocity_collapses_when_phase_goes_through_the_sanitizer() {
+        fn node_with(sanitize: bool, rotation_per_frame: f64) -> NodeState {
+            let mut n = NodeState::new();
+            n.csi_fps_ema = 44.0;
+            n.last_frame_time = Some(std::time::Instant::now());
+            let dt = 1.0 / n.csi_fps_ema;
+            for i in 0..MIN_BVP_SAMPLES {
+                let t = i as f64 * dt;
+                let amp = 10.0 + 3.0 * (2.0 * std::f64::consts::PI * 2.0 * t).sin();
+                n.frame_history.push_back(vec![amp; N_SC]);
+                let raw = vec![rotation_per_frame * i as f64; N_SC];
+                n.phase_history.push_back(if sanitize {
+                    sanitize_phase_linear_detrend(&raw)
+                } else {
+                    raw
+                });
+            }
+            n
+        }
+
+        let bypassing = node_doppler_sample(&node_with(false, 0.3))
+            .expect("bypassing the sanitizer yields a sample");
+        let real_path = node_doppler_sample(&node_with(true, 0.3));
+
+        assert!(
+            bypassing.mean_radial_velocity.abs() > 0.05,
+            "control: injecting past the sanitizer must show real signed velocity, got {}",
+            bypassing.mean_radial_velocity
+        );
+
+        // Through the real path the phase is identically zero every frame, so
+        // the complex CSI carries amplitude only - direction information is
+        // gone. Either extraction fails outright or velocity collapses toward
+        // zero; both are the same finding.
+        if let Some(s) = real_path {
+            assert!(
+                s.mean_radial_velocity.abs() < bypassing.mean_radial_velocity.abs() / 10.0,
+                "through sanitize_phase_linear_detrend the signed velocity must collapse \
+                 (control {:.4}, real path {:.4})",
+                bypassing.mean_radial_velocity,
+                s.mean_radial_velocity
+            );
+        }
+    }
+}
+
+/// Complex-valued counterpart to [`build_csi_temporal`]: combines a node's
+/// amplitude and (already-sanitized) phase history into `amplitude * e^{jθ}`
+/// samples for `extract_bvp_signed`. Both histories are pushed together in
+/// lockstep at the one real ESP32 ingestion site, so a length mismatch here
+/// should never happen in practice — treated as "not enough data yet"
+/// (`None`) rather than panicking, since it's not this function's job to
+/// diagnose a caller bug.
+fn build_csi_temporal_complex(
+    amp_history: &std::collections::VecDeque<Vec<f64>>,
+    phase_history: &std::collections::VecDeque<Vec<f64>>,
+    n_samples: usize,
+) -> Option<ndarray::Array2<num_complex::Complex64>> {
+    if amp_history.len() < n_samples || phase_history.len() != amp_history.len() {
+        return None;
+    }
+    let skip = amp_history.len() - n_samples;
+    let n_sc = amp_history.back()?.len();
+    if n_sc == 0 || phase_history.back()?.len() != n_sc {
+        return None;
+    }
+    let mut data = Vec::with_capacity(n_samples * n_sc);
+    for (amp_frame, phase_frame) in amp_history.iter().skip(skip).zip(phase_history.iter().skip(skip)) {
+        if amp_frame.len() != n_sc || phase_frame.len() != n_sc {
+            return None;
+        }
+        for (&a, &p) in amp_frame.iter().zip(phase_frame.iter()) {
+            data.push(num_complex::Complex64::new(a * p.cos(), a * p.sin()));
+        }
+    }
+    ndarray::Array2::from_shape_vec((n_samples, n_sc), data).ok()
+}
+
+/// A node's most recent Body Velocity Profile time-frame, reduced to the two
+/// scalars the two Doppler-based position tiers need — both derived from a
+/// single [`wifi_densepose_signal::bvp::extract_bvp_signed`] call.
+struct NodeDopplerSample {
+    /// Raw moving-energy magnitude summed over bins outside the near-zero-
+    /// velocity deadband — same role as the original `node_doppler_weight`
+    /// (see its history below). Feeds [`doppler_weighted_centroid`].
+    moving_energy: f64,
+    /// Signed, energy-weighted mean velocity (m/s) over the same non-
+    /// deadband bins. This is the actual bistatic radial-velocity
+    /// measurement `solve_bistatic_velocity` needs; a magnitude alone
+    /// (`moving_energy`) carries no directional information (see the closed
+    /// 2026-08-28 Doppler-weighting investigation in memory for why that's a
+    /// dead end for position). Only meaningful because this is built from
+    /// `extract_bvp_signed` on genuinely complex CSI, not `extract_bvp`'s
+    /// amplitude-only, direction-collapsed spectrum.
+    mean_radial_velocity: f64,
+}
+
+/// Raw moving-energy magnitude + signed mean radial velocity from a node's
+/// most recent Body Velocity Profile time-frame — the energy summed over
+/// bins outside the near-zero-velocity deadband, i.e. how much of this
+/// node's link energy right now is genuinely Doppler-shifted (moving) rather
+/// than static multipath, and which direction (toward/away along this link)
+/// that motion is signed. Returns `None` when there isn't enough sanitized
+/// phase+amplitude history yet ([`MIN_BVP_SAMPLES`]) or BVP extraction
+/// otherwise fails (never panics on a bad/edge-case frame — falls through to
+/// the caller's next tier instead).
 ///
 /// Carrier frequency is hardcoded to 2.4 GHz: RuView's ESP32 nodes sense
 /// 2.4 GHz WiFi traffic (`BvpConfig::default()`'s own 5 GHz assumption would
 /// be wrong here and silently mis-scale every velocity bin).
-fn node_doppler_weight(n: &NodeState) -> Option<f64> {
-    let temporal = build_csi_temporal(&n.frame_history, MIN_BVP_SAMPLES)?;
+fn node_doppler_sample(n: &NodeState) -> Option<NodeDopplerSample> {
+    let temporal = build_csi_temporal_complex(&n.frame_history, &n.phase_history, MIN_BVP_SAMPLES)?;
     let sample_rate = n.csi_fps_ema.max(1.0);
     let config = wifi_densepose_signal::bvp::BvpConfig {
         window_size: BVP_WINDOW_SIZE,
@@ -5366,7 +6112,7 @@ fn node_doppler_weight(n: &NodeState) -> Option<f64> {
         carrier_frequency: 2.4e9,
         ..wifi_densepose_signal::bvp::BvpConfig::default()
     };
-    let bvp = wifi_densepose_signal::bvp::extract_bvp(&temporal, sample_rate, &config).ok()?;
+    let bvp = wifi_densepose_signal::bvp::extract_bvp_signed(&temporal, sample_rate, &config).ok()?;
     if bvp.n_time == 0 {
         return None;
     }
@@ -5383,10 +6129,12 @@ fn node_doppler_weight(n: &NodeState) -> Option<f64> {
         .unwrap_or(0);
     let mut moving = 0.0_f64;
     let mut total = 0.0_f64;
+    let mut signed_velocity_sum = 0.0_f64;
     for (i, &energy) in last_col.iter().enumerate() {
         total += energy;
         if i.abs_diff(zero_idx) > BVP_ZERO_VELOCITY_DEADBAND_BINS {
             moving += energy;
+            signed_velocity_sum += energy * bvp.velocity_bins[i];
         }
     }
     if total < 1e-9 {
@@ -5401,9 +6149,19 @@ fn node_doppler_weight(n: &NodeState) -> Option<f64> {
     // general. Hypothesis: normalizing to each node's own total energy
     // throws away real magnitude differences a closer node should show
     // (more absolute Doppler energy from a stronger, shorter-path
-    // reflection) — raw magnitude preserves that. NOT yet live-validated;
-    // this is the next real test, not a confirmed fix.
-    Some(moving.max(0.0))
+    // reflection) — raw magnitude preserves that. Live-validated as a dead
+    // end for *position* (no scalar can carry direction) but kept as-is: it
+    // still feeds `doppler_weighted_centroid`, a real fallback tier.
+    let moving_energy = moving.max(0.0);
+    let mean_radial_velocity = if moving > 1e-9 {
+        signed_velocity_sum / moving
+    } else {
+        0.0
+    };
+    Some(NodeDopplerSample {
+        moving_energy,
+        mean_radial_velocity,
+    })
 }
 
 /// Throttle for the diagnostic Doppler-centroid log — same rationale as
@@ -5413,6 +6171,20 @@ static LAST_DOPPLER_LOG: std::sync::Mutex<Option<std::time::Instant>> =
 
 /// Throttle for the diagnostic `attach_positions` log — see its call site.
 static LAST_ATTACH_LOG: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// Throttle for the diagnostic bistatic-estimator log — same rationale as
+/// `LAST_DOPPLER_LOG`.
+static LAST_BISTATIC_LOG: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// Throttle for the per-slot vitals log — see the UDP dispatch.
+static LAST_VITALS_SLOTS_LOG: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// Throttle for the diagnostic per-node bistatic-link log — see
+/// `bistatic_links`.
+static LAST_BISTATIC_LINKS_LOG: std::sync::Mutex<Option<std::time::Instant>> =
     std::sync::Mutex::new(None);
 
 /// Estimate a rough person position as a Doppler-weighted centroid of node
@@ -5453,6 +6225,7 @@ fn doppler_weighted_centroid(
     let mut weighted = [0.0_f64; 3];
     let mut total_weight = 0.0_f64;
     let mut usable_nodes = 0usize;
+    let mut per_node_log: Vec<(u8, f64)> = Vec::new();
 
     for (&id, n) in node_states {
         let fresh = n
@@ -5464,9 +6237,10 @@ fn doppler_weighted_centroid(
         let Some(pos) = node_positions_config.get(&id) else {
             continue;
         };
-        let Some(weight) = node_doppler_weight(n) else {
+        let Some(weight) = node_doppler_sample(n).map(|s| s.moving_energy) else {
             continue;
         };
+        per_node_log.push((id, weight));
         usable_nodes += 1;
         weighted[0] += weight * pos[0] as f64;
         weighted[1] += weight * pos[1] as f64;
@@ -5483,6 +6257,15 @@ fn doppler_weighted_centroid(
             "doppler centroid: {usable_nodes} node(s) with enough CSI history, \
              total_weight={total_weight:.3} (need >= {MIN_TOTAL_DOPPLER_WEIGHT} and >= 2 nodes)"
         );
+        // Per-node breakdown. This lives here rather than in `bistatic_links`
+        // because that function only runs when the (default-off) bistatic tier
+        // is enabled, and a per-sensor walk test needs per-node motion energy
+        // regardless. Amplitude-derived, so it is unaffected by the phase
+        // findings in `bistatic_tier_enabled`'s docs.
+        per_node_log.sort_unstable_by_key(|(id, _)| *id);
+        for (id, energy) in &per_node_log {
+            info!("doppler per-node: node={id} moving_energy={energy:.3}");
+        }
     }
 
     if usable_nodes < 2 || total_weight < MIN_TOTAL_DOPPLER_WEIGHT {
@@ -5493,6 +6276,443 @@ fn doppler_weighted_centroid(
         x: weighted[0] / total_weight,
         y: weighted[1] / total_weight,
         z: weighted[2] / total_weight,
+    })
+}
+
+/// Minimum usable links (nodes with both a configured position and a fresh
+/// [`node_doppler_sample`]) for [`solve_bistatic_velocity`] to attempt a 2D
+/// least-squares solve. 2 is the mathematical minimum (2 unknowns); with
+/// RuView's 3 real nodes this is rarely the binding constraint in practice.
+const BISTATIC_MIN_LINKS: usize = 2;
+/// Upper bound on `step_bistatic_filter`'s predict-step `dt` (seconds) —
+/// guards against a huge position jump after a gap (server restart, node
+/// dropout) rather than integrating a stale velocity over an unbounded
+/// interval.
+const BISTATIC_DT_CLAMP_SECS: f64 = 2.0;
+/// Fraction pulled toward the existing Doppler/motion centroid each tick a
+/// correction prior is available — bounds dead-reckoning drift without
+/// throwing away the finer-grained velocity-integrated motion between
+/// corrections. UNTUNED — first-cut guess, needs live calibration like every
+/// other constant in this file (see `BASELINE_SUBTRACTION_FRACTION`'s
+/// history for how that calibration has gone in practice).
+const BISTATIC_CORRECTION_BLEND: f64 = 0.08;
+/// Growth rate (meters/second) of `AppStateInner::bistatic_uncertainty_m`
+/// between corrections — reflects dead-reckoning drift. UNTUNED.
+const BISTATIC_PROCESS_NOISE_PER_SEC: f64 = 0.3;
+/// `bistatic_uncertainty_m` reset value on (re)seed — deliberately large
+/// (room-scale) since a freshly seeded position is not yet trusted.
+const BISTATIC_RESET_UNCERTAINTY_M: f64 = 3.0;
+/// How long `presence` must stay false (measured via a frozen
+/// `bistatic_last_update`) before `step_bistatic_filter` clears its state
+/// entirely, rather than continuing to dead-reckon a target that's no
+/// longer there.
+const BISTATIC_PRESENCE_TIMEOUT_SECS: f64 = 3.0;
+/// EMA rate for tracking each node's resting-state `mean_radial_velocity`
+/// baseline in `bistatic_links` (2026-08-28) — live per-node logs showed the
+/// raw value sitting persistently on one side of zero across every
+/// deliberate motion test (body-blocking, an aluminum laptop fully covering
+/// a node, circles, repeated walk-throughs directly over two of the three
+/// nodes), even after the AP-location and WiFi-channel confounds were both
+/// confirmed ruled out. A steady one-sided offset is not what random noise
+/// looks like — it's consistent with per-node CFO/oscillator phase bias
+/// (the exact risk `sanitize_phase_linear_detrend` flags: it only removes
+/// the per-frame subcarrier-axis timing trend, never drift *over time*
+/// between frames). This is one call per tick (`node_doppler_sample`'s
+/// actual call rate), not per-CSI-frame, so it's a per-call alpha, not a
+/// physical time constant. UNTUNED, NOT yet live-validated — this is the
+/// direct next experiment, not a confirmed fix. Known limitation: unlike
+/// `BASELINE_SUBTRACTION_FRACTION`'s amplitude-channel counterpart, this has
+/// no "only update during calm periods" gate, so a very slow, sustained
+/// motion could partially bleed into the baseline over ~10+ seconds.
+const RADIAL_VELOCITY_BASELINE_EMA_ALPHA: f64 = 0.05;
+/// Ticks before the radial-velocity baseline is trusted enough to start
+/// being subtracted — before this, it aggressively tracks (see
+/// `bistatic_links`) rather than slow-EMAs, same warm-up pattern as
+/// `NODE_BASELINE_WARMUP_SECS`'s amplitude-channel counterpart.
+const RADIAL_VELOCITY_BASELINE_WARMUP_TICKS: u64 = 20;
+
+/// Whether the bistatic phase-Doppler position tier may run.
+///
+/// **Default off since 2026-08-28**, on measured evidence that its input is
+/// noise on this hardware. See [`bistatic_tier_enabled`].
+static BISTATIC_TIER_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Is the bistatic phase-Doppler tier enabled? Off unless
+/// `--enable-bistatic-tier` was passed.
+///
+/// # Why this defaults to off
+///
+/// The tier needs a *signed* radial velocity per link, which requires the
+/// common-mode (across-subcarrier) component of CSI phase. On 2026-08-28 that
+/// component was measured directly on all three ESP32-C6 nodes, over ~23k
+/// frames, via `--phase-diagnostics`:
+///
+/// | metric | node 0 | node 1 | node 2 | uniform-random reference |
+/// |---|---|---|---|---|
+/// | resultant length `R` of frame-to-frame change | 0.013 | 0.011 | 0.032 | 0.000 |
+/// | standard deviation (rad) | 1.813 | 1.806 | 1.779 | 1.814 |
+/// | `P(|delta| > 2 rad)` | 0.365 | 0.360 | 0.342 | 0.363 |
+/// | lag-1 autocorrelation | 0.010 | -0.001 | -0.021 | 0.000 |
+///
+/// The common-mode phase is statistically indistinguishable from uniform
+/// random between consecutive frames, with no lag-1 structure — so it is not
+/// undersampled drift that a better filter or a bias baseline could recover.
+/// A second, unwrap-free estimator agreed (per-subcarrier `R` = 0.084-0.096),
+/// ruling out the measurement itself as the cause.
+///
+/// The mechanism is packet-detection timing quantization, not oscillator
+/// drift: common-mode phase is `-2*pi*f_c*tau`, and at 20 MHz sampling one ADC
+/// sample of packet-detection jitter is `2*pi * 2.412e9 * 50e-9` ~= 758 rad,
+/// about 120 full wraps. It re-randomizes every packet and is not calibratable.
+///
+/// Notably the *differential* across subcarriers IS coherent (`R` = 0.32-0.44)
+/// — but that encodes path delay, which needs the >=40 MHz bandwidth
+/// `ruvsense::cir` already gates on and this deployment does not have.
+///
+/// Nothing here implicates [`solve_bistatic_velocity`], which remains proven
+/// correct against synthetic ground truth. The geometry is right; the
+/// measurement feeding it does not exist on single-antenna commodity silicon.
+/// The tier is retained, not deleted, so it can be re-enabled on hardware that
+/// can supply real signed Doppler (multi-antenna, or a receiver exposing a
+/// stable phase reference).
+fn bistatic_tier_enabled() -> bool {
+    BISTATIC_TIER_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod bistatic_tier_gating_tests {
+    use super::*;
+
+    /// The tier must stay off unless explicitly enabled: with its input
+    /// measured to be noise, emitting `position_source: "bistatic_velocity"`
+    /// plus a real-looking `uncertainty_m` would overclaim what the system
+    /// actually knows (`CLAUDE.md`'s accuracy-labeling rule).
+    #[test]
+    fn bistatic_tier_is_disabled_by_default() {
+        assert!(
+            !bistatic_tier_enabled(),
+            "the bistatic phase-Doppler tier must default to off; re-enabling it \
+             needs --enable-bistatic-tier and hardware that supplies signed Doppler"
+        );
+    }
+
+    /// Gating happens before any geometry work, so a disabled tier costs
+    /// nothing and cannot touch filter state.
+    #[test]
+    fn disabled_tier_yields_no_estimate_and_leaves_filter_state_untouched() {
+        let mut state = AppStateInner::minimal();
+        state.ap_position = Some([7.9, 5.9, 2.3]);
+        state.room_bounds = (13.4, 10.4);
+        state.bistatic_position = None;
+
+        let out = estimate_bistatic_position(
+            &mut state,
+            std::time::Instant::now(),
+            Some(MotionCentroid { x: 2.0, y: 2.0, z: 0.5 }),
+            true,
+        );
+        assert!(out.is_none(), "disabled tier must not produce an estimate");
+        assert!(
+            state.bistatic_position.is_none(),
+            "disabled tier must not seed filter state"
+        );
+    }
+}
+
+/// Solve the person's 2D velocity `(vx, vy)` from each link's *signed*
+/// radial Doppler velocity via real bistatic-ellipse geometry: for the
+/// AP→person→node link, the measured radial velocity is the person's
+/// velocity projected onto `normalize(at - ap) + normalize(at - node)`
+/// (unit vectors from the AP and from that node toward the *current*
+/// position estimate — the bistatic ellipse's gradient direction at that
+/// point). With `links.len()` linear equations in 2 unknowns, solved by
+/// closed-form least squares (`(HᵀH)⁻¹Hᵀr` via Cramer's rule — no linalg
+/// dependency needed for 2 unknowns).
+///
+/// `at` is the position to linearize around — the filter's current estimate,
+/// not the (unknown) true position. This is a first-order approximation:
+/// good as long as the true position hasn't moved far from `at` within one
+/// tick, same assumption any dead-reckoning filter makes.
+///
+/// Returns `None` when fewer than [`BISTATIC_MIN_LINKS`] links are usable,
+/// or the geometry is too close to degenerate to resolve 2D velocity (link
+/// gradient directions nearly parallel — e.g. AP, node, and the position
+/// estimate roughly colinear) rather than fabricating a velocity from a
+/// near-singular system.
+fn solve_bistatic_velocity(
+    ap: [f32; 3],
+    links: &[([f32; 3], f64)],
+    at: (f64, f64),
+) -> Option<(f64, f64)> {
+    if links.len() < BISTATIC_MIN_LINKS {
+        return None;
+    }
+
+    let ap_xy = (ap[0] as f64, ap[1] as f64);
+    let dx_ap = at.0 - ap_xy.0;
+    let dy_ap = at.1 - ap_xy.1;
+    let norm_ap = (dx_ap * dx_ap + dy_ap * dy_ap).sqrt();
+    if norm_ap < 1e-6 {
+        return None;
+    }
+    let u_ap = (dx_ap / norm_ap, dy_ap / norm_ap);
+
+    // Normal-equations accumulators for the 2x2 system HᵀH v = HᵀR.
+    let mut hh = [[0.0_f64; 2]; 2];
+    let mut hr = [0.0_f64; 2];
+
+    for &(node_pos, r_i) in links {
+        let node_xy = (node_pos[0] as f64, node_pos[1] as f64);
+        let dx = at.0 - node_xy.0;
+        let dy = at.1 - node_xy.1;
+        let norm = (dx * dx + dy * dy).sqrt();
+        if norm < 1e-6 {
+            continue;
+        }
+        let u_node = (dx / norm, dy / norm);
+        let row = (u_ap.0 + u_node.0, u_ap.1 + u_node.1);
+
+        hh[0][0] += row.0 * row.0;
+        hh[0][1] += row.0 * row.1;
+        hh[1][0] += row.1 * row.0;
+        hh[1][1] += row.1 * row.1;
+        hr[0] += row.0 * r_i;
+        hr[1] += row.1 * r_i;
+    }
+
+    let det = hh[0][0] * hh[1][1] - hh[0][1] * hh[1][0];
+    if det.abs() < 1e-9 {
+        return None;
+    }
+
+    let vx = (hr[0] * hh[1][1] - hr[1] * hh[0][1]) / det;
+    let vy = (hh[0][0] * hr[1] - hh[1][0] * hr[0]) / det;
+    Some((vx, vy))
+}
+
+/// Dead-reckoning predict/correct step for the bistatic position estimate.
+/// Persisted in `AppStateInner::bistatic_position` /
+/// `bistatic_uncertainty_m` / `bistatic_last_update` because, unlike the
+/// Doppler/motion centroids, this tier has no absolute-position observable
+/// of its own — [`solve_bistatic_velocity`] only ever measures velocity, so
+/// position has to be integrated over time and periodically corrected.
+///
+/// - `presence == false` for longer than [`BISTATIC_PRESENCE_TIMEOUT_SECS`]
+///   clears all persisted state and returns `None` — no target to
+///   dead-reckon.
+/// - No existing estimate (first presence, or just cleared above): reseed at
+///   `correction_prior` if available, else the room center; reset
+///   uncertainty to [`BISTATIC_RESET_UNCERTAINTY_M`].
+/// - Otherwise: integrate `velocity` over `dt` (clamped to
+///   [`BISTATIC_DT_CLAMP_SECS`]), growing uncertainty by
+///   [`BISTATIC_PROCESS_NOISE_PER_SEC`]; blend toward `correction_prior` by
+///   [`BISTATIC_CORRECTION_BLEND`] when available this tick, shrinking
+///   uncertainty proportionally; clamp to `room_bounds` (the person is in
+///   the room — a real physical constraint, not a heuristic).
+fn step_bistatic_filter(
+    state: &mut AppStateInner,
+    now: std::time::Instant,
+    room_bounds: (f32, f32),
+    velocity: Option<(f64, f64)>,
+    correction_prior: Option<MotionCentroid>,
+    presence: bool,
+    avg_z: f64,
+) -> Option<MotionCentroid> {
+    if !presence {
+        let stale = state.bistatic_last_update.is_none_or(|t| {
+            now.duration_since(t).as_secs_f64() >= BISTATIC_PRESENCE_TIMEOUT_SECS
+        });
+        if stale {
+            state.bistatic_position = None;
+            state.bistatic_uncertainty_m = 0.0;
+            state.bistatic_last_update = None;
+        }
+        return None;
+    }
+
+    let (width_m, depth_m) = room_bounds;
+
+    if state.bistatic_position.is_none() {
+        let seed = correction_prior
+            .map(|c| (c.x, c.y))
+            .unwrap_or((width_m as f64 / 2.0, depth_m as f64 / 2.0));
+        state.bistatic_position = Some(seed);
+        state.bistatic_uncertainty_m = BISTATIC_RESET_UNCERTAINTY_M;
+        state.bistatic_last_update = Some(now);
+        return Some(MotionCentroid {
+            x: seed.0,
+            y: seed.1,
+            z: avg_z,
+        });
+    }
+
+    let (mut x, mut y) = state.bistatic_position.expect("checked Some above");
+    let dt = state
+        .bistatic_last_update
+        .map(|t| now.duration_since(t).as_secs_f64())
+        .unwrap_or(0.0)
+        .clamp(0.0, BISTATIC_DT_CLAMP_SECS);
+
+    if let Some((vx, vy)) = velocity {
+        x += vx * dt;
+        y += vy * dt;
+        state.bistatic_uncertainty_m += BISTATIC_PROCESS_NOISE_PER_SEC * dt;
+    }
+
+    if let Some(prior) = correction_prior {
+        x = x * (1.0 - BISTATIC_CORRECTION_BLEND) + prior.x * BISTATIC_CORRECTION_BLEND;
+        y = y * (1.0 - BISTATIC_CORRECTION_BLEND) + prior.y * BISTATIC_CORRECTION_BLEND;
+        state.bistatic_uncertainty_m *= 1.0 - BISTATIC_CORRECTION_BLEND;
+    }
+
+    // The person is in the room — a real physical constraint, not a guess.
+    x = x.clamp(0.0, width_m as f64);
+    y = y.clamp(0.0, depth_m as f64);
+
+    state.bistatic_position = Some((x, y));
+    state.bistatic_last_update = Some(now);
+
+    Some(MotionCentroid { x, y, z: avg_z })
+}
+
+/// Gather `(node position, bias-corrected mean_radial_velocity)` pairs for
+/// every fresh, positioned node with enough CSI history for a Doppler
+/// sample — the input [`solve_bistatic_velocity`] needs. Same freshness/
+/// position gating as [`doppler_weighted_centroid`]/[`motion_weighted_centroid`]
+/// (never trusts an unconfigured node's display-only default position).
+/// Takes `node_states` mutably to update each node's
+/// `radial_velocity_baseline` — see [`RADIAL_VELOCITY_BASELINE_EMA_ALPHA`].
+fn bistatic_links(
+    node_states: &mut HashMap<u8, NodeState>,
+    node_positions_config: &HashMap<u8, [f32; 3]>,
+    now: std::time::Instant,
+) -> Vec<([f32; 3], f64)> {
+    let mut per_node_log = Vec::new();
+    let links: Vec<([f32; 3], f64)> = node_states
+        .iter_mut()
+        .filter_map(|(&id, n)| {
+            let fresh = n
+                .last_frame_time
+                .is_some_and(|t| now.duration_since(t).as_secs() < 10);
+            if !fresh {
+                return None;
+            }
+            let pos = *node_positions_config.get(&id)?;
+            let sample = node_doppler_sample(n)?;
+
+            // Per-node CFO/oscillator bias correction — see
+            // RADIAL_VELOCITY_BASELINE_EMA_ALPHA's doc comment for why.
+            n.radial_velocity_baseline_ticks += 1;
+            if n.radial_velocity_baseline_ticks < RADIAL_VELOCITY_BASELINE_WARMUP_TICKS {
+                n.radial_velocity_baseline =
+                    n.radial_velocity_baseline * 0.8 + sample.mean_radial_velocity * 0.2;
+            } else {
+                n.radial_velocity_baseline = n.radial_velocity_baseline
+                    * (1.0 - RADIAL_VELOCITY_BASELINE_EMA_ALPHA)
+                    + sample.mean_radial_velocity * RADIAL_VELOCITY_BASELINE_EMA_ALPHA;
+            }
+            let bias_corrected = sample.mean_radial_velocity - n.radial_velocity_baseline;
+
+            per_node_log.push((
+                id,
+                sample.mean_radial_velocity,
+                bias_corrected,
+                sample.moving_energy,
+            ));
+            Some((pos, bias_corrected))
+        })
+        .collect();
+
+    // Diagnostic (2026-08-28): the combined bistatic filter output stayed
+    // inside a small noise-scale box through several deliberate tests
+    // tonight (body-blocking, a full aluminum laptop over a node) that
+    // clearly moved the amplitude-based doppler_centroid's total_weight but
+    // not this. This per-node breakdown exists to answer *where* the flat
+    // response originates. Now also logs the bias-corrected value alongside
+    // the raw one, so a live test can show directly whether baseline
+    // subtraction is doing anything real — not a confirmed fix yet.
+    let mut last = LAST_BISTATIC_LINKS_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_none_or(|t| now.duration_since(t).as_secs() >= 2) {
+        *last = Some(now);
+        drop(last);
+        per_node_log.sort_unstable_by_key(|(id, _, _, _)| *id);
+        for (id, raw, bias_corrected, moving_energy) in &per_node_log {
+            info!(
+                "bistatic per-node: node={id} mean_radial_velocity={raw:.4} \
+                 bias_corrected={bias_corrected:.4} moving_energy={moving_energy:.3}"
+            );
+        }
+    }
+
+    links
+}
+
+/// Orchestrates the bistatic velocity/position tier: gathers links, solves
+/// velocity via [`solve_bistatic_velocity`], steps the dead-reckoning filter
+/// via [`step_bistatic_filter`], and wraps the result as a
+/// `PositionEstimate::Bistatic`. Returns `None` (falls through to the
+/// Doppler/motion centroid tiers) whenever the AP or room bounds aren't
+/// configured, or the underlying solve/filter step doesn't produce an
+/// estimate this tick.
+fn estimate_bistatic_position(
+    state: &mut AppStateInner,
+    now: std::time::Instant,
+    correction_prior: Option<MotionCentroid>,
+    presence: bool,
+) -> Option<PositionEstimate> {
+    if !bistatic_tier_enabled() {
+        return None;
+    }
+    let ap = state.ap_position?;
+    let (width_m, depth_m) = state.room_bounds;
+    if width_m <= 0.0 || depth_m <= 0.0 {
+        return None;
+    }
+    let links = bistatic_links(&mut state.node_states, &state.node_positions_config, now);
+
+    let avg_z = if links.is_empty() {
+        correction_prior.map(|c| c.z).unwrap_or(1.5)
+    } else {
+        links.iter().map(|(p, _)| p[2] as f64).sum::<f64>() / links.len() as f64
+    };
+
+    let at = state
+        .bistatic_position
+        .or_else(|| correction_prior.map(|c| (c.x, c.y)))
+        .unwrap_or((width_m as f64 / 2.0, depth_m as f64 / 2.0));
+
+    let velocity = solve_bistatic_velocity(ap, &links, at);
+
+    let c = step_bistatic_filter(
+        state,
+        now,
+        (width_m, depth_m),
+        velocity,
+        correction_prior,
+        presence,
+        avg_z,
+    )?;
+
+    {
+        let mut last = LAST_BISTATIC_LOG.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_none_or(|t| now.duration_since(t).as_secs() >= 2) {
+            *last = Some(now);
+            drop(last);
+            info!(
+                "bistatic filter: {} link(s), velocity={velocity:?}, \
+                 position=({:.2}, {:.2}), uncertainty_m={:.2}",
+                links.len(),
+                c.x,
+                c.y,
+                state.bistatic_uncertainty_m
+            );
+        }
+    }
+
+    Some(PositionEstimate::Bistatic {
+        c,
+        uncertainty_m: state.bistatic_uncertainty_m,
     })
 }
 
@@ -5609,6 +6829,7 @@ fn attach_positions(update: &mut SensingUpdate, estimate: Option<PositionEstimat
     {
         let n_persons = update.persons.as_ref().map_or(0, |p| p.len());
         let estimate_kind = match &estimate {
+            Some(PositionEstimate::Bistatic { .. }) => "bistatic",
             Some(PositionEstimate::Doppler(_)) => "doppler",
             Some(PositionEstimate::Motion(_)) => "motion",
             None => "none",
@@ -5633,14 +6854,17 @@ fn attach_positions(update: &mut SensingUpdate, estimate: Option<PositionEstimat
     }
 
     if let Some(est) = estimate {
-        let (c, source) = match est {
-            PositionEstimate::Doppler(c) => (c, "doppler_centroid"),
-            PositionEstimate::Motion(c) => (c, "motion_centroid"),
+        let (c, source, uncertainty_m) = match est {
+            PositionEstimate::Bistatic { c, uncertainty_m } => {
+                (c, "bistatic_velocity", Some(uncertainty_m))
+            }
+            PositionEstimate::Doppler(c) => (c, "doppler_centroid", None),
+            PositionEstimate::Motion(c) => (c, "motion_centroid", None),
         };
         for person in persons.iter_mut() {
             person.position = [c.x, c.y, c.z];
             person.position_source = source.to_string();
-            person.position_uncertainty_m = None;
+            person.position_uncertainty_m = uncertainty_m;
         }
     } else {
         let [nx, _ny, nz] = update.signal_field.grid_size;
@@ -5771,6 +6995,194 @@ mod motion_weighted_centroid_tests {
 }
 
 #[cfg(test)]
+mod bistatic_geometry_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn unit(dx: f64, dy: f64) -> (f64, f64) {
+        let norm = (dx * dx + dy * dy).sqrt();
+        (dx / norm, dy / norm)
+    }
+
+    /// Builds the exact `links` a real caller would pass, given a known
+    /// ground-truth velocity — computes each link's radial velocity from the
+    /// same bistatic formula `solve_bistatic_velocity` uses internally, so
+    /// recovering that same velocity from `links` alone is a real
+    /// correctness test of the solver, independent of any BVP/hardware
+    /// concern.
+    fn synthetic_links(
+        ap: [f32; 3],
+        nodes: &[[f32; 3]],
+        at: (f64, f64),
+        truth: (f64, f64),
+    ) -> Vec<([f32; 3], f64)> {
+        let u_ap = unit(at.0 - ap[0] as f64, at.1 - ap[1] as f64);
+        nodes
+            .iter()
+            .map(|&n| {
+                let u_n = unit(at.0 - n[0] as f64, at.1 - n[1] as f64);
+                let r = truth.0 * (u_ap.0 + u_n.0) + truth.1 * (u_ap.1 + u_n.1);
+                (n, r)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn solve_bistatic_velocity_recovers_known_ground_truth() {
+        let ap = [0.0f32, 0.0, 1.0];
+        let nodes = [[4.0f32, 0.0, 1.0], [0.0f32, 4.0, 1.0], [4.0f32, 4.0, 1.0]];
+        let at = (2.0, 1.0);
+        let truth = (0.7, -0.4);
+
+        let links = synthetic_links(ap, &nodes, at, truth);
+        let solved = solve_bistatic_velocity(ap, &links, at).expect("well-posed geometry");
+
+        assert!(
+            (solved.0 - truth.0).abs() < 1e-6 && (solved.1 - truth.1).abs() < 1e-6,
+            "expected {truth:?}, got {solved:?}"
+        );
+    }
+
+    #[test]
+    fn solve_bistatic_velocity_fewer_than_two_links_yields_none() {
+        let ap = [0.0f32, 0.0, 1.0];
+        let links = vec![([4.0f32, 0.0, 1.0], 0.5)];
+        assert!(solve_bistatic_velocity(ap, &links, (2.0, 1.0)).is_none());
+    }
+
+    #[test]
+    fn solve_bistatic_velocity_degenerate_colinear_geometry_yields_none() {
+        // AP and both nodes on the y=0 line, with the position estimate past
+        // both of them on the same line — every link's gradient direction
+        // is the same (+x), so the 2x2 normal-equations system is singular:
+        // no way to resolve a y-velocity component from parallel rows.
+        let ap = [0.0f32, 0.0, 1.0];
+        let nodes = [[4.0f32, 0.0, 1.0], [8.0f32, 0.0, 1.0]];
+        let at = (10.0, 0.0);
+        let links = synthetic_links(ap, &nodes, at, (0.5, 0.0));
+        assert!(
+            solve_bistatic_velocity(ap, &links, at).is_none(),
+            "colinear AP/nodes/position must not fabricate a velocity from a singular system"
+        );
+    }
+
+    fn fresh_state() -> AppStateInner {
+        AppStateInner::minimal()
+    }
+
+    #[test]
+    fn step_bistatic_filter_seeds_at_correction_prior_on_first_presence() {
+        let mut state = fresh_state();
+        let now = Instant::now();
+        let prior = MotionCentroid { x: 3.0, y: 2.0, z: 1.2 };
+
+        let c = step_bistatic_filter(&mut state, now, (5.0, 4.0), None, Some(prior), true, 1.2)
+            .expect("first presence with a correction prior should seed immediately");
+
+        assert_eq!((c.x, c.y), (3.0, 2.0));
+        assert_eq!(state.bistatic_uncertainty_m, BISTATIC_RESET_UNCERTAINTY_M);
+    }
+
+    #[test]
+    fn step_bistatic_filter_integrates_velocity_over_dt() {
+        let mut state = fresh_state();
+        let t0 = Instant::now();
+        step_bistatic_filter(
+            &mut state,
+            t0,
+            (10.0, 10.0),
+            None,
+            Some(MotionCentroid { x: 5.0, y: 5.0, z: 1.0 }),
+            true,
+            1.0,
+        );
+
+        let t1 = t0 + Duration::from_millis(500);
+        let c = step_bistatic_filter(&mut state, t1, (10.0, 10.0), Some((1.0, 0.0)), None, true, 1.0)
+            .expect("subsequent tick with velocity should integrate");
+
+        // x should have moved forward by roughly vx * dt = 1.0 * 0.5 = 0.5.
+        assert!((c.x - 5.5).abs() < 1e-6, "expected x≈5.5, got {}", c.x);
+        assert_eq!(c.y, 5.0);
+    }
+
+    #[test]
+    fn step_bistatic_filter_clamps_to_room_bounds() {
+        let mut state = fresh_state();
+        let t0 = Instant::now();
+        step_bistatic_filter(
+            &mut state,
+            t0,
+            (5.0, 5.0),
+            None,
+            Some(MotionCentroid { x: 4.9, y: 4.9, z: 1.0 }),
+            true,
+            1.0,
+        );
+
+        let t1 = t0 + Duration::from_secs(1);
+        let c = step_bistatic_filter(&mut state, t1, (5.0, 5.0), Some((10.0, 10.0)), None, true, 1.0)
+            .expect("velocity tick should still produce an estimate");
+
+        assert!(
+            c.x <= 5.0 && c.y <= 5.0,
+            "position must stay inside room bounds, got ({}, {})",
+            c.x,
+            c.y
+        );
+    }
+
+    #[test]
+    fn step_bistatic_filter_clears_state_after_sustained_absence() {
+        let mut state = fresh_state();
+        let t0 = Instant::now();
+        step_bistatic_filter(
+            &mut state,
+            t0,
+            (5.0, 5.0),
+            None,
+            Some(MotionCentroid { x: 1.0, y: 1.0, z: 1.0 }),
+            true,
+            1.0,
+        );
+        assert!(state.bistatic_position.is_some());
+
+        let t1 = t0 + Duration::from_secs_f64(BISTATIC_PRESENCE_TIMEOUT_SECS + 0.5);
+        let result = step_bistatic_filter(&mut state, t1, (5.0, 5.0), None, None, false, 1.0);
+
+        assert!(result.is_none());
+        assert!(
+            state.bistatic_position.is_none(),
+            "state must be cleared after presence has been false beyond the timeout"
+        );
+    }
+
+    #[test]
+    fn step_bistatic_filter_absent_returns_none_without_wiping_state_before_timeout() {
+        let mut state = fresh_state();
+        let t0 = Instant::now();
+        step_bistatic_filter(
+            &mut state,
+            t0,
+            (5.0, 5.0),
+            None,
+            Some(MotionCentroid { x: 1.0, y: 1.0, z: 1.0 }),
+            true,
+            1.0,
+        );
+
+        let t1 = t0 + Duration::from_millis(200);
+        let result = step_bistatic_filter(&mut state, t1, (5.0, 5.0), None, None, false, 1.0);
+
+        assert!(result.is_none(), "must not report a position while absent");
+        assert!(
+            state.bistatic_position.is_some(),
+            "a brief absence flicker under the timeout should not wipe the estimate"
+        );
+    }
+}
+
+#[cfg(test)]
 mod doppler_weighted_centroid_tests {
     use super::*;
     use std::collections::HashMap;
@@ -5779,22 +7191,47 @@ mod doppler_weighted_centroid_tests {
     const N_SUBCARRIERS: usize = 8;
 
     /// A node with `MIN_BVP_SAMPLES` frames of constant (non-moving)
-    /// amplitude — after `extract_bvp`'s per-subcarrier DC removal this
-    /// leaves ~nothing in any velocity bin, real or fabricated.
+    /// amplitude and phase — after DC removal this leaves ~nothing in any
+    /// velocity bin, real or fabricated.
     fn static_node() -> NodeState {
         let mut n = NodeState::new();
         n.csi_fps_ema = 44.0;
         n.last_frame_time = Some(Instant::now());
         for _ in 0..MIN_BVP_SAMPLES {
             n.frame_history.push_back(vec![10.0; N_SUBCARRIERS]);
+            n.phase_history.push_back(vec![0.0; N_SUBCARRIERS]);
         }
         n
     }
 
-    /// A node whose amplitude oscillates sinusoidally frame-to-frame — a
-    /// synthetic stand-in for genuine Doppler-modulated CSI, so
-    /// `node_doppler_weight` has something real to detect.
+    /// A node whose amplitude oscillates sinusoidally frame-to-frame, with a
+    /// constant per-frame phase rotation (`doppler_rotation_per_frame`) — a
+    /// synthetic stand-in for genuine Doppler-modulated CSI from a target
+    /// moving at a fixed radial velocity along this link.
+    ///
+    /// The rotation is constant *across time* (frame index `i`), not across
+    /// subcarrier index within a frame.
+    ///
+    /// WARNING (corrected 2026-08-28): an earlier version of this comment
+    /// claimed `sanitize_phase_linear_detrend` "leaves it untouched — it
+    /// survives into `phase_history` exactly like a real target's Doppler
+    /// phase would". **Both halves of that were wrong.** The sanitizer fits
+    /// `a*k + b` and subtracts *both* terms, so a vector that is constant
+    /// across subcarriers is pure intercept and is zeroed exactly (OLS on a
+    /// constant series has zero residual). This helper pushes straight into
+    /// `phase_history`, bypassing the sanitizer, so these tests exercise the
+    /// BVP transform but NOT the real ingestion path. See
+    /// `phase_sanitization_annihilates_doppler_tests` for the proof, and
+    /// `phase_diag` for the hardware measurement showing the common-mode
+    /// phase is uniform-random per packet on this silicon anyway.
     fn oscillating_node() -> NodeState {
+        directional_oscillating_node(0.3)
+    }
+
+    /// Same synthetic construction as [`oscillating_node`], with an
+    /// explicit, testable per-frame phase rotation rate (radians/frame) so
+    /// direction-sensitivity tests can compare a positive vs. negative rate.
+    fn directional_oscillating_node(doppler_rotation_per_frame: f64) -> NodeState {
         let mut n = NodeState::new();
         n.csi_fps_ema = 44.0;
         n.last_frame_time = Some(Instant::now());
@@ -5804,6 +7241,8 @@ mod doppler_weighted_centroid_tests {
             let t = i as f64 * dt;
             let amp = 10.0 + 3.0 * (2.0 * std::f64::consts::PI * freq_hz * t).sin();
             n.frame_history.push_back(vec![amp; N_SUBCARRIERS]);
+            let phase = doppler_rotation_per_frame * i as f64;
+            n.phase_history.push_back(vec![phase; N_SUBCARRIERS]);
         }
         n
     }
@@ -5845,7 +7284,7 @@ mod doppler_weighted_centroid_tests {
         let mut n = NodeState::new();
         n.csi_fps_ema = 44.0;
         n.frame_history.push_back(vec![1.0; N_SUBCARRIERS]);
-        assert!(node_doppler_weight(&n).is_none());
+        assert!(node_doppler_sample(&n).is_none());
     }
 
     #[test]
@@ -5854,7 +7293,7 @@ mod doppler_weighted_centroid_tests {
         // fabricate a moving-energy fraction from pure noise-floor leakage.
         let n = static_node();
         assert!(
-            node_doppler_weight(&n).is_none(),
+            node_doppler_sample(&n).is_none(),
             "constant amplitude must not produce a fabricated Doppler weight"
         );
     }
@@ -5864,10 +7303,44 @@ mod doppler_weighted_centroid_tests {
         // Raw magnitude, not a [0,1] ratio (changed live 2026-08-28) — just
         // check it's a real, positive, finite detection, not a specific scale.
         let n = oscillating_node();
-        let weight = node_doppler_weight(&n).expect("oscillating input should yield a real weight");
+        let sample =
+            node_doppler_sample(&n).expect("oscillating input should yield a real weight");
         assert!(
-            weight > 0.0 && weight.is_finite(),
-            "a genuinely oscillating signal should yield positive, finite moving energy, got {weight}"
+            sample.moving_energy > 0.0 && sample.moving_energy.is_finite(),
+            "a genuinely oscillating signal should yield positive, finite moving energy, got {}",
+            sample.moving_energy
+        );
+        assert!(
+            sample.mean_radial_velocity.is_finite(),
+            "mean_radial_velocity must be finite even when moving_energy is real"
+        );
+    }
+
+    #[test]
+    fn node_doppler_sample_mean_radial_velocity_tracks_rotation_sign() {
+        // Two nodes, identical amplitude modulation, opposite-signed
+        // per-frame phase rotation (opposite synthetic Doppler direction).
+        // If mean_radial_velocity is genuinely signed (the whole point of
+        // extract_bvp_signed over the old amplitude-only extract_bvp), these
+        // must land on opposite sides of zero — not both ~0, and not both
+        // the same sign.
+        let approaching = directional_oscillating_node(0.6);
+        let receding = directional_oscillating_node(-0.6);
+
+        let approaching_sample = node_doppler_sample(&approaching)
+            .expect("positively-rotating phase should yield a sample");
+        let receding_sample = node_doppler_sample(&receding)
+            .expect("negatively-rotating phase should yield a sample");
+
+        assert!(
+            approaching_sample.mean_radial_velocity > 0.0,
+            "positive phase rotation should yield positive mean_radial_velocity, got {}",
+            approaching_sample.mean_radial_velocity
+        );
+        assert!(
+            receding_sample.mean_radial_velocity < 0.0,
+            "negative phase rotation should yield negative mean_radial_velocity, got {}",
+            receding_sample.mean_radial_velocity
         );
     }
 
@@ -7283,6 +8756,190 @@ pub(crate) fn fleet_role_counts(snaps: &[(u8, NodeSyncSnapshot)]) -> (u64, u64) 
     (leaders, followers)
 }
 
+/// ADR-345: per-link CSI perturbation, one row per (receiver, transmitter).
+///
+/// The link table was previously reachable only through a 30-second log line,
+/// which is the wrong medium for something whose whole value is watching it
+/// respond while you walk around the room.
+///
+/// `motion` is baseline-subtracted and is the quantity a localiser should
+/// consume; `raw_motion` is reported alongside it because a link whose baseline
+/// has not settled shows a large raw value and a near-zero motion, and without
+/// both numbers that reads as a dead link rather than a warming one.
+///
+/// `kind` distinguishes a link from the access point (an uncontrolled
+/// transmitter, wherever the router happens to be) from a node-to-node link
+/// between two boards whose positions are known — the distinction that makes
+/// node-to-node links worth ~3x the angular spread.
+async fn links_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+
+    // MACs of our own nodes, so a peer link can be labelled with the peer's
+    // node id instead of a bare address.
+    // Node identity is inferred from who did *not* hear a transmitter; see
+    // `links::infer_transmitting_node` for the reasoning and its limits.
+    let metrics = s.link_table.metrics();
+    let (receivers, heard_by) = links::hearing_index(&metrics);
+
+    let rows: Vec<serde_json::Value> = metrics
+        .iter()
+        .map(|m| {
+            let tx_node = links::infer_transmitting_node(&m.id.tx_mac, &receivers, &heard_by);
+            serde_json::json!({
+                "rx_node": m.id.rx_node,
+                "tx_mac": format!(
+                    "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    m.id.tx_mac[0], m.id.tx_mac[1], m.id.tx_mac[2],
+                    m.id.tx_mac[3], m.id.tx_mac[4], m.id.tx_mac[5]
+                ),
+                // Inferred, never measured — see `infer_node` above.
+                "tx_node_inferred": tx_node,
+                "kind": if tx_node.is_some() { "node" } else { "infrastructure" },
+                "label": m.id.label(),
+                "frames": m.frames,
+                "rssi_dbm": m.rssi,
+                "raw_motion": m.raw_motion,
+                "motion": m.motion,
+                // Both metrics above are statistics over a fixed 64-frame
+                // window, so they mean nothing without the window they were
+                // taken over. A link whose delivery collapses while its peers
+                // surge produces a large apparent `motion` from transport
+                // contention alone — that pattern accounted for 56% of
+                // above-threshold bins on the 2026-08-28 overnight baseline,
+                // including the night's largest excursions, with the room
+                // empty. Report the window so a consumer can reject the
+                // comparison instead of believing it.
+                "window_span_s": m.window_span_s,
+                "fps": m.fps,
+            })
+        })
+        .collect();
+
+    // The link-line estimate, computed and reported *alongside* the live
+    // position rather than replacing it. It has never been scored against
+    // ground truth, so promoting it to the dot on the strength of it being
+    // newer would be exactly the overclaim this repository forbids. Reporting
+    // both here lets a labelled walk record them together and settle it with
+    // numbers.
+    let rti = rti_from_links(&metrics, &receivers, &heard_by, &s);
+
+    Json(serde_json::json!({
+        "links": rows,
+        "count": rows.len(),
+        // A v1-only fleet carries no transmitter address, so the table stays
+        // empty. Say so explicitly rather than letting an empty list read as
+        // "no motion anywhere".
+        "wire_v2_active": !rows.is_empty(),
+        "rti": rti,
+    }))
+}
+
+/// Build link-line observations from the current link table and solve for a
+/// position. `null` whenever the geometry or the data cannot support one — a
+/// missing node position, an unconfigured AP, too few usable links, or a
+/// baseline that has not converged.
+///
+/// Only links whose *both* endpoints have known coordinates can contribute. A
+/// link to an unidentified transmitter (a neighbour's router, a phone) is real
+/// signal but its geometry is unknown, so including it would inject an
+/// arbitrary line into the solve.
+fn rti_from_links(
+    metrics: &[links::LinkMetric],
+    receivers: &std::collections::BTreeSet<u8>,
+    heard_by: &std::collections::BTreeMap<[u8; 6], std::collections::BTreeSet<u8>>,
+    s: &AppStateInner,
+) -> serde_json::Value {
+    /// Frames the baseline EMA needs before its scale is trustworthy. At
+    /// `BASELINE_ALPHA = 0.02` the EMA's effective window is ~50 samples; this
+    /// is several times that, so a freshly admitted link stays out of the
+    /// solve rather than entering it with a scale still chasing its own start.
+    const MIN_BASELINE_SAMPLES: u64 = 200;
+
+    let Some(ap) = s.ap_position else {
+        return serde_json::Value::Null;
+    };
+    let (room_w, room_d) = s.room_bounds;
+    if room_w <= 0.0 || room_d <= 0.0 {
+        return serde_json::Value::Null;
+    }
+
+    let mut observations = Vec::new();
+    let mut skipped_unknown_tx = 0usize;
+    let mut skipped_cold = 0usize;
+
+    for m in metrics {
+        let Some(rx) = s.node_positions_config.get(&m.id.rx_node) else {
+            continue;
+        };
+        // Transmitter: one of our nodes (inferred), otherwise assumed to be the
+        // configured AP only when no receiver is missing — the same signature
+        // `infer_transmitting_node` uses, read the other way round.
+        let tx_node = links::infer_transmitting_node(&m.id.tx_mac, receivers, heard_by);
+        let tx = match tx_node {
+            Some(id) => match s.node_positions_config.get(&id) {
+                Some(p) => [p[0] as f64, p[1] as f64],
+                None => {
+                    skipped_unknown_tx += 1;
+                    continue;
+                }
+            },
+            None => {
+                // Heard by every receiver ⇒ external infrastructure, which we
+                // take to be the configured AP. Heard by some but not all with
+                // no single hole ⇒ an unidentified transmitter whose position
+                // we do not know, and must not guess at.
+                let heard_all = heard_by
+                    .get(&m.id.tx_mac)
+                    .is_some_and(|h| h.len() == receivers.len());
+                if !heard_all {
+                    skipped_unknown_tx += 1;
+                    continue;
+                }
+                [ap[0] as f64, ap[1] as f64]
+            }
+        };
+
+        if m.baseline_samples < MIN_BASELINE_SAMPLES {
+            skipped_cold += 1;
+            continue;
+        }
+        let response = rti::normalise_response(m.raw_motion, m.baseline);
+        observations.push(rti::LinkObservation {
+            rx: [rx[0] as f64, rx[1] as f64],
+            tx,
+            response,
+        });
+    }
+
+    let cfg = rti::RtiConfig {
+        width_m: room_w as f64,
+        depth_m: room_d as f64,
+        ..Default::default()
+    };
+
+    match rti::estimate(&observations, &cfg) {
+        Some(e) => serde_json::json!({
+            "x": e.x,
+            "y": e.y,
+            "confidence": e.confidence,
+            "spread_m": e.spread_m,
+            "links_used": e.links_used,
+            "skipped_unknown_tx": skipped_unknown_tx,
+            "skipped_cold_baseline": skipped_cold,
+            // Never promoted to `position_source` on the live dot. Unscored.
+            "status": "candidate_unvalidated",
+        }),
+        None => serde_json::json!({
+            "x": serde_json::Value::Null,
+            "y": serde_json::Value::Null,
+            "links_used": observations.len(),
+            "skipped_unknown_tx": skipped_unknown_tx,
+            "skipped_cold_baseline": skipped_cold,
+            "status": "no_estimate",
+        }),
+    }
+}
+
 async fn mesh_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let s = state.read().await;
     let mut nodes = serde_json::Map::new();
@@ -7470,6 +9127,49 @@ async fn udp_receiver_task(
                         Ok((_, consumed)) => warn!("RTL8720F radar datagram from {src} has trailing bytes: consumed={consumed} received={len}"),
                         Err(error) => warn!("Rejected RTL8720F radar datagram from {src}: {error}"),
                     }
+                    continue;
+                }
+                // Per-slot vitals (magic 0xC511_0009), sent alongside the
+                // aggregate packet below. Checked first because both are 32
+                // bytes and only the magic separates them.
+                if let Some(slots) = parse_esp32_vitals_slots(&buf[..len]) {
+                    let breakdown = slots
+                        .slots
+                        .iter()
+                        .filter(|s| s.active)
+                        .map(|s| {
+                            format!(
+                                "slot{}: br={:.1} hr={:.1} sc={}",
+                                s.slot, s.breathing_bpm, s.heartrate_bpm, s.subcarrier_idx
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("  ");
+                    // Throttled to the same cadence as the other per-node
+                    // diagnostics so a 1 Hz vitals cadence per node doesn't
+                    // flood the terminal. The guard is scoped so it is always
+                    // released before the `.await` below — a std MutexGuard
+                    // held across an await makes the future non-Send.
+                    let should_log = {
+                        let mut last = LAST_VITALS_SLOTS_LOG
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let now = std::time::Instant::now();
+                        if last.is_none_or(|t| now.duration_since(t).as_secs() >= 5) {
+                            *last = Some(now);
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if should_log {
+                        info!(
+                            "vitals slots: node={} active={}/{}  {}",
+                            slots.node_id, slots.n_active, slots.max_slots, breakdown
+                        );
+                    }
+                    let mut s = state.write().await;
+                    s.latest_vitals_slots.insert(slots.node_id, slots);
                     continue;
                 }
                 // ADR-039: Try edge vitals packet first (magic 0xC511_0002).
@@ -7731,16 +9431,27 @@ async fn udp_receiver_task(
                     if !tracked.is_empty() {
                         update.persons = Some(tracked);
                     }
-                    // Real multistatic path: prefer a Doppler-weighted centroid,
-                    // fall back to the amplitude-based motion-weighted centroid,
-                    // then to field_peak — see `attach_positions` and
-                    // `PositionEstimate` for what each tier means and why.
-                    let estimate = doppler_weighted_centroid(&s.node_states, &s.node_positions_config, now)
-                        .map(PositionEstimate::Doppler)
-                        .or_else(|| {
-                            motion_weighted_centroid(&s.node_states, &s.node_positions_config, now)
-                                .map(PositionEstimate::Motion)
-                        });
+                    // Real multistatic path: prefer the bistatic-geometry
+                    // velocity/position estimate, fall back to a Doppler-
+                    // weighted centroid, then the amplitude-based motion-
+                    // weighted centroid, then to field_peak — see
+                    // `attach_positions` and `PositionEstimate` for what each
+                    // tier means and why. NOTE: bistatic_links and
+                    // doppler_weighted_centroid each independently call
+                    // node_doppler_sample (BVP/STFT) per node this tick — a
+                    // known, accepted inefficiency for this first cut, not a
+                    // correctness issue; not worth deduplicating before this
+                    // tier is even live-validated.
+                    let doppler_centroid =
+                        doppler_weighted_centroid(&s.node_states, &s.node_positions_config, now);
+                    let motion_centroid =
+                        motion_weighted_centroid(&s.node_states, &s.node_positions_config, now);
+                    let correction_prior = doppler_centroid.or(motion_centroid);
+                    let presence = update.classification.presence;
+                    let estimate =
+                        estimate_bistatic_position(&mut s, now, correction_prior, presence)
+                            .or_else(|| doppler_centroid.map(PositionEstimate::Doppler))
+                            .or_else(|| motion_centroid.map(PositionEstimate::Motion));
                     attach_positions(&mut update, estimate);
                     assess_legacy_image_pose(&mut s, &update);
 
@@ -7928,6 +9639,18 @@ async fn udp_receiver_task(
                     // to avoid unsafe raw pointer (review finding #2).
                     let adaptive_model_clone = s.adaptive_model.clone();
 
+                    // Per-link accumulation, done before the per-node borrow
+                    // below so the link table and one node aren't borrowed at
+                    // once. Only wire v2 frames carry a transmitter; a frame
+                    // without one cannot be attributed to a link at all, and
+                    // giving it a placeholder key would recreate exactly the
+                    // mixing this layer exists to undo.
+                    if let Some(tx) = frame.source_mac {
+                        let now = std::time::Instant::now();
+                        s.link_table
+                            .observe(node_id, tx, &frame.amplitudes, frame.rssi, now);
+                        s.link_table.expire(now);
+                    }
                     let ns = s.node_states.entry(node_id).or_insert_with(NodeState::new);
                     // ADR-110 iter 19 — feed the per-node fps EMA from real
                     // CSI arrivals. The helper sets `last_frame_time` as a
@@ -7948,9 +9671,32 @@ async fn udp_receiver_task(
                     // for downstream model-wake gating.
                     ns.update_novelty(&frame.amplitudes);
 
+                    // Phase-channel diagnostic, if enabled. Deliberately taken
+                    // from `frame.phases` *before* sanitization: the open
+                    // question is whether the common-mode term the sanitizer
+                    // removes carries recoverable Doppler, which is
+                    // unanswerable from post-sanitization data.
+                    if let Some(diag) = phase_diagnostics() {
+                        diag.observe_frame(
+                            node_id,
+                            frame.sequence,
+                            frame.source_mac,
+                            &frame.phases,
+                            &frame.amplitudes,
+                        );
+                    }
+
                     ns.frame_history.push_back(frame.amplitudes.clone());
                     if ns.frame_history.len() > FRAME_HISTORY_CAPACITY {
                         ns.frame_history.pop_front();
+                    }
+                    // Pushed in lockstep with frame_history (same length,
+                    // same eviction) so build_csi_temporal_complex can zip
+                    // them by index — see node_doppler_sample.
+                    ns.phase_history
+                        .push_back(sanitize_phase_linear_detrend(&frame.phases));
+                    if ns.phase_history.len() > FRAME_HISTORY_CAPACITY {
+                        ns.phase_history.pop_front();
                     }
 
                     let sample_rate_hz = 1000.0 / 500.0_f64;
@@ -8207,16 +9953,27 @@ async fn udp_receiver_task(
                     if !tracked.is_empty() {
                         update.persons = Some(tracked);
                     }
-                    // Real multistatic path: prefer a Doppler-weighted centroid,
-                    // fall back to the amplitude-based motion-weighted centroid,
-                    // then to field_peak — see `attach_positions` and
-                    // `PositionEstimate` for what each tier means and why.
-                    let estimate = doppler_weighted_centroid(&s.node_states, &s.node_positions_config, now)
-                        .map(PositionEstimate::Doppler)
-                        .or_else(|| {
-                            motion_weighted_centroid(&s.node_states, &s.node_positions_config, now)
-                                .map(PositionEstimate::Motion)
-                        });
+                    // Real multistatic path: prefer the bistatic-geometry
+                    // velocity/position estimate, fall back to a Doppler-
+                    // weighted centroid, then the amplitude-based motion-
+                    // weighted centroid, then to field_peak — see
+                    // `attach_positions` and `PositionEstimate` for what each
+                    // tier means and why. NOTE: bistatic_links and
+                    // doppler_weighted_centroid each independently call
+                    // node_doppler_sample (BVP/STFT) per node this tick — a
+                    // known, accepted inefficiency for this first cut, not a
+                    // correctness issue; not worth deduplicating before this
+                    // tier is even live-validated.
+                    let doppler_centroid =
+                        doppler_weighted_centroid(&s.node_states, &s.node_positions_config, now);
+                    let motion_centroid =
+                        motion_weighted_centroid(&s.node_states, &s.node_positions_config, now);
+                    let correction_prior = doppler_centroid.or(motion_centroid);
+                    let presence = update.classification.presence;
+                    let estimate =
+                        estimate_bistatic_position(&mut s, now, correction_prior, presence)
+                            .or_else(|| doppler_centroid.map(PositionEstimate::Doppler))
+                            .or_else(|| motion_centroid.map(PositionEstimate::Motion));
                     attach_positions(&mut update, estimate);
                     assess_legacy_image_pose(&mut s, &update);
 
@@ -9475,6 +11232,84 @@ async fn main() {
     info!("  UI path:   {}", args.ui_path.display());
     info!("  Source:    {}", args.source);
 
+    // Opt-in phase-channel diagnostics. A failure to open the sink is logged
+    // and ignored: instrumentation must never prevent the server from running.
+    let phase_diag_sink = args.phase_diagnostics.as_ref().and_then(|dir| {
+        match phase_diag::PhaseDiagnostics::new_with_mode(
+            dir,
+            args.phase_diagnostics_continuous,
+        ) {
+            Ok(d) => Some(std::sync::Arc::new(d)),
+            Err(e) => {
+                error!("failed to open phase diagnostics in {}: {e}", dir.display());
+                None
+            }
+        }
+    });
+    if let Some(sink) = phase_diag_sink.clone() {
+        // Overnight runs are usually ended with a kill rather than a clean
+        // shutdown, so flush on a timer instead of relying on Drop.
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
+            let mut ticks: u32 = 0;
+            loop {
+                ticker.tick().await;
+                sink.flush();
+                ticks += 1;
+                // Every ~30 s, report which transmitters each node is actually
+                // hearing. Empty on wire-v1 firmware, which carries no
+                // transmitter identity. This answers "what is this node
+                // listening to" from the server, with no serial console.
+                if ticks % 3 == 0 {
+                    let census = sink.source_census();
+                    if census.is_empty() {
+                        continue;
+                    }
+                    let mut per_node: std::collections::BTreeMap<u8, Vec<([u8; 6], u64)>> =
+                        std::collections::BTreeMap::new();
+                    for (node, mac, count) in census {
+                        per_node.entry(node).or_default().push((mac, count));
+                    }
+                    for (node, mut srcs) in per_node {
+                        let total: u64 = srcs.iter().map(|(_, c)| *c).sum();
+                        srcs.truncate(5);
+                        let listed = srcs
+                            .iter()
+                            .map(|(m, c)| {
+                                format!(
+                                    "{:02x}:{:02x}:{:02x}={} ({:.0}%)",
+                                    m[3],
+                                    m[4],
+                                    m[5],
+                                    c,
+                                    100.0 * *c as f64 / total.max(1) as f64
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("  ");
+                        info!("source census: node={node} total={total}  {listed}");
+                    }
+                }
+            }
+        });
+    }
+    let _ = PHASE_DIAG.set(phase_diag_sink);
+
+    if args.enable_bistatic_tier {
+        BISTATIC_TIER_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        warn!(
+            "bistatic phase-Doppler position tier ENABLED by --enable-bistatic-tier. \
+             Its input (common-mode CSI phase) measured uniform-random per packet on \
+             ESP32-C6 single-antenna hardware; positions from this tier are CLAIMED, \
+             not MEASURED. See bistatic_tier_enabled's docs."
+        );
+    } else {
+        info!(
+            "bistatic phase-Doppler position tier disabled (default); position falls \
+             back to doppler_centroid -> motion_centroid -> field_peak"
+        );
+    }
+
     // Resolve the data source into a concrete task plan (issue #1004).
     //
     // Issue #937 (prior fix): `auto` must never serve fake CSI *tagged as
@@ -9723,7 +11558,13 @@ async fn main() {
     // room_config.json (Room Builder) — same source and load order as
     // `node_positions_config`.
     let mut ap_position: Option<[f32; 3]> = None;
+    // Room bounds (meters) for `step_bistatic_filter`'s position clamp.
+    // `(0.0, 0.0)` (never configured) disables that tier's clamp step at the
+    // call site — see its guard there.
+    let mut room_bounds: (f32, f32) = (0.0, 0.0);
     let state: SharedState = Arc::new(RwLock::new(AppStateInner {
+        link_table: links::LinkTable::new(),
+        latest_vitals_slots: HashMap::new(),
         latest_update: None,
         last_broadcast_at: None,
         rssi_history: VecDeque::new(),
@@ -9826,6 +11667,9 @@ async fn main() {
             // every future launch. The CLI flag remains a first-run/no-GUI
             // convenience, not removed.
             let room_config = load_room_config(&data_dir);
+            if room_config.width_m > 0.0 && room_config.depth_m > 0.0 {
+                room_bounds = (room_config.width_m, room_config.depth_m);
+            }
             if !room_config.nodes.is_empty() {
                 info!(
                     "Loaded {} node position(s) from room_config.json (overrides --node-positions)",
@@ -9856,9 +11700,13 @@ async fn main() {
         },
         node_positions_config,
         ap_position,
+        room_bounds,
         room_debounced_level: "absent".to_string(),
         room_debounce_candidate: "absent".to_string(),
         room_debounce_since: None,
+        bistatic_position: None,
+        bistatic_uncertainty_m: 0.0,
+        bistatic_last_update: None,
         engine_bridge: engine_bridge::EngineBridge::new(
             wifi_densepose_bfld::PrivacyMode::PrivateHome,
             1,
@@ -9885,6 +11733,42 @@ async fn main() {
         )
         .expect("default pose physics configuration is valid"),
     }));
+
+    // Per-link motion, the surface node<->node ranging is built on. Populated
+    // only from wire v2 frames; silent on a v1-only fleet.
+    {
+        let link_state = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                ticker.tick().await;
+                let metrics = {
+                    let st = link_state.read().await;
+                    st.link_table.metrics()
+                };
+                if metrics.is_empty() {
+                    continue;
+                }
+                let listed = metrics
+                    .iter()
+                    .take(16)
+                    .map(|m| {
+                        format!(
+                            "{}: motion={:.3} raw={:.3} rssi={:.0} n={}",
+                            m.id.label(),
+                            m.motion,
+                            m.raw_motion,
+                            m.rssi,
+                            m.frames
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("  |  ");
+                info!("links ({}): {listed}", metrics.len());
+            }
+        });
+    }
+
 
     // Start background tasks from the resolved plan (issue #1004).
     //
@@ -10091,6 +11975,8 @@ async fn main() {
         .route("/api/v1/nodes/:id/sync", get(node_sync_endpoint))
         .route("/api/v1/mesh", get(mesh_endpoint))
         .route("/api/v1/mesh/metrics", get(mesh_metrics_endpoint))
+        // ADR-345: per-link CSI perturbation (receiver, transmitter).
+        .route("/api/v1/links", get(links_endpoint))
         // Vital sign endpoints
         .route("/api/v1/vital-signs", get(vital_signs_endpoint))
         .route("/api/v1/edge-vitals", get(edge_vitals_endpoint))
@@ -10179,6 +12065,10 @@ async fn main() {
             "/api/v1/config/room",
             get(config_get_room).post(config_set_room),
         )
+        // Ground-truth marker for attended signal experiments. GET so it can be
+        // triggered from a phone browser mid-walk without a REST client.
+        // axum 0.7 path-param syntax is `:label`; `{label}` is a literal segment.
+        .route("/api/v1/diag/mark/:label", get(diag_mark))
         // Static UI files
         .nest_service("/ui", ServeDir::new(&ui_path))
         // ADR-102: make the edge registry handle (Option<Arc<EdgeRegistry>>)
@@ -10504,31 +12394,43 @@ mod sync_snapshot_helper_tests {
     }
 
     #[test]
-    fn observe_csi_frame_arrival_ignores_subms_bursts() {
-        // Issue #1180 regression: a ~40 fps node whose frames are delivered
-        // in tight UDP bursts (sub-ms intra-burst deltas) must still report
-        // ~40 fps, not tens of kHz. Synthesize the arrival stream by adding
-        // Durations to a base Instant.
+    fn observe_csi_frame_arrival_recovers_rate_through_udp_bursts() {
+        // Issue #1180 regression: a 40 fps node whose frames are delivered in
+        // tight UDP bursts must still report ~40 fps.
+        //
+        // The earlier version of this test put three arrivals in every 25 ms
+        // group — 90 frames in 750 ms, i.e. 120 fps — and asserted the answer
+        // was 40. That only holds if the two extra arrivals aren't real
+        // frames, but each `observe_csi_frame_arrival` call is one distinct
+        // CSI frame with its own sequence number, and 120 fps is above the
+        // firmware's own `CSI_MIN_SEND_INTERVAL_US` ceiling anyway.
+        //
+        // Modelled properly: the node produces at 40 fps (25 ms apart) and
+        // the network clumps every three frames into one burst, so bursts
+        // land every 75 ms. Same burst pathology, physically possible node.
         use std::time::Duration;
         let base = std::time::Instant::now();
         let mut ns = NodeState::new();
         ns.csi_fps_ema = 40.0; // pretend already warmed up
         ns.csi_fps_samples = 10;
 
-        // 30 nominal 25 ms groups, each preceded by a 3-frame sub-ms burst.
-        for g in 0..30u64 {
-            let group_t = base + Duration::from_millis(25 * g);
-            ns.observe_csi_frame_arrival(group_t);
-            // burst: two extra arrivals 40 µs and 80 µs later — must be
-            // ignored for rate purposes (anchor must not advance to them).
-            ns.observe_csi_frame_arrival(group_t + Duration::from_micros(40));
-            ns.observe_csi_frame_arrival(group_t + Duration::from_micros(80));
+        for g in 0..40u64 {
+            let burst_t = base + Duration::from_millis(75 * g);
+            ns.observe_csi_frame_arrival(burst_t);
+            ns.observe_csi_frame_arrival(burst_t + Duration::from_micros(40));
+            ns.observe_csi_frame_arrival(burst_t + Duration::from_micros(80));
         }
 
         assert!(
             (ns.csi_fps_ema - 40.0).abs() < 2.0,
-            "csi_fps_ema must stay near the 40 fps ground truth despite \
-             sub-ms bursts, got {}",
+            "csi_fps_ema must recover the 40 fps ground truth through burst \
+             delivery, got {}",
+            ns.csi_fps_ema
+        );
+        assert!(
+            ns.csi_fps_ema < CSI_PRODUCTION_CEILING_FPS,
+            "must never report above the {CSI_PRODUCTION_CEILING_FPS} fps \
+             firmware ceiling, got {}",
             ns.csi_fps_ema
         );
     }
@@ -10881,6 +12783,7 @@ async fn config_set_room(
     }
     s.multistatic_fuser.set_node_positions(positions);
     s.ap_position = config.ap_position;
+    s.room_bounds = (config.width_m, config.depth_m);
     let data_dir = s.data_dir.clone();
     drop(s);
     save_room_config(&data_dir, &config);
@@ -11326,6 +13229,30 @@ mod observatory_persons_field_position_tests {
         let v = serde_json::to_value(&update).unwrap();
         assert_eq!(v["persons"][0]["position_source"], "motion_centroid");
         assert!(v["persons"][0].get("position_uncertainty_m").is_none());
+    }
+
+    #[test]
+    fn attach_positions_bistatic_reports_real_uncertainty() {
+        // Unlike the Doppler/motion centroid tiers, the bistatic tier has a
+        // real (filter-internal) uncertainty — the first tier to populate
+        // position_uncertainty_m with something other than None.
+        let mut update = base_update(field_with_peak(15, 4), true, 10.0);
+        update.persons = Some(derive_pose_from_sensing(&update));
+
+        let centroid = MotionCentroid { x: 1.2, y: 3.4, z: 1.5 };
+        attach_positions(
+            &mut update,
+            Some(PositionEstimate::Bistatic { c: centroid, uncertainty_m: 0.75 }),
+        );
+
+        let p0 = &update.persons.as_ref().unwrap()[0];
+        assert_eq!(p0.position, [1.2, 3.4, 1.5]);
+        assert_eq!(p0.position_source, "bistatic_velocity");
+        assert_eq!(p0.position_uncertainty_m, Some(0.75));
+
+        let v = serde_json::to_value(&update).unwrap();
+        assert_eq!(v["persons"][0]["position_source"], "bistatic_velocity");
+        assert_eq!(v["persons"][0]["position_uncertainty_m"], 0.75);
     }
 
     #[test]

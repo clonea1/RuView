@@ -59,13 +59,17 @@ wifi-densepose-wifiscan = { version = "0.3.0", path = "../wifi-densepose-wifisca
 # build without vcpkg/openblas (issue #366, #415).
 wifi-densepose-signal = { version = "0.3.1", path = "../wifi-densepose-signal", default-features = false }
 
-# Body Velocity Profile (Doppler) extraction — feeds `doppler_weighted_centroid`.
-# Same workspace-pinned version wifi-densepose-signal itself uses, so the
-# `Array2<f64>` built here and passed into `wifi_densepose_signal::bvp::extract_bvp`
-# is the same concrete type across the crate boundary (a mismatched ndarray
+# Body Velocity Profile (Doppler) extraction — feeds `doppler_weighted_centroid`
+# and `node_doppler_sample`. Same workspace-pinned version wifi-densepose-signal
+# itself uses, so the `Array2<_>` built here and passed into
+# `wifi_densepose_signal::bvp::extract_bvp`/`extract_bvp_signed` is the same
+# concrete type across the crate boundary (a mismatched ndarray/num-complex
 # major version would otherwise silently fail to compile as "expected Array2,
 # found Array2").
 ndarray = { workspace = true }
+# Complex CSI (amplitude * e^{jθ}) for `extract_bvp_signed` — see
+# `build_csi_temporal_complex`/`node_doppler_sample`.
+num-complex = { workspace = true }
 
 # Hardware crate — SyncPacket decoder for ADR-110 §A0.12 mesh-aligned timestamps.
 wifi-densepose-hardware = { version = "0.3.0", path = "../wifi-densepose-hardware" }
