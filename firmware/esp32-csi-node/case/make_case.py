@@ -12,9 +12,12 @@ This fleet has already measured what obstruction costs: wire cages flanking one
 node put ~13 dB of excess loss on its shortest link. A bad case is the same
 class of problem, self-inflicted.
 
-So the antenna end is left fully open. Not thinned, not vented -- open. The
-board is held by its opposite end and the case stops short of ANTENNA_CLEAR_MM
-before the antenna region begins. Everything else here is ordinary.
+So the antenna is pushed OUT of the box rather than given room inside it. The
+enclosure is otherwise a closed tray: the antenna end carries a full wall with
+a horizontal slot at board height, and the last ANTENNA_CLEAR_MM of the board
+slides through and sits in free air. Nothing dielectric ends up beside the
+antenna, and the electronics are still fully housed -- better than truncating
+the case, which left the board's end unsupported and open to dust.
 
 Print notes
 -----------
@@ -77,63 +80,76 @@ def write_stl(path, tris, name="node_case"):
 
 def build(a):
     W = a.wall
-    # Interior the board sits in, with clearance all round.
     ix = a.pcb_l + 2*a.fit
     iy = a.pcb_w + 2*a.fit
-    # Height: floor standoff + board + headroom over the tallest component.
     iz = a.standoff + a.pcb_h + a.headroom
 
-    # The case is truncated before the antenna so nothing dielectric sits
-    # near it. This is the whole point of the design.
-    body_len = ix - a.antenna_clear
+    # How much board is enclosed; the rest protrudes through the slot.
+    enc = ix - a.antenna_clear
+    outer_x = enc + 2*W
+    outer_y = iy + 2*W
+
+    # Slot geometry: the board passes through at its seated height, with a
+    # little clearance so it is not a press fit through a printed edge.
+    g = a.slot_gap
+    sz0 = W + a.standoff - g
+    sz1 = W + a.standoff + a.pcb_h + g
+    sy0 = W - g
+    sy1 = W + iy + g
 
     t = []
-    # Floor, under the supported part only.
-    t += box(0, 0, 0, body_len + W, iy + 2*W, W)
+    t += box(0, 0, 0, outer_x, outer_y, W)                       # floor
 
-    # Long walls, broken into segments to leave ventilation gaps. The radio is
-    # on continuously and these run warm.
-    seg = (body_len + W) / (2*a.vents + 1)
+    # Long walls, segmented for ventilation. The radio runs continuously.
+    seg = outer_x / (2*a.vents + 1)
     for i in range(a.vents + 1):
-        x0 = i * 2 * seg
-        x1 = min(x0 + seg, body_len + W)
+        x0, x1 = i*2*seg, min(i*2*seg + seg, outer_x)
         if x1 <= x0:
             continue
-        t += box(x0, 0, 0, x1, W, W + iz)                 # near wall
-        t += box(x0, iy + W, 0, x1, iy + 2*W, W + iz)     # far wall
+        t += box(x0, 0, 0, x1, W, W + iz)
+        t += box(x0, outer_y - W, 0, x1, outer_y, W + iz)
 
-    # End wall at the closed end, with a USB-C cutout left as a gap.
-    u0 = (iy + 2*W - a.usb_w) / 2
+    # Closed end, with the USB-C opening left as a gap in the wall.
+    u0 = (outer_y - a.usb_w) / 2
     t += box(0, 0, 0, W, u0, W + iz)
-    t += box(0, u0 + a.usb_w, 0, W, iy + 2*W, W + iz)
-    t += box(0, u0, W + a.usb_h, W, u0 + a.usb_w, W + iz)  # bridge over USB
+    t += box(0, u0 + a.usb_w, 0, W, u0 + a.usb_w + (outer_y - u0 - a.usb_w), W + iz)
+    t += box(0, u0, W + a.usb_h, W, u0 + a.usb_w, W + iz)
 
-    # Standoffs to lift the board off the floor so the underside clears.
-    for sx in (W + 3, body_len - 6):
-        for sy in (W + 3, iy + W - 3 - a.pad):
+    # Antenna end: a full wall, slotted so the board passes through.
+    ax0, ax1 = outer_x - W, outer_x
+    t += box(ax0, 0, 0, ax1, outer_y, sz0)                       # under the slot
+    t += box(ax0, 0, sz1, ax1, outer_y, W + iz)                  # over the slot
+    t += box(ax0, 0, sz0, ax1, sy0, sz1)                         # beside, near
+    t += box(ax0, sy1, sz0, ax1, outer_y, sz1)                   # beside, far
+
+    # Standoffs.
+    for sx in (W + 3, outer_x - W - 6):
+        for sy in (W + 3, outer_y - W - 3 - a.pad):
             t += box(sx, sy, W, sx + a.pad, sy + a.pad, W + a.standoff)
 
-    # Retaining lip at the closed end so the board cannot slide out backwards.
+    # Retaining lip at the closed end so the board cannot back out of the slot.
     t += box(W, W, W + a.standoff + a.pcb_h,
-             W + 2, iy + W, W + a.standoff + a.pcb_h + 1.2)
+             W + 2, outer_y - W, W + a.standoff + a.pcb_h + 1.2)
 
-    # Two keyhole-free mounting tabs; drill or screw through as suits the wall.
-    for ty in (0, iy + 2*W - a.tab_w):
-        t += box(body_len + W, ty, 0, body_len + W + a.tab_l, ty + a.tab_w, W)
+    # Mounting tabs on the long sides, clear of the antenna.
+    for sy, sy2 in ((0 - a.tab_l, 0), (outer_y, outer_y + a.tab_l)):
+        t += box(outer_x*0.25, sy, 0, outer_x*0.25 + a.tab_w, sy2, W)
 
-    return t, (body_len + W + a.tab_l, iy + 2*W, W + iz)
+    return t, (outer_x, outer_y + 2*a.tab_l, W + iz)
 
 
 def build_lid(a):
     W = a.wall
     ix = a.pcb_l + 2*a.fit
     iy = a.pcb_w + 2*a.fit
-    body_len = ix - a.antenna_clear
+    enc = ix - a.antenna_clear
+    outer_x = enc + 2*W
+    outer_y = iy + 2*W
     t = []
-    t += box(0, 0, 0, body_len + W, iy + 2*W, W)
+    t += box(0, 0, 0, outer_x, outer_y, W)
     # Inner lip so it locates without fasteners.
-    t += box(W + 0.3, W + 0.3, W, body_len - 0.3, iy + W - 0.3, W + 2)
-    return t, (body_len + W, iy + 2*W, W + 2)
+    t += box(W + 0.3, W + 0.3, W, outer_x - W - 0.3, outer_y - W - 0.3, W + 2)
+    return t, (outer_x, outer_y, W + 2)
 
 
 def main():
@@ -144,7 +160,9 @@ def main():
     p.add_argument("--pcb-w", type=float, default=25.5, help="board width mm")
     p.add_argument("--pcb-h", type=float, default=1.6,  help="board thickness mm")
     p.add_argument("--antenna-clear", type=float, default=18.0,
-                   help="mm of board left OUTSIDE the case at the antenna end")
+                   help="mm of board protruding through the slot, antenna end")
+    p.add_argument("--slot-gap", type=float, default=0.6,
+                   help="clearance around the board in the antenna slot")
     p.add_argument("--wall", type=float, default=2.0)
     p.add_argument("--fit", type=float, default=0.4, help="clearance per side")
     p.add_argument("--standoff", type=float, default=2.5)
@@ -166,7 +184,7 @@ def main():
         lt, ld = build_lid(a)
         ln = write_stl("node-lid.stl", lt)
         print("node-lid.stl  %d triangles  %.1f x %.1f x %.1f mm" % (ln, *ld))
-    print("\nantenna end left open: %.1f mm of board protrudes" % a.antenna_clear)
+    print("\nantenna slot: %.1f mm of board protrudes into free air" % a.antenna_clear)
     print("print in PLA or PETG. NOT carbon-fill or any conductive filament:")
     print("carbon is lossy at 2.4 GHz and would attenuate every link.")
 
