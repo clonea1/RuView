@@ -91,13 +91,6 @@
 #define EDGE_PERSON_PERSIST_FRAMES   3     /**< Consecutive decisions a count must hold before emit. */
 
 /* ---- Calibration ---- */
-/* Per-frame climb of the quiet floor: ~+0.7%/min at 36 fps, so a genuine
- * change in the room is adopted over tens of minutes while a stationary person
- * is never mistaken for the new normal. Descent is instantaneous. */
-#define EDGE_FLOOR_LEAK   1.000002f
-/* Presence threshold as a multiple of the tracked floor. */
-#define EDGE_FLOOR_MULT   4.0f
-
 #define EDGE_CALIB_FRAMES     1200  /**< Frames for adaptive calibration (~60s at 20 Hz). */
 #define EDGE_CALIB_SIGMA_MULT 3.0f  /**< Threshold = mean + 3*sigma of ambient. */
 
