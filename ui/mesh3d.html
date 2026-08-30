@@ -89,6 +89,8 @@
       <input type="range" id="p0" min="-60" max="-20" step="1" value="-40">
       <label>exponent <span class="val" id="nv"></span> <span class="sub">(2 = open air, 3&ndash;4 = walls)</span></label>
       <input type="range" id="n" min="15" max="45" step="1" value="30">
+      <label>AP transmits harder by <span class="val" id="apv"></span></label>
+      <input type="range" id="apg" min="0" max="16" step="1" value="8">
       <div class="hint">Calibrate: pick two nodes whose real separation you
       know, then move the exponent until the map agrees. Everything else
       follows.</div>
@@ -113,11 +115,20 @@
 <script>
 // ---- state ---------------------------------------------------------------
 var links = [], ids = [], pos = {}, az = 0.6, el = 0.4, zoom = 1, drag = null;
-var P0 = -40, PLE = 3.0;   // dBm at 1 ft, path-loss exponent
+var P0 = -40, PLE = 3.0;   // dBm at 1 ft for a NODE transmitter
+var AP_GAIN = 8;           // dB the AP transmits harder than a node
 
-function rssiToFeet(dbm){
-  // d = d0 * 10^((P0 - RSSI) / (10 * n)), d0 = 1 ft
-  return Math.pow(10, (P0 - dbm) / (10 * PLE));
+// Separate reference power per transmitter class.
+//
+// d = d0 * 10^((P0 - RSSI) / (10 * n)) assumes a fixed transmit power, so one
+// P0 across mixed transmitters is a real error: an AP with more output and a
+// better antenna reads stronger at the same distance, and a single P0 would
+// place it too close. The AP's stronger link is still the *better* measurement
+// — higher SNR means a steadier RSSI — but only once its extra output is
+// accounted for rather than mistaken for proximity.
+function rssiToFeet(dbm, isAp){
+  var ref = isAp ? (P0 + AP_GAIN) : P0;
+  return Math.pow(10, (ref - dbm) / (10 * PLE));
 }
 
 // ---- MDS by gradient descent --------------------------------------------
@@ -224,7 +235,8 @@ function buildPairs(){
   return Object.keys(best).map(function(k){
     var e = best[k];
     var mean = e.v.reduce(function(s,x){return s+x;},0) / e.v.length;
-    return {a:e.a, b:e.b, d:rssiToFeet(mean), rssi:mean};
+    var isAp = (e.a === 'AP' || e.b === 'AP');
+    return {a:e.a, b:e.b, d:rssiToFeet(mean, isAp), rssi:mean, ap:isAp};
   });
 }
 
@@ -238,7 +250,8 @@ function recompute(){
   var rows = '<tr><td>pair</td><td class="n">dBm</td><td class="n">ft</td></tr>';
   pairs.sort(function(a,b){ return a.d - b.d; }).forEach(function(p){
     rows += '<tr><td>' + p.a + ' &harr; ' + p.b + '</td><td class="n">' +
-            p.rssi.toFixed(0) + '</td><td class="n">' + p.d.toFixed(0) + '</td></tr>';
+            p.rssi.toFixed(0) + '</td><td class="n">' + p.d.toFixed(0) +
+            (p.ap ? ' <span class="sub">ap</span>' : '') + '</td></tr>';
   });
   document.getElementById('tbl').innerHTML = rows;
   document.getElementById('stamp').textContent =
@@ -252,12 +265,16 @@ function recompute(){
 function syncLabels(){
   document.getElementById('p0v').textContent = P0 + ' dBm';
   document.getElementById('nv').textContent = PLE.toFixed(1);
+  document.getElementById('apv').textContent = AP_GAIN + ' dB';
 }
 document.getElementById('p0').oninput = function(){
   P0 = +this.value; syncLabels(); recompute();
 };
 document.getElementById('n').oninput = function(){
   PLE = +this.value / 10; syncLabels(); recompute();
+};
+document.getElementById('apg').oninput = function(){
+  AP_GAIN = +this.value; syncLabels(); recompute();
 };
 document.getElementById('solve').onclick = function(){
   var a = document.getElementById('ka').value.trim();
@@ -271,7 +288,8 @@ document.getElementById('solve').onclick = function(){
   // Solve n directly: want = 10^((P0 - rssi)/(10n))  ->  n = (P0-rssi)/(10*log10(want))
   var lg = Math.log(want) / Math.LN10;
   if (Math.abs(lg) < 1e-6) { note.innerHTML = '<span class="err">pick a pair not 1 ft apart</span>'; return; }
-  var n = (P0 - pr.rssi) / (10 * lg);
+  var ref = pr.ap ? (P0 + AP_GAIN) : P0;
+  var n = (ref - pr.rssi) / (10 * lg);
   if (!(n > 1.5 && n < 4.5)) {
     note.innerHTML = '<span class="err">that implies exponent ' + n.toFixed(2) +
       ', outside the physical 1.5&ndash;4.5 range. Check the node numbers or the distance.</span>';
