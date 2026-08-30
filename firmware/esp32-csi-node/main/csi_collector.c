@@ -111,7 +111,7 @@ static esp_timer_handle_t s_hop_timer = NULL;
  * Serialize CSI data into ADR-018 binary frame format.
  *
  * Layout:
- *   [0..3]   Magic: 0xC5110001 (LE)
+ *   [0..3]   Magic: 0xC5110008 = CSI_MAGIC_V2 (LE); v1 was 0xC5110001
  *   [4]      Node ID
  *   [5]      Number of antennas (rx_ctrl.rx_ant + 1 if available, else 1)
  *   [6..7]   Number of subcarriers (LE u16) = len / (2 * n_antennas)
@@ -119,8 +119,13 @@ static esp_timer_handle_t s_hop_timer = NULL;
  *   [12..15] Sequence number (LE u32)
  *   [16]     RSSI (i8)
  *   [17]     Noise floor (i8)
- *   [18..19] Reserved
- *   [20..]   I/Q data (raw bytes from ESP-IDF callback)
+ *   [18]     PPDU type (ADR-110; 0 when HE tagging is compiled out)
+ *   [19]     Flags (ADR-018; bit4 = cross-node sync valid)
+ *   [20..25] Transmitter MAC (addr2) — wire v2 only
+ *   [26..]   I/Q data (raw bytes from ESP-IDF callback)
+ *
+ * Emits wire v2 (CSI_MAGIC_V2). v1 differs only in lacking bytes 20..25, so
+ * its I/Q begins at 20 instead of 26.
  */
 size_t csi_serialize_frame(const wifi_csi_info_t *info, uint8_t *buf, size_t buf_len)
 {
@@ -132,7 +137,7 @@ size_t csi_serialize_frame(const wifi_csi_info_t *info, uint8_t *buf, size_t buf
     uint16_t iq_len = (uint16_t)info->len;
     uint16_t n_subcarriers = iq_len / (2 * n_antennas);
 
-    size_t frame_size = CSI_HEADER_SIZE + iq_len;
+    size_t frame_size = CSI_HEADER_SIZE_V2 + iq_len;
     if (frame_size > buf_len) {
         ESP_LOGW(TAG, "Buffer too small: need %u, have %u", (unsigned)frame_size, (unsigned)buf_len);
         return 0;
@@ -151,8 +156,10 @@ size_t csi_serialize_frame(const wifi_csi_info_t *info, uint8_t *buf, size_t buf
         freq_mhz = 0;
     }
 
-    /* Magic (LE) */
-    uint32_t magic = CSI_MAGIC;
+    /* Magic (LE). Wire v2: identical to v1 through byte 19, then the
+     * transmitter MAC at 20..25 and I/Q from 26. A v1-only reader rejects the
+     * magic outright rather than misparsing the payload at the wrong offset. */
+    uint32_t magic = CSI_MAGIC_V2;
     memcpy(&buf[0], &magic, 4);
 
     /* Node ID (captured at init into s_node_id to survive memory corruption
@@ -237,8 +244,14 @@ size_t csi_serialize_frame(const wifi_csi_info_t *info, uint8_t *buf, size_t buf
     buf[19] = 0;
 #endif
 
+    /* Wire v2 bytes 20..25: transmitter (addr2) of the frame this CSI came
+     * from. ESP-IDF already hands it to us in info->mac; before v2 it was
+     * used only for the optional filter_mac comparison and then discarded,
+     * which left the sink unable to tell one link from another. */
+    memcpy(&buf[20], info->mac, 6);
+
     /* I/Q data */
-    memcpy(&buf[CSI_HEADER_SIZE], info->buf, iq_len);
+    memcpy(&buf[CSI_HEADER_SIZE_V2], info->buf, iq_len);
 
     return frame_size;
 }
@@ -250,6 +263,29 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
 {
     (void)ctx;
 
+    /* ADR-060: MAC address filtering — drop frames from non-matching sources.
+     * Uses defensively-copied s_filter_mac instead of g_nvs_config (which can
+     * be corrupted by wifi_init_sta — same root cause as the node_id clobber).
+     *
+     * This MUST run before the rate gate below. Previously the gate ran first
+     * and stamped s_last_process_us before this check, so a frame from any
+     * other transmitter consumed the 20 ms slot and was then discarded here —
+     * starving the frames we actually asked for. Measured on an ESP32-C6 in a
+     * normal home environment (2026-08-28): enabling filter_mac dropped yield
+     * from ~42 pps to 6-13 pps, because ~75% of promiscuous MGMT+DATA traffic
+     * on the channel was not the filtered peer. Filtering first restores the
+     * full rate for the selected transmitter.
+     *
+     * Safe with respect to the crash the gate guards against: a 6-byte memcmp
+     * is negligible ISR work next to the CSI processing that follows, so
+     * running it on every callback does not reintroduce the wDev_ProcessFiq
+     * SPI-flash-cache pressure the gate exists to bound. */
+    if (s_filter_mac_set) {
+        if (memcmp(info->mac, s_filter_mac, 6) != 0) {
+            return;  /* Source MAC doesn't match filter — skip frame. */
+        }
+    }
+
     /* Early rate gate: drop excess callbacks to ~50 Hz to prevent
      * SPI flash cache crash in WiFi ISR (wDev_ProcessFiq). */
     int64_t now_us = esp_timer_get_time();
@@ -258,15 +294,6 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
         return;
     }
     s_last_process_us = now_us;
-
-    /* ADR-060: MAC address filtering — drop frames from non-matching sources.
-     * Uses defensively-copied s_filter_mac instead of g_nvs_config (which can
-     * be corrupted by wifi_init_sta — same root cause as the node_id clobber). */
-    if (s_filter_mac_set) {
-        if (memcmp(info->mac, s_filter_mac, 6) != 0) {
-            return;  /* Source MAC doesn't match filter — skip frame. */
-        }
-    }
 
     s_cb_count++;
 

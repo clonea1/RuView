@@ -23,6 +23,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "esp_err.h"
+/* Required for CONFIG_SOC_WIFI_HE_SUPPORT, which EDGE_MAX_SUBCARRIERS below
+ * switches on. Without it the macro is undefined, and C evaluates an undefined
+ * identifier in #if as 0 — silently selecting the pre-HE size on an HE part
+ * with no warning. */
+#include "sdkconfig.h"
 
 /* ---- Magic numbers ---- */
 #define EDGE_VITALS_MAGIC     0xC5110002  /**< Vitals packet magic. */
@@ -33,7 +38,30 @@
 #define EDGE_MAX_IQ_BYTES     1024  /**< Max I/Q payload per slot. */
 #define EDGE_PHASE_HISTORY_LEN 256  /**< Phase history buffer depth. */
 #define EDGE_TOP_K            8     /**< Top-K subcarriers to track. */
-#define EDGE_MAX_SUBCARRIERS  128   /**< Max subcarriers per frame. */
+/**
+ * Max subcarriers per frame the edge pipeline will process.
+ *
+ * Target-conditional since 2026-08-28. The original 128 was an ESP32-S3
+ * assumption: pre-HE chips report at most 128 CSI bins. ADR-110 onboarded the
+ * ESP32-C6 to the *capture* path but not to this one, and a C6 associated to an
+ * HE-capable AP delivers HE20 frames with 256 bins (iq_len = 512 bytes).
+ *
+ * `process_frame()` guards with `n_subcarriers > EDGE_MAX_SUBCARRIERS -> return`,
+ * so on C6 every frame was rejected and the whole edge pipeline — vitals,
+ * presence, fall detection, per-slot counting — silently did nothing. The Edge
+ * DSP task started, logged its banner, and never processed a frame. Confirmed
+ * on hardware: no edge_proc log past init and no vitals packet ever reaching
+ * the sink.
+ *
+ * HE-capable parts get 256; pre-HE parts keep 128 so they don't pay ~3.5 KB of
+ * .bss they can never use. CONFIG_SOC_WIFI_HE_SUPPORT is the same switch
+ * csi_collector.c uses to pick its rx_ctrl layout.
+ */
+#if CONFIG_SOC_WIFI_HE_SUPPORT
+#define EDGE_MAX_SUBCARRIERS  256   /**< HE20 carries 256 CSI bins (C6/C5). */
+#else
+#define EDGE_MAX_SUBCARRIERS  128   /**< Pre-HE parts (S3 etc). */
+#endif
 
 /* ---- Multi-person ---- */
 #define EDGE_MAX_PERSONS      4     /**< Max simultaneous persons. */
@@ -153,6 +181,40 @@ typedef struct __attribute__((packed)) {
 } edge_vitals_pkt_t;
 
 _Static_assert(sizeof(edge_vitals_pkt_t) == 32, "vitals packet must be 32 bytes");
+
+/* ---- Per-slot vitals packet (wire format) ----
+ *
+ * update_multi_person_vitals() already computes an independent breathing and
+ * heart rate for every detected slot — its own phase history, filters and
+ * autocorrelation. The 32-byte edge_vitals_pkt_t above then transmits only the
+ * aggregate plus a bare n_persons count, so all per-slot detail is computed
+ * and thrown away.
+ *
+ * That discarded detail is the only thing that can distinguish WHAT is being
+ * counted. The slot count is a subcarrier-energy-cluster heuristic with no
+ * size or species awareness, so a room containing pets reports them as
+ * "persons". Per-slot breathing rates are species-plausible evidence: a
+ * resting human sits near 12-20 BPM, a rabbit near 30-60, a chinchilla higher
+ * still. Sending them lets the sink label honestly instead of overclaiming.
+ *
+ * Sent IN ADDITION to edge_vitals_pkt_t, never instead of it, so an older sink
+ * keeps working unchanged and simply ignores this magic. */
+#define EDGE_VITALS_SLOTS_MAGIC 0xC5110009
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;          /**< EDGE_VITALS_SLOTS_MAGIC = 0xC5110009. */
+    uint8_t  node_id;        /**< ESP32 node identifier. */
+    uint8_t  n_active;       /**< Slots currently marked active. */
+    uint8_t  max_slots;      /**< EDGE_MAX_PERSONS, so the sink can validate. */
+    uint8_t  active_mask;    /**< Bit p set when slot p is active. */
+    uint32_t timestamp_ms;   /**< Milliseconds since boot. */
+    uint16_t breathing_bpm[EDGE_MAX_PERSONS];  /**< BPM * 100 per slot. */
+    uint16_t heartrate_bpm[EDGE_MAX_PERSONS];  /**< BPM * 100 per slot. */
+    uint8_t  subcarrier_idx[EDGE_MAX_PERSONS]; /**< Subcarrier group per slot. */
+} edge_vitals_slots_pkt_t;
+
+_Static_assert(sizeof(edge_vitals_slots_pkt_t) == 32,
+               "per-slot vitals packet must be 32 bytes");
 
 /* ---- ADR-069: CSI Feature Vector packet (48 bytes, wire format) ---- */
 #define EDGE_FEATURE_MAGIC  0xC5110003  /**< Feature vector packet magic. */

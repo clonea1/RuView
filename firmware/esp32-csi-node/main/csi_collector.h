@@ -12,13 +12,32 @@
 #include "esp_wifi_types.h"
 
 /** ADR-018 magic number. */
+/* Wire v1: 20-byte header, no transmitter identity. Retained so a mixed fleet
+ * and older sinks keep parsing. */
 #define CSI_MAGIC 0xC5110001
 
-/** ADR-018 header size in bytes. */
+/* Wire v2: v1 header plus the 6-byte transmitter MAC (addr2) at bytes 20..25.
+ *
+ * Why: a node in promiscuous MGMT+DATA mode with no filter_mac produces CSI
+ * for every transmitter on the channel — measured 2026-08-28 at ~75% non-AP in
+ * a normal home. Each of those frames is a valid measurement of a *different*
+ * link, but without the transmitter on the wire the sink cannot separate them,
+ * so they interleave into one history with mixed geometry. Carrying addr2 lets
+ * the sink split one stream into per-link streams, which is also what any
+ * node-to-node ranging needs.
+ *
+ * 0xC5110002..0xC5110007 are already claimed by the vitals, feature and other
+ * edge packets, so v2 takes the next free value rather than an adjacent one. */
+#define CSI_MAGIC_V2 0xC5110008
+
+/** ADR-018 header size in bytes (wire v1). */
 #define CSI_HEADER_SIZE 20
 
-/** Maximum frame buffer size (header + 4 antennas * 256 subcarriers * 2 bytes). */
-#define CSI_MAX_FRAME_SIZE (CSI_HEADER_SIZE + 4 * 256 * 2)
+/** Wire v2 header size: v1 plus the 6-byte transmitter MAC. */
+#define CSI_HEADER_SIZE_V2 26
+
+/** Maximum frame buffer size (largest header + 4 antennas * 256 subcarriers * 2 bytes). */
+#define CSI_MAX_FRAME_SIZE (CSI_HEADER_SIZE_V2 + 4 * 256 * 2)
 
 /** Maximum number of channels in the hop table (ADR-029). */
 #define CSI_HOP_CHANNELS_MAX 6

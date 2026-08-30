@@ -51,6 +51,19 @@ static uint32_t s_ring_drops;  /* Frames dropped due to full ring buffer. */
 static float s_scratch_br[EDGE_PHASE_HISTORY_LEN];
 static float s_scratch_hr[EDGE_PHASE_HISTORY_LEN];
 
+/* Subcarrier-sized scratch, static for the same reason as the two above.
+ * EDGE_MAX_SUBCARRIERS doubled to 256 on HE-capable parts (see its comment),
+ * which would have added ~1.5 KB to a task stack that was already running at
+ * ~6.5-7.5 KB of 8 KB before the scratch buffers were hoisted. Making these
+ * static instead lowers peak stack below where it was at 128 subcarriers.
+ *
+ * Safe as statics: every one of these is touched only from the single Edge DSP
+ * task (process_frame and its callee update_top_k), never concurrently. */
+static float s_sc_phases[EDGE_MAX_SUBCARRIERS];
+static float s_sc_amplitudes[EDGE_MAX_SUBCARRIERS];
+static float s_sc_variances[EDGE_MAX_SUBCARRIERS];
+static bool  s_sc_topk_used[EDGE_MAX_SUBCARRIERS];
+
 static inline bool ring_push(const uint8_t *iq, uint16_t len,
                              int8_t rssi, uint8_t channel)
 {
@@ -428,8 +441,8 @@ static void update_top_k(uint16_t n_subcarriers)
     if (k > n_subcarriers) k = (uint8_t)n_subcarriers;
 
     /* Simple selection: find K largest variances. */
-    bool used[EDGE_MAX_SUBCARRIERS];
-    memset(used, 0, sizeof(used));
+    bool *used = s_sc_topk_used;
+    memset(used, 0, sizeof(s_sc_topk_used));
 
     for (uint8_t ki = 0; ki < k; ki++) {
         double best_var = -1.0;
@@ -908,6 +921,37 @@ static void send_vitals_packet(void)
     s_latest_pkt = pkt;
     s_pkt_valid = true;
 
+    /* Per-slot vitals, sent alongside (never instead of) the aggregate packet
+     * above. update_multi_person_vitals() already computed these; before this
+     * they were discarded at the wire, leaving the sink unable to tell what the
+     * slot count was actually counting. See EDGE_VITALS_SLOTS_MAGIC's comment. */
+    {
+        edge_vitals_slots_pkt_t spkt;
+        memset(&spkt, 0, sizeof(spkt));
+        spkt.magic = EDGE_VITALS_SLOTS_MAGIC;
+        spkt.node_id = pkt.node_id;
+        spkt.n_active = n_active;
+        spkt.max_slots = EDGE_MAX_PERSONS;
+        spkt.timestamp_ms = pkt.timestamp_ms;
+        for (uint8_t p = 0; p < EDGE_MAX_PERSONS; p++) {
+            if (s_persons[p].active) {
+                spkt.active_mask |= (uint8_t)(1u << p);
+            }
+            /* Fixed-point BPM*100 in a uint16 tops out at 655 BPM, far above
+             * any plausible rate; clamp rather than wrap on a bad estimate. */
+            float br = s_persons[p].breathing_bpm;
+            float hr = s_persons[p].heartrate_bpm;
+            if (br < 0.0f) br = 0.0f;
+            if (br > 650.0f) br = 650.0f;
+            if (hr < 0.0f) hr = 0.0f;
+            if (hr > 650.0f) hr = 650.0f;
+            spkt.breathing_bpm[p] = (uint16_t)(br * 100.0f);
+            spkt.heartrate_bpm[p] = (uint16_t)(hr * 100.0f);
+            spkt.subcarrier_idx[p] = s_persons[p].subcarrier_idx;
+        }
+        stream_sender_send((const uint8_t *)&spkt, sizeof(spkt));
+    }
+
     /* ADR-063: If mmWave is active, send fused 48-byte packet instead. */
     mmwave_state_t mw;
     if (mmwave_sensor_get_state(&mw) && mw.detected) {
@@ -1070,7 +1114,7 @@ static void process_frame(const edge_ring_slot_t *slot)
     const float sample_rate = s_sample_rate_hz;
 
     /* --- Step 1-2: Phase extraction + unwrapping per subcarrier --- */
-    float phases[EDGE_MAX_SUBCARRIERS];
+    float *phases = s_sc_phases;
     for (uint16_t sc = 0; sc < n_subcarriers; sc++) {
         float raw_phase = extract_phase(slot->iq_data, sc);
 
@@ -1235,7 +1279,7 @@ static void process_frame(const edge_ring_slot_t *slot)
     /* --- Step 14 (ADR-040): Dispatch to WASM modules --- */
     if (s_cfg.tier >= 2 && s_pkt_valid) {
         /* Extract amplitudes from I/Q for WASM host API. */
-        float amplitudes[EDGE_MAX_SUBCARRIERS];
+        float *amplitudes = s_sc_amplitudes;
         for (uint16_t sc = 0; sc < n_subcarriers; sc++) {
             int8_t i_val = (int8_t)slot->iq_data[sc * 2];
             int8_t q_val = (int8_t)slot->iq_data[sc * 2 + 1];
@@ -1243,7 +1287,7 @@ static void process_frame(const edge_ring_slot_t *slot)
         }
 
         /* Build variance array from Welford state. */
-        float variances[EDGE_MAX_SUBCARRIERS];
+        float *variances = s_sc_variances;
         for (uint16_t sc = 0; sc < n_subcarriers; sc++) {
             variances[sc] = (float)welford_variance(&s_subcarrier_var[sc]);
         }
