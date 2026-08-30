@@ -31,11 +31,9 @@ export class RoomBuilderTab {
     this._draggingAp = false;
     this._loaded = false;
     // Live tracked-position overlay, fed by sensingService (/ws/sensing).
-    // `_liveDot` is only ever set from a "doppler_centroid" or
-    // "motion_centroid" position_source (real room-space meters, same
-    // convention as this.config.nodes — both are genuine, if heuristic,
-    // signals: nodes seeing more measured disturbance pull the estimate
-    // toward themselves) — a "field_peak" fix lives in the Observatory's own
+    // `_liveDot` is only ever set from a "bistatic_velocity", "doppler_centroid",
+    // or "motion_centroid" position_source (real room-space meters, same
+    // convention as this.config.nodes) — a "field_peak" fix lives in the Observatory's own
     // grid-centered coordinate frame (unrelated to this room's actual
     // width_m/depth_m), so plotting it here would be a fabricated-looking
     // position. `_liveStatus` explains why no dot is showing when that's the
@@ -97,6 +95,8 @@ export class RoomBuilderTab {
     const p = persons[0];
     const nodeCount = Array.isArray(data.nodes) ? data.nodes.length : 0;
     const ROOM_SPACE_SOURCES = {
+      bistatic_velocity: 'Live bistatic-geometry estimate — real AP/node Doppler-ellipse math, '
+        + 'still an unvalidated first cut (see position_uncertainty_m).',
       doppler_centroid: 'Live Doppler-weighted centroid — a heuristic estimate, not a calibrated fix.',
       motion_centroid: 'Live motion-weighted centroid — a heuristic estimate, not a calibrated fix.',
     };
@@ -653,7 +653,12 @@ export class RoomBuilderTab {
     ctx.fillStyle = '#ffd166';
     ctx.font = 'bold 12px monospace';
     ctx.textAlign = 'center';
-    const label = this._liveDotSource === 'doppler_centroid' ? 'live (doppler)' : 'live (motion)';
+    const LIVE_DOT_LABELS = {
+      bistatic_velocity: 'live (bistatic)',
+      doppler_centroid: 'live (doppler)',
+      motion_centroid: 'live (motion)',
+    };
+    const label = LIVE_DOT_LABELS[this._liveDotSource] || 'live (motion)';
     ctx.fillText(label, px, py - LIVE_DOT_RADIUS - 8);
 
     // Keep animating the pulse while a fix is present.

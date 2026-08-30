@@ -8,6 +8,7 @@
 
 import { sensingService } from '../services/sensing.service.js';
 import { GaussianSplatRenderer } from './gaussian-splats.js';
+import { LinkMeshPanel } from './LinkMeshPanel.js';
 
 export class SensingTab {
   /** @param {HTMLElement} container - the #sensing section element */
@@ -18,14 +19,30 @@ export class SensingTab {
     this._unsubState = null;
     this._resizeObserver = null;
     this._threeLoaded = false;
+    this.linkMesh = null;
   }
 
   async init() {
     this._buildDOM();
+    // Before Three.js: the link table is plain DOM and useful even when the
+    // CDN load fails or is slow, so it must not sit behind that await.
+    this._initLinkMesh();
     await this._loadThree();
     this._initSplatRenderer();
     this._connectService();
     this._setupResize();
+  }
+
+  _initLinkMesh() {
+    const host = this.container.querySelector('#linkMeshContainer');
+    if (!host) return;
+    // `handleTabChange` re-runs `init()` on every visit while `splatRenderer`
+    // is null — which is the steady state whenever the Three.js CDN is
+    // unreachable. Without this, each visit would leave another 1 Hz poll
+    // timer running against a panel nothing references.
+    if (this.linkMesh) this.linkMesh.dispose();
+    this.linkMesh = new LinkMeshPanel(host);
+    this.linkMesh.init();
   }
 
   // ---- DOM construction --------------------------------------------------
@@ -120,6 +137,12 @@ export class SensingTab {
           <div class="sensing-card" id="sensingNodeCards">
             <div class="sensing-card-title">NODE STATUS</div>
             <div id="nodeStatusContainer"></div>
+          </div>
+
+          <!-- ADR-345: per-link perturbation, including node<->node paths. -->
+          <div class="sensing-card">
+            <div class="sensing-card-title">LINK MESH</div>
+            <div id="linkMeshContainer"></div>
           </div>
 
           <!-- Extra info -->
@@ -228,7 +251,8 @@ export class SensingTab {
         'live':              { text: 'LIVE \u2014 ESP32 HARDWARE',           cls: 'sensing-source-live' },
         'server-simulated':  { text: 'SIMULATED \u2014 NO HARDWARE',        cls: 'sensing-source-server-sim' },
         'reconnecting':      { text: 'RECONNECTING...',                    cls: 'sensing-source-reconnecting' },
-        'simulated':         { text: 'OFFLINE \u2014 CLIENT SIMULATION',    cls: 'sensing-source-simulated' },
+        'unreachable':       { text: 'NO DATA \u2014 SERVER UNREACHABLE',   cls: 'sensing-source-simulated' },
+        'simulated':         { text: 'INVENTED DATA \u2014 NOT MEASURED',   cls: 'sensing-source-simulated' },
       };
       const cfg = bannerConfig[dataSource] || bannerConfig.reconnecting;
       banner.textContent = cfg.text;
@@ -397,6 +421,7 @@ export class SensingTab {
     if (this._unsubState) this._unsubState();
     if (this._resizeObserver) this._resizeObserver.disconnect();
     if (this.splatRenderer) this.splatRenderer.dispose();
+    if (this.linkMesh) this.linkMesh.dispose();
     sensingService.stop();
   }
 }
