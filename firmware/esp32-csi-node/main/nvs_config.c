@@ -48,6 +48,7 @@ void nvs_config_load(nvs_config_t *cfg)
     cfg->dwell_ms       = 50;
     cfg->tdm_slot_index = 0;
     cfg->tdm_node_count = 1;
+    cfg->beacon_period_ms = 0;   /* 0 = derive from fleet size */
 
     /* ADR-039: Edge intelligence defaults from Kconfig. */
 #ifdef CONFIG_EDGE_TIER
@@ -189,6 +190,20 @@ void nvs_config_load(nvs_config_t *cfg)
             ESP_LOGI(TAG, "NVS override: tdm_node_count=%u", (unsigned)cfg->tdm_node_count);
         } else {
             ESP_LOGW(TAG, "NVS tdm_nodes=%u invalid, ignored", (unsigned)tdm_nodes_val);
+        }
+    }
+
+    /* ADR-345: explicit ESP-NOW beacon period override (0/absent = derive). */
+    uint16_t beacon_ms_val;
+    if (nvs_get_u16(handle, "beacon_ms", &beacon_ms_val) == ESP_OK) {
+        if (beacon_ms_val == 0 || (beacon_ms_val >= 20 && beacon_ms_val <= 2000)) {
+            cfg->beacon_period_ms = beacon_ms_val;
+            ESP_LOGI(TAG, "NVS override: beacon_period_ms=%u%s",
+                     (unsigned)cfg->beacon_period_ms,
+                     cfg->beacon_period_ms == 0 ? " (derive from fleet size)" : "");
+        } else {
+            ESP_LOGW(TAG, "NVS beacon_ms=%u out of range [20,2000], ignored",
+                     (unsigned)beacon_ms_val);
         }
     }
 

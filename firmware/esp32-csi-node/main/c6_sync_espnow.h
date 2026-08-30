@@ -58,6 +58,13 @@ int64_t c6_sync_espnow_get_offset_us(void);
 int64_t c6_sync_espnow_get_offset_us_smoothed(void);
 
 /* Counters for the witness harness — exposed for tests/diagnostics. */
+/* Effective ESP-NOW beacon period in ms for this node.
+ *
+ * Derived from the provisioned fleet size (`tdm_node_count`) unless NVS
+ * `beacon_ms` sets an explicit override. Exposed so a diagnostic can report
+ * the cadence a node actually chose rather than the compile-time default. */
+uint32_t c6_sync_espnow_period_ms(void);
+
 uint32_t c6_sync_espnow_tx_count(void);
 uint32_t c6_sync_espnow_tx_fail(void);
 uint32_t c6_sync_espnow_rx_count(void);

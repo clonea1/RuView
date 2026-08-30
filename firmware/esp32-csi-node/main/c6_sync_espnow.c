@@ -16,6 +16,7 @@
 
 #include "sdkconfig.h"
 #include "c6_sync_espnow.h"
+#include "nvs_config.h"
 #include "esp_log.h"
 #include "esp_now.h"
 #include "esp_wifi.h"
@@ -25,6 +26,11 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
 #include <string.h>
+
+/* Same pattern as csi_collector.c / edge_processing.c — the provisioned
+ * config is a single global that each translation unit declares for itself. */
+extern nvs_config_t g_nvs_config;
+
 
 static const char *TAG = "c6_espnow";
 
@@ -60,14 +66,71 @@ static const char *TAG = "c6_espnow";
  * 64-frame window spans ~5 s and a 35 s dwell yields ~7 independent samples.
  *
  * This does NOT generalise: 13 nodes hear 12 peers, and the same inequality
- * demands ~340 ms. The constant must become an NVS setting scaled to fleet
- * size before the fleet grows — a compile-time value cannot be right for both.
+ * demands ~340 ms. So the period is no longer a compile-time constant — it is
+ * derived from the provisioned fleet size at init, and `BEACON_PERIOD_MS` is
+ * only the fallback for an unprovisioned node. See c6_sync_espnow_period_ms().
  *
  * Doppler is not a consideration. An earlier justification for 20 ms was
  * Nyquist for 1-20 Hz motion, but the phase measurement that needed it was
  * shown to be unusable on this silicon and the amplitude pipeline that
  * replaced it needs frames per window, not bandwidth. */
 #define BEACON_PERIOD_MS  80
+
+/* Sizing constants for the derivation below.
+ *
+ * BEACON_AP_BUDGET_FPS is what the associated AP contributes to the same
+ * 50 Hz receive gate — measured 10-15 fps on this fleet, taken at the
+ * pessimistic end so the derived period errs slow.
+ *
+ * BEACON_MARGIN_NUM/DEN is the headroom over the bare inequality. At three
+ * nodes the inequality demands >= 57 ms and the value proven on hardware is
+ * 80 ms, which is where 7/5 comes from — the derivation returns 81 ms at N=3,
+ * so it reproduces the measured setting rather than being fitted after it.
+ *
+ * Across fleet sizes this holds the offered load at ~40 fps against the 50 fps
+ * gate — 3 nodes 81 ms, 6 nodes 200 ms, 9 nodes 320 ms, 13 nodes 480 ms — so
+ * every size keeps the same 10 fps of headroom rather than one being tuned
+ * and the rest inheriting whatever falls out. */
+#define BEACON_AP_BUDGET_FPS   15
+#define BEACON_GATE_FPS        50
+#define BEACON_MARGIN_NUM       7
+#define BEACON_MARGIN_DEN       5
+#define BEACON_PERIOD_MIN_MS   20
+#define BEACON_PERIOD_MAX_MS 2000
+
+static uint32_t s_beacon_period_ms = BEACON_PERIOD_MS;
+
+/* Effective beacon period for this node.
+ *
+ * An explicit NVS `beacon_ms` wins, for benching. Otherwise derive from the
+ * provisioned fleet size, because that is the quantity the period actually
+ * depends on and it is already provisioned for TDM:
+ *
+ *     period >= (N - 1) * 1000 / (GATE - AP_BUDGET)   then * margin
+ *
+ * N=3 -> 80 ms (the measured value), N=9 -> 320 ms, N=13 -> 480 ms.
+ *
+ * A fleet-size change is therefore a re-provision, never a reflash — which
+ * is the whole point, since getting this wrong does not degrade gracefully:
+ * an over-fast beacon overruns the receive gate, 60-90% of peer frames are
+ * discarded at random, and the transmit queue can wedge outright. */
+uint32_t c6_sync_espnow_period_ms(void)
+{
+    if (g_nvs_config.beacon_period_ms != 0) {
+        return g_nvs_config.beacon_period_ms;
+    }
+    uint32_t n = g_nvs_config.tdm_node_count;
+    if (n < 2) {
+        /* Unprovisioned or a single node: nobody to collide with. */
+        return BEACON_PERIOD_MS;
+    }
+    uint32_t budget = BEACON_GATE_FPS - BEACON_AP_BUDGET_FPS;      /* 35 fps */
+    uint32_t base   = ((n - 1) * 1000U + budget - 1) / budget;     /* ceil */
+    uint32_t period = (base * BEACON_MARGIN_NUM) / BEACON_MARGIN_DEN;
+    if (period < BEACON_PERIOD_MIN_MS) period = BEACON_PERIOD_MIN_MS;
+    if (period > BEACON_PERIOD_MAX_MS) period = BEACON_PERIOD_MAX_MS;
+    return period;
+}
 
 /* Beacons allowed outstanding before send_beacon skips a tick.
  *
@@ -339,8 +402,13 @@ esp_err_t c6_sync_espnow_init(void)
     s_last_seen_us = (uint64_t)esp_timer_get_time();
     s_last_send_cb_us = esp_timer_get_time();
 
+    /* Resolve the cadence before the timer exists — it cannot be changed
+     * afterwards without re-creating the timer, and getting it wrong is the
+     * failure mode this whole derivation exists to prevent. */
+    s_beacon_period_ms = c6_sync_espnow_period_ms();
+
     s_beacon_timer = xTimerCreate("c6_espnow_beacon",
-                                  pdMS_TO_TICKS(BEACON_PERIOD_MS),
+                                  pdMS_TO_TICKS(s_beacon_period_ms),
                                   pdTRUE, NULL, beacon_timer_cb);
     if (s_beacon_timer == NULL) {
         ESP_LOGE(TAG, "xTimerCreate failed");
@@ -348,8 +416,11 @@ esp_err_t c6_sync_espnow_init(void)
     }
     xTimerStart(s_beacon_timer, 0);
 
-    ESP_LOGI(TAG, "init done: local_id=%012llx leader=yes(candidate) period=%ums",
-             (unsigned long long)s_local_id, (unsigned)BEACON_PERIOD_MS);
+    ESP_LOGI(TAG, "init done: local_id=%012llx leader=yes(candidate) "
+             "period=%ums (fleet=%u, %s)",
+             (unsigned long long)s_local_id, (unsigned)s_beacon_period_ms,
+             (unsigned)g_nvs_config.tdm_node_count,
+             g_nvs_config.beacon_period_ms != 0 ? "nvs override" : "derived");
     return ESP_OK;
 }
 
