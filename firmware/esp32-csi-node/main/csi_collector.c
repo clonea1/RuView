@@ -286,6 +286,35 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
         }
     }
 
+    /* ADR-345 phase 2 probe: is rx_seq live, and do nodes share frames?
+     *
+     * `wifi_csi_info_t.rx_seq` is the 802.11 sequence number of the overheard
+     * packet, so two nodes that hear the SAME transmission see the SAME value.
+     * That would make (mac, rx_seq) a coordination-free identifier for "the
+     * same moment in the channel" — fusing on it needs no clocks, no guard
+     * interval, and no sync at all, because the frames are literally the same
+     * transmission arriving nanoseconds apart.
+     *
+     * Two things have to hold, and neither is safe to assume:
+     *
+     *   1. rx_seq is actually populated. It is declared and documented, but
+     *      IDF has fields that exist and are never filled.
+     *   2. Nodes accept overlapping frames. The rate gate below is a *time*
+     *      limiter with independent phase per node, so node A may accept at
+     *      t=0,20,40 ms while node B accepts at 7,27,47 — potentially disjoint
+     *      sets, which would leave nothing to pair.
+     *
+     * Logged BEFORE the gate ('h' = heard) and again after ('a' = accepted),
+     * so one capture answers both: whether rx_seq increments sensibly, and
+     * what fraction of heard frames survive to be pairable.
+     *
+     * Off by default. Enabling it costs a log line per callback at up to
+     * 50 Hz, which is fine for a bench capture and not for a soak. */
+#ifdef CONFIG_CSI_SEQ_DIAG
+    ESP_LOGI("seqdiag", "h %02x%02x%02x %u",
+             info->mac[3], info->mac[4], info->mac[5], (unsigned)info->rx_seq);
+#endif
+
     /* Early rate gate: drop excess callbacks to ~50 Hz to prevent
      * SPI flash cache crash in WiFi ISR (wDev_ProcessFiq). */
     int64_t now_us = esp_timer_get_time();
@@ -294,6 +323,11 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
         return;
     }
     s_last_process_us = now_us;
+
+#ifdef CONFIG_CSI_SEQ_DIAG
+    ESP_LOGI("seqdiag", "a %02x%02x%02x %u",
+             info->mac[3], info->mac[4], info->mac[5], (unsigned)info->rx_seq);
+#endif
 
     s_cb_count++;
 

@@ -494,3 +494,19 @@ menu "Onboard LED (ADR-183)"
             colormap, in milli-units (250 = 0.25). Lower = more sensitive
             (reaches yellow with less motion).
 endmenu
+
+config CSI_SEQ_DIAG
+    bool "Log (source MAC, rx_seq) for every CSI callback (ADR-345 phase 2 probe)"
+    default n
+    help
+      Emits one line per CSI callback, before and after the rate gate, tagged
+      'h' (heard) and 'a' (accepted), carrying the last three bytes of the
+      source MAC and the 802.11 rx_seq of the overheard packet.
+
+      Answers two questions that decide whether cross-node fusion can key on
+      rx_seq instead of timestamps: whether rx_seq is populated at all, and
+      what fraction of heard frames survive the rate gate to be pairable
+      against another node's capture of the same transmission.
+
+      Bench use only. At up to 50 Hz this is a lot of logging; leave it off
+      for any soak or production flash.
