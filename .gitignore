@@ -339,3 +339,6 @@ firmware/esp32-csi-node/board_index.json
 
 # Generated enclosure meshes — regenerate with case/make_case.py
 firmware/esp32-csi-node/case/*.stl
+
+# Provisioning config: points at a credential file outside the repo.
+firmware/esp32-csi-node/provision_conf.json
