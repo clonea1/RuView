@@ -1,6 +1,21 @@
 {
+  "permissions": {
+    "allow": [
+      "Bash(git show HEAD:v2/crates/wifi-densepose-sensing-server/src/main.rs | file - *)",
+      "Read(//tmp/**)",
+      "Bash(rm v2/crates/wifi-densepose-sensing-server/src/orgmain.rs)",
+      "Bash(cargo check *)",
+      "Bash(cargo test *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git fetch *)"
+    ],
+    "additionalDirectories": [
+      "C:\\temp\\ruview\\RuView\\v2\\crates\\wifi-densepose-sensing-server\\src"
+    ]
+  },
+  "enableAllProjectMcpServers": true,
   "enabledMcpjsonServers": [
     "claude-flow"
-  ],
-  "enableAllProjectMcpServers": true
+  ]
 }
