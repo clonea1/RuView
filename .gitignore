@@ -336,3 +336,6 @@ v2/crates/ruview-offaxis/pkg/
 # Board identity index — MACs of physical hardware, not secret, but not useful
 # to anyone else and it churns per fleet. Keep it local.
 firmware/esp32-csi-node/board_index.json
+
+# Generated enclosure meshes — regenerate with case/make_case.py
+firmware/esp32-csi-node/case/*.stl
