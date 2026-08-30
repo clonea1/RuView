@@ -98,7 +98,26 @@ def build(a):
     sy1 = W + iy + g
 
     t = []
-    t += box(0, 0, 0, outer_x, outer_y, W)                       # floor
+    # Floor, slotted under the module end.
+    #
+    # The radio transmits continuously, and the module -- not the regulator --
+    # is the hot part. Slots in the floor beneath it and matching ones in the
+    # lid above give convection somewhere to go: cool air in low, warm air out
+    # high. Side-wall gaps alone only ventilate the empty half of the case.
+    #
+    # Slots run across the short axis so they print without bridging, and they
+    # stop short of the walls so the floor stays one rigid piece.
+    vz0 = max(W, outer_x - W - a.vent_zone)
+    t += box(0, 0, 0, vz0, outer_y, W)                           # solid floor
+    nslot = max(1, a.floor_slots)
+    pitch = (outer_x - W - vz0) / nslot
+    for i in range(nslot):
+        x0 = vz0 + i*pitch
+        t += box(x0, 0, 0, x0 + pitch*0.45, outer_y, W)          # rib
+        t += box(x0 + pitch*0.45, 0, 0, x0 + pitch, W + 1.5, W)  # near edge
+        t += box(x0 + pitch*0.45, outer_y - W - 1.5, 0,
+                 x0 + pitch, outer_y, W)                          # far edge
+    t += box(outer_x - W, 0, 0, outer_x, outer_y, W)             # end rail
 
     # Long walls, segmented for ventilation. The radio runs continuously.
     seg = outer_x / (2*a.vents + 1)
@@ -146,9 +165,21 @@ def build_lid(a):
     outer_x = enc + 2*W
     outer_y = iy + 2*W
     t = []
-    t += box(0, 0, 0, outer_x, outer_y, W)
+    # Vented over the module end, mirroring the floor, so the two form a
+    # convection path rather than two unrelated sets of holes.
+    vz0 = max(W, outer_x - W - a.vent_zone)
+    t += box(0, 0, 0, vz0, outer_y, W)
+    nslot = max(1, a.floor_slots)
+    pitch = (outer_x - W - vz0) / nslot
+    for i in range(nslot):
+        x0 = vz0 + i*pitch
+        t += box(x0, 0, 0, x0 + pitch*0.45, outer_y, W)
+        t += box(x0 + pitch*0.45, 0, 0, x0 + pitch, W + 1.5, W)
+        t += box(x0 + pitch*0.45, outer_y - W - 1.5, 0,
+                 x0 + pitch, outer_y, W)
+    t += box(outer_x - W, 0, 0, outer_x, outer_y, W)
     # Inner lip so it locates without fasteners.
-    t += box(W + 0.3, W + 0.3, W, outer_x - W - 0.3, outer_y - W - 0.3, W + 2)
+    t += box(W + 0.3, W + 0.3, W, vz0 - 0.3, outer_y - W - 0.3, W + 2)
     return t, (outer_x, outer_y, W + 2)
 
 
@@ -170,7 +201,13 @@ def main():
     p.add_argument("--usb-w", type=float, default=10.0)
     p.add_argument("--usb-h", type=float, default=4.0)
     p.add_argument("--pad", type=float, default=3.0)
-    p.add_argument("--vents", type=int, default=2)
+    p.add_argument("--vents", type=int, default=2,
+                   help="ventilation gaps in each long wall")
+    p.add_argument("--vent-zone", type=float, default=16.0,
+                   help="mm at the antenna end vented through floor and lid, "
+                        "over the radio module")
+    p.add_argument("--floor-slots", type=int, default=4,
+                   help="slots across the vent zone, floor and lid")
     p.add_argument("--tab-l", type=float, default=8.0)
     p.add_argument("--tab-w", type=float, default=8.0)
     p.add_argument("--out", default="node-case.stl")
