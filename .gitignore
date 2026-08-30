@@ -33,6 +33,27 @@ firmware/esp32-csi-node/test/*.obj
 data/recordings/
 v2/data/recordings/
 rust-port/wifi-densepose-rs/data/recordings/
+v2/data/diagnostics/
+# Recordings are large and derived from CSI; the analysis scripts beside them
+# are source and must stay tracked.
+v2/data/walktest/*
+!v2/data/walktest/*.py
+!v2/data/walktest/*.sh
+!v2/data/walktest/*.md
+
+# Phase-diagnostic sink. Bulky, and phase_markers_*.csv records exactly when
+# identified people were in which room — person data, never committed.
+v2/data/mesh/
+v2/data/filtertest/
+v2/data/nodelink/
+v2/data/tier2/
+v2/data/v2test/
+
+# Catch-all so a future diagnostic run cannot slip person data into a commit,
+# whichever directory --phase-diagnostics is pointed at.
+phase_markers_*.csv
+phase_raw_*.csv
+phase_stats_*.csv
 **/*.csi.jsonl
 **/*.csi.meta.json
 
