@@ -105,7 +105,16 @@
     </div>
 
     <div class="grp">
-      <h2>Links, in feet</h2>
+      <h2>Auto-calibrate</h2>
+      <button id="auto">Fit model to surveyed nodes</button>
+      <div class="hint" id="autonote">Least-squares over every link whose true
+      distance is known, solving reference power, exponent and AP gain at once.
+      Until it is run, part of the &ldquo;excess&rdquo; column is model error
+      rather than obstruction.</div>
+    </div>
+
+    <div class="grp">
+      <h2>Links &mdash; true vs RF</h2>
       <table id="tbl"></table>
     </div>
     <div class="sub" id="stamp"></div>
@@ -115,6 +124,34 @@
 <script>
 // ---- state ---------------------------------------------------------------
 var links = [], ids = [], pos = {}, az = 0.6, el = 0.4, zoom = 1, drag = null;
+var truth = null;      // /api/v1/config/room, when a node's position is known
+var M2F = 3.28084;
+
+// Known positions win over inference.
+//
+// MDS exists to place nodes when we do not know where they are. For nodes we
+// DO know, inferring a position from RSSI and then comparing it to the answer
+// we already had is worse than useless -- it hides the measurement behind a
+// reconstruction. So a node with a surveyed position is drawn there, and the
+// RF estimate is spent on the thing we actually want: how much longer the
+// signal path is than the straight line.
+//
+// Unknown nodes still get MDS, anchored against the known ones -- which is
+// what a newly plugged-in board looks like before it has been surveyed.
+function truthPos(id){
+  if (!truth) return null;
+  if (id === 'AP') {
+    var a = truth.ap_position;
+    return a ? {x:a[0]*M2F, y:a[1]*M2F, z:a[2]*M2F} : null;
+  }
+  var n = (truth.nodes || []).filter(function(x){ return String(x.id) === String(id); })[0];
+  return n ? {x:n.x*M2F, y:n.y*M2F, z:n.z*M2F} : null;
+}
+function trueFeet(a, b){
+  var A = truthPos(a), B = truthPos(b);
+  if (!A || !B) return null;
+  return Math.sqrt(Math.pow(A.x-B.x,2) + Math.pow(A.y-B.y,2) + Math.pow(A.z-B.z,2));
+}
 var P0 = -40, PLE = 3.0;   // dBm at 1 ft for a NODE transmitter
 var AP_GAIN = 8;           // dB the AP transmits harder than a node
 
@@ -195,14 +232,23 @@ function draw(){
   // Edges first, far ones dimmer.
   pairs.forEach(function(pr){
     var A = project(pos[pr.a], w, h), B = project(pos[pr.b], w, h);
-    var far = pr.d > 40, mid = pr.d > 20;
-    ctx.strokeStyle = far ? 'rgba(248,81,73,.55)'
-                     : mid ? 'rgba(210,153,34,.55)' : 'rgba(46,160,67,.65)';
-    ctx.lineWidth = far ? 1 : 1.8;
+    var bad;
+    if (pr.ratio !== null) {
+      // Excess over the straight line is the diagnostic: 1.0x is clear air,
+      // anything well above it is something in the way.
+      bad = pr.ratio > 1.8 ? 2 : (pr.ratio > 1.25 ? 1 : 0);
+    } else {
+      bad = pr.d > 40 ? 2 : (pr.d > 20 ? 1 : 0);
+    }
+    ctx.strokeStyle = bad === 2 ? 'rgba(248,81,73,.6)'
+                    : bad === 1 ? 'rgba(210,153,34,.6)' : 'rgba(46,160,67,.65)';
+    ctx.lineWidth = bad === 2 ? 2.4 : 1.6;
     ctx.beginPath(); ctx.moveTo(A.x,A.y); ctx.lineTo(B.x,B.y); ctx.stroke();
     var mx=(A.x+B.x)/2, my=(A.y+B.y)/2;
-    ctx.fillStyle = '#8b949e'; ctx.font = '10px ui-monospace';
-    ctx.fillText(pr.d.toFixed(0) + " ft", mx + 3, my - 3);
+    ctx.fillStyle = bad ? '#e6edf3' : '#8b949e'; ctx.font = '10px ui-monospace';
+    ctx.fillText(pr.truth !== null
+      ? pr.truth.toFixed(0) + ' ft → ' + pr.d.toFixed(0)
+      : pr.d.toFixed(0) + ' ft', mx + 3, my - 3);
   });
 
   ids.map(function(id){ return {id:id, p:project(pos[id], w, h)}; })
@@ -236,7 +282,9 @@ function buildPairs(){
     var e = best[k];
     var mean = e.v.reduce(function(s,x){return s+x;},0) / e.v.length;
     var isAp = (e.a === 'AP' || e.b === 'AP');
-    return {a:e.a, b:e.b, d:rssiToFeet(mean, isAp), rssi:mean, ap:isAp};
+    var rf = rssiToFeet(mean, isAp), tf = trueFeet(e.a, e.b);
+    return {a:e.a, b:e.b, d:rf, rssi:mean, ap:isAp,
+            truth:tf, excess:(tf ? rf - tf : null), ratio:(tf ? rf / tf : null)};
   });
 }
 
@@ -245,18 +293,48 @@ function recompute(){
   var set = {};
   pairs.forEach(function(p){ set[p.a]=1; set[p.b]=1; });
   ids = Object.keys(set).sort();
+  // Solve only for nodes without a surveyed position; pin the rest.
   pos = layout(pairs, ids);
+  var anchored = 0;
+  ids.forEach(function(id){
+    var t = truthPos(id);
+    if (t) { pos[id] = {x:t.x, y:t.y, z:t.z}; anchored++; }
+  });
+  if (anchored) {
+    // Re-run with anchors held fixed so unsurveyed nodes settle around them.
+    for (var it = 0; it < 400; it++){
+      var lr = 0.08 * (1 - it/400);
+      pairs.forEach(function(pr){
+        var A = pos[pr.a], B = pos[pr.b];
+        var fa = !truthPos(pr.a), fb = !truthPos(pr.b);
+        if (!fa && !fb) return;
+        var dx=B.x-A.x, dy=B.y-A.y, dz=B.z-A.z;
+        var d = Math.sqrt(dx*dx+dy*dy+dz*dz) || 1e-6;
+        var err = (d - pr.d)/d * lr * 0.5;
+        if (fa){ A.x += dx*err; A.y += dy*err; A.z += dz*err; }
+        if (fb){ B.x -= dx*err; B.y -= dy*err; B.z -= dz*err; }
+      });
+    }
+  }
 
-  var rows = '<tr><td>pair</td><td class="n">dBm</td><td class="n">ft</td></tr>';
-  pairs.sort(function(a,b){ return a.d - b.d; }).forEach(function(p){
-    rows += '<tr><td>' + p.a + ' &harr; ' + p.b + '</td><td class="n">' +
-            p.rssi.toFixed(0) + '</td><td class="n">' + p.d.toFixed(0) +
-            (p.ap ? ' <span class="sub">ap</span>' : '') + '</td></tr>';
+  var rows = '<tr><td>pair</td><td class="n">true</td><td class="n">rf</td><td class="n">excess</td></tr>';
+  pairs.sort(function(a,b){
+    return (b.ratio || 0) - (a.ratio || 0);
+  }).forEach(function(p){
+    var col = p.ratio === null ? '#8b949e'
+            : p.ratio > 1.8 ? '#f85149' : p.ratio > 1.25 ? '#d29922' : '#2ea043';
+    rows += '<tr><td>' + p.a + ' &harr; ' + p.b + '</td>' +
+            '<td class="n">' + (p.truth === null ? '&mdash;' : p.truth.toFixed(0)) + '</td>' +
+            '<td class="n">' + p.d.toFixed(0) + '</td>' +
+            '<td class="n" style="color:' + col + '">' +
+            (p.excess === null ? '&mdash;'
+              : (p.excess > 0 ? '+' : '') + p.excess.toFixed(0) + ' ft') + '</td></tr>';
   });
   document.getElementById('tbl').innerHTML = rows;
   document.getElementById('stamp').textContent =
     ids.length + ' nodes · ' + pairs.length + ' links · fit residual ' +
     (residual(pairs, pos)*100).toFixed(1) + '%' +
+    (truth ? ' · ' + ids.filter(function(i){return !!truthPos(i);}).length + ' surveyed' : '') +
     (ids.length <= 3 ? ' — degenerate below 4 nodes' : '');
   draw();
 }
@@ -301,6 +379,96 @@ document.getElementById('solve').onclick = function(){
     ' — every other distance is now scaled against that pair.';
 };
 
+// Path loss is linear in log-distance:  RSSI = P0 + G*isAP - (10n)*log10(d)
+// so the three parameters fall out of an ordinary least-squares fit over the
+// surveyed links. Worth doing before reading the excess column: an uncalibrated
+// model contributes its own error there, which is indistinguishable by eye from
+// something physically in the way.
+document.getElementById('auto').onclick = function(){
+  var note = document.getElementById('autonote');
+  var all = buildPairs().filter(function(p){ return p.truth !== null && p.truth > 0.5; });
+  if (all.length < 4) {
+    note.innerHTML = '<span class="err">need at least 4 surveyed links, have ' +
+                     all.length + '</span>';
+    return;
+  }
+
+  function fit(set){
+    var A=[[0,0,0],[0,0,0],[0,0,0]], y=[0,0,0];
+    set.forEach(function(p){
+      var r=[1, p.ap?1:0, -Math.log(p.truth)/Math.LN10];
+      for (var i=0;i<3;i++){
+        for (var j=0;j<3;j++) A[i][j]+=r[i]*r[j];
+        y[i]+=r[i]*p.rssi;
+      }
+    });
+    var M=[[A[0][0],A[0][1],A[0][2],y[0]],
+           [A[1][0],A[1][1],A[1][2],y[1]],
+           [A[2][0],A[2][1],A[2][2],y[2]]];
+    for (var c=0;c<3;c++){
+      var piv=c;
+      for (var r2=c+1;r2<3;r2++) if (Math.abs(M[r2][c])>Math.abs(M[piv][c])) piv=r2;
+      if (Math.abs(M[piv][c])<1e-12) return null;
+      var t=M[c]; M[c]=M[piv]; M[piv]=t;
+      for (var r3=0;r3<3;r3++){
+        if (r3===c) continue;
+        var f=M[r3][c]/M[c][c];
+        for (var k=c;k<4;k++) M[r3][k]-=f*M[c][k];
+      }
+    }
+    return {p0:M[0][3]/M[0][0], g:M[1][3]/M[1][1], n:(M[2][3]/M[2][2])/10};
+  }
+
+  // Robust fit: an obstructed link is an outlier in dB, and a single blocked
+  // link can invert the slope entirely — the cage-shadowed pair here is both
+  // the closest and the weakest, which a plain least-squares reads as "closer
+  // is weaker". So fit, drop the worst offender, refit, and keep going while
+  // the model is unphysical or the residual is dominated by one point.
+  //
+  // The excluded links are not a nuisance: they are the obstructed ones, and
+  // naming them is the actual output.
+  var set = all.slice(), dropped = [], f = null;
+  while (set.length >= 4) {
+    f = fit(set);
+    if (f) {
+      var resid = set.map(function(p){
+        var pred = f.p0 + (p.ap?f.g:0) - 10*f.n*Math.log(p.truth)/Math.LN10;
+        return {p:p, e:Math.abs(pred - p.rssi)};
+      });
+      var worst = resid.reduce(function(a,b){ return a.e>b.e ? a : b; });
+      var ok = (f.n>1.2 && f.n<5 && f.g>-6 && f.g<25);
+      if (ok && worst.e < 8) break;              // physical, and no wild outlier
+      if (set.length === 4) break;
+      dropped.push({pair:worst.p, dB:worst.e});
+      set = set.filter(function(p){ return p !== worst.p; });
+      continue;
+    }
+    break;
+  }
+
+  if (!f || !(f.n>1.2 && f.n<5) || !(f.g>-6 && f.g<25)) {
+    note.innerHTML = '<span class="err">no physical fit even after excluding ' +
+      dropped.length + ' link(s). Check the surveyed positions.</span>';
+    return;
+  }
+
+  P0 = Math.round(f.p0); PLE = f.n; AP_GAIN = Math.round(f.g);
+  document.getElementById('p0').value = P0;
+  document.getElementById('n').value = Math.round(f.n*10);
+  document.getElementById('apg').value = AP_GAIN;
+  syncLabels(); recompute();
+
+  var msg = 'fitted on ' + set.length + ' clear link(s): exponent ' +
+            f.n.toFixed(2) + ', AP gain ' + AP_GAIN + ' dB.';
+  if (dropped.length) {
+    msg += '<br><b>Excluded as obstructed:</b> ' + dropped.map(function(d){
+      return d.pair.a + '&harr;' + d.pair.b + ' (' + d.dB.toFixed(0) + ' dB off)';
+    }).join(', ') + '. Those are the blocked paths &mdash; the model is now ' +
+    'calibrated on the clear ones, so the excess column reads the room.';
+  }
+  note.innerHTML = msg;
+};
+
 cv.addEventListener('mousedown', function(e){ drag = {x:e.clientX, y:e.clientY}; });
 window.addEventListener('mouseup', function(){ drag = null; });
 window.addEventListener('mousemove', function(e){
@@ -320,6 +488,13 @@ cv.addEventListener('wheel', function(e){
 window.addEventListener('resize', draw);
 
 function load(){
+  fetch('/api/v1/config/room', {cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(c){ if (c && c.nodes) truth = c; })
+    .catch(function(){ /* unsurveyed is a valid state — fall back to pure MDS */ })
+    .then(loadLinks);
+}
+function loadLinks(){
   fetch('/api/v1/links', {cache:'no-store'})
     .then(function(r){ return r.json(); })
     .then(function(d){ links = d.links || []; recompute(); })
