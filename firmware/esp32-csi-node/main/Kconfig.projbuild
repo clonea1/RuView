@@ -495,6 +495,30 @@ menu "Onboard LED (ADR-183)"
             (reaches yellow with less motion).
 endmenu
 
+config CSI_GATE_MESH_ALIGNED
+    bool "Align the CSI rate gate to mesh time (enables cross-node pairing)"
+    default y
+    help
+      Gate CSI acceptance on a bucket of the mesh-aligned epoch rather than on
+      time elapsed since this node's own last accept.
+
+      With the per-node elapsed gate, two nodes drift into independent phase
+      and accept disjoint frames while both look perfectly healthy at 50 Hz.
+      Measured on 2026-08-30 with two boards side by side: 72% of HEARD frames
+      were common, but only 25% of ACCEPTED ones -- the gate was discarding the
+      pairing that fusion depends on.
+
+      Bucketing on shared mesh time makes every node take the first frame in
+      the same absolute window, so frames both nodes heard are frames both
+      nodes keep.
+
+      Falls back automatically to the elapsed-time gate whenever mesh sync is
+      invalid, so an unsynced or freshly booted node degrades to the old
+      behaviour rather than gating on a meaningless epoch.
+
+      Turn off to A/B against the old gate; the seqdiag probe
+      (CSI_SEQ_DIAG) measures the difference directly.
+
 config CSI_SEQ_DIAG
     bool "Log (source MAC, rx_seq) for every CSI callback (ADR-345 phase 2 probe)"
     default n
@@ -574,5 +598,66 @@ config THERMAL_HYSTERESIS_C
     help
       Recovering at the same threshold that tripped would oscillate, and every
       oscillation is a visible RSSI step on every link the node has.
+
+endmenu
+
+menu "Network supervision"
+
+config UPLINK_WATCHDOG
+    bool "Restart the node if the CSI uplink stops for too long"
+    default y
+    help
+      Bounds how long a node can sit powered, capturing, and unable to reach
+      the network.
+
+      MEASURED 2026-08-30: an AP-side event at 03:37 EDT disconnected all three
+      wall-mounted nodes within three minutes of each other, and every one of
+      them stayed dead for 5.5-7.5 hours until it was physically unplugged. The
+      specific cause of that outage (a reconnect counter that gave up
+      permanently) is fixed in main.c, but this exists so the NEXT unknown
+      wedge costs minutes instead of a night of data.
+
+      The watchdog counts a successful sendto(), which on UDP means the network
+      stack accepted the datagram -- not that the aggregator received it. That
+      is deliberate: stopping the server does NOT reboot the fleet, because
+      sendto keeps succeeding into a socket whose peer is gone. It fires only
+      when the node's own network path is broken.
+
+      It arms on the first successful send rather than at boot, so a node
+      powered on while the AP is down does not reboot-loop; the unbounded
+      reconnect handles that case instead.
+
+config UPLINK_WATCHDOG_TIMEOUT_S
+    int "Restart after this many seconds with no successful send"
+    depends on UPLINK_WATCHDOG
+    range 30 3600
+    default 1200
+    help
+      Must sit above the worst SELF-HEALING gap, or the watchdog reboots nodes
+      that were about to recover on their own -- which is worse than the fault
+      it guards against, because every reboot re-runs ESP-NOW leader election
+      and discards the mesh time-sync state.
+
+      This was 120 s on the reasoning that the ENOMEM backoff caps at 2 s so a
+      healthy node is never quiet for long. A 58-minute soak on 2026-08-30
+      falsified that: nodes 0 and 2 each went silent repeatedly with a median
+      gap of 210 s and a maximum of 225 s, and recovered every time without
+      intervention. 120 s would have rebooted them every few minutes forever.
+      (The cause of those 210 s gaps is still unknown -- it is not the ENOMEM
+      backoff, which cannot produce a gap that long.)
+
+      Sized from the completed 112-minute soak, not the partial one: 30
+      silences across two nodes, median 225 s, p90 225 s, and a single 510 s
+      outlier that looks like two cycles running together. A third such merge
+      would reach ~735 s, so 600 s was too tight -- it left only 90 s of margin
+      over an event already observed once.
+
+      1200 s is 2.35x the observed maximum while still bounding a true wedge to
+      twenty minutes rather than the 7.5 hours measured the same day. Revisit
+      it if the ~225 s flapping is ever explained and fixed; until then do not
+      lower it below ~900 s.
+
+      If nodes do restart unexpectedly, check the reset reason in the sync
+      packet's health field before assuming the watchdog is responsible.
 
 endmenu
