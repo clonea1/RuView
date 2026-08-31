@@ -61,8 +61,36 @@ are intermittent; links stronger than about -85 are typically 100% present.
 
 **One snapshot cannot distinguish an intermittent link from an absent one.**
 Marginal links come and go. Use a window and report **presence percentage**, not
-just a mean. `scratchpad/observe.py N tag` records links, mesh and registry
-every 10 s to `observe_<tag>.jsonl`. A 15-minute window is 90 polls.
+just a mean.
+
+## Tooling — durable location
+
+Everything lives in **`c:/temp/ruview/fleet-baselines/`**, outside the git
+repository because these captures hold motion and presence values for an
+occupied home. Never copy them into the repo. Read its `README.md` first: it
+carries the measured pos1/pos2/pos3 baselines and both metric traps above.
+
+| command | does |
+|---|---|
+| `python observe.py N tag` | records links, mesh and registry every 10 s to `observe_<tag>.jsonl`. 15 minutes = 90 polls. |
+| `python placement.py <node> --save <tag> --compare <tag>` | single-node placement comparison |
+| `python nightlog.py [tag]` | continuous 15 s recorder. **`while True` — it never stops on its own.** Appends; a tag separates runs. |
+
+Output lands next to the script, so run these from that directory — never from
+a session scratchpad, which is keyed to a session id and disappears with it.
+
+**If you start `nightlog.py`, say so explicitly in your report**, including that
+it runs until killed. An earlier run recorded for 14 hours into a doomed
+directory before anyone noticed.
+
+`placement.py`'s verdict weighs how MANY peers hear a node, not how well, so it
+reports "mixed" when peer count holds but RSSI improves substantially. Read its
+numbers, not its summary line.
+
+The two windows named `before_master_move` and `after_n5_move` predate the
+mesh/registry capture, so they carry links only and have no frame-rate column.
+Despite its name, `observe_before_master_move.jsonl` is the node 5 pos1
+baseline, not a master-bedroom capture.
 
 ## Placement rule (MEASURED, three 90-poll windows)
 
