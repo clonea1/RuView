@@ -98,6 +98,18 @@
 /* Presence threshold as a multiple of the tracked floor. */
 #define EDGE_FLOOR_MULT   4.0f
 
+/**
+ * Clear the adaptive floor and re-seed it from the next EDGE_CALIB_FRAMES
+ * frames, then resume continuous tracking.
+ *
+ * For use after a node is physically moved or the room is rearranged. The
+ * continuous tracker handles drift on its own, but it climbs deliberately
+ * slowly; this shortcuts the wait when the change is known rather than
+ * gradual. Safe to call at any time and from any task -- the worst case is a
+ * short period of default sensitivity while it re-seeds.
+ */
+void edge_processing_recalibrate(void);
+
 #define EDGE_CALIB_FRAMES     1200  /**< Frames for adaptive calibration (~60s at 20 Hz). */
 #define EDGE_CALIB_SIGMA_MULT 3.0f  /**< Threshold = mean + 3*sigma of ambient. */
 

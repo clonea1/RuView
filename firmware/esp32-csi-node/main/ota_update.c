@@ -17,6 +17,7 @@
 #include "esp_app_desc.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "edge_processing.h"
 
 static const char *TAG = "ota_update";
 
@@ -237,6 +238,37 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
     return ESP_OK;  /* Never reached. */
 }
 
+/**
+ * `POST /calibrate` — clear the adaptive floor and re-seed it.
+ *
+ * Lives on the OTA server because that server already exists on every node,
+ * already authenticates with the fleet PSK, and is already reachable from the
+ * aggregator. Standing up a second HTTP server, or a second credential, to
+ * carry one command would be more surface for no benefit.
+ *
+ * Authenticated with the same PSK as a firmware upload, deliberately. It is a
+ * far smaller action than replacing the firmware, but it is still an
+ * unauthenticated way to blind a sensor if left open: repeatedly clearing the
+ * floor would keep every node permanently in warm-up.
+ */
+static esp_err_t ota_calibrate_handler(httpd_req_t *req)
+{
+    if (!ota_check_auth(req)) {
+        ESP_LOGW(TAG, "calibrate rejected: authentication failed");
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
+                            "Authentication required. Use: Authorization: Bearer <psk>");
+        return ESP_FAIL;
+    }
+
+    edge_processing_recalibrate();
+
+    const char *resp =
+        "{\"status\":\"ok\",\"message\":\"floor cleared; re-seeding\"}";
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, strlen(resp));
+    return ESP_OK;
+}
+
 /** Internal: start the HTTP server and register OTA endpoints. */
 static esp_err_t ota_start_server(httpd_handle_t *out_handle)
 {
@@ -271,9 +303,18 @@ static esp_err_t ota_start_server(httpd_handle_t *out_handle)
     };
     httpd_register_uri_handler(server, &upload_uri);
 
+    httpd_uri_t calibrate_uri = {
+        .uri      = "/calibrate",
+        .method   = HTTP_POST,
+        .handler  = ota_calibrate_handler,
+        .user_ctx = NULL,
+    };
+    httpd_register_uri_handler(server, &calibrate_uri);
+
     ESP_LOGI(TAG, "OTA HTTP server started on port %d", OTA_PORT);
     ESP_LOGI(TAG, "  GET  /ota/status — firmware version info");
     ESP_LOGI(TAG, "  POST /ota        — upload new firmware binary");
+    ESP_LOGI(TAG, "  POST /calibrate  — clear and re-seed the adaptive floor");
 
     if (out_handle) *out_handle = server;
     return ESP_OK;

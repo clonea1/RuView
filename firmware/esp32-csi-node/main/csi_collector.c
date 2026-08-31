@@ -451,7 +451,7 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
 #define CONFIG_C6_SYNC_EVERY_N_FRAMES 20
 #endif
         if ((s_cb_count % CONFIG_C6_SYNC_EVERY_N_FRAMES) == 0) {
-            uint8_t sync[32];
+            uint8_t sync[38];
             uint32_t sync_magic = 0xC511A110u;    /* CSI-ADR-110 sync packet */
             uint64_t local_us = (uint64_t)esp_timer_get_time();
             uint64_t epoch_us = c6_sync_espnow_get_epoch_us();
@@ -463,12 +463,33 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
 
             memcpy(&sync[0],  &sync_magic, 4);
             sync[4] = s_node_id;
-            sync[5] = 0x01;                       /* protocol version */
+            sync[5] = 0x02;                       /* proto v2: + node_mac */
             sync[6] = flags;
             sync[7] = 0;                          /* reserved */
             memcpy(&sync[8],  &local_us, 8);
             memcpy(&sync[16], &epoch_us, 8);
             memcpy(&sync[24], &s_sequence, 4);    /* high-water seq for pairing */
+
+            /* Bytes 32..37: this node's own WiFi STA MAC.
+             *
+             * The sink cannot otherwise tell that a captured transmitter
+             * address belongs to one of its own nodes. It had to guess, using
+             * the only signature available: a MAC heard by every receiver
+             * except one is probably that one's. That holds while every node
+             * hears every other -- true of boards on a bench, false the moment
+             * they are spread through a building. MEASURED 2026-08-31 with
+             * nine nodes in real positions: 0 of 32 links attributed, every
+             * peer link misreported as infrastructure.
+             *
+             * The node knows this for free. Six bytes at ~0.5 Hz replaces an
+             * inference that fails exactly where the product is meant to run. */
+            uint8_t self_mac[6] = {0};
+            if (esp_wifi_get_mac(WIFI_IF_STA, self_mac) != ESP_OK) {
+                /* Leave zeros; the sink treats all-zero as "not reported"
+                 * rather than as an address. */
+                memset(self_mac, 0, sizeof(self_mac));
+            }
+            memcpy(&sync[32], self_mac, 6);
             /* Node health, in bytes that were reserved-zero.
              *
              * These nodes live on walls with no console, so a serial log line

@@ -587,6 +587,33 @@ static void calibration_update(float motion)
     }
 }
 
+void edge_processing_recalibrate(void)
+{
+    /* Drop the floor back into warm-up so it re-seeds from the room as it is
+     * NOW, then resumes tracking from there.
+     *
+     * The leaky minimum finds quiet on its own, but only downwards quickly:
+     * it descends to any new low instantly and climbs at well under a percent
+     * a minute, by design, so that a person standing still is never mistaken
+     * for the new normal. The cost of that asymmetry is that a node which was
+     * calibrated somewhere quiet and then moved somewhere busier stays
+     * over-sensitive for an hour or two while the floor walks up.
+     *
+     * This is the "I just moved it" button. It cannot be inferred: a node has
+     * no way to tell being carried to a new wall from a room that simply got
+     * noisier, and guessing wrong in either direction is worse than being
+     * told.
+     */
+    s_calibrated = false;
+    s_calib_sum = 0.0f;
+    s_calib_sum_sq = 0.0f;
+    s_calib_count = 0;
+    s_floor = 1.0f;
+    s_adaptive_threshold = 0.05f;
+    ESP_LOGI(TAG, "recalibration requested — floor cleared, re-seeding over the "
+                  "next %d frames", EDGE_CALIB_FRAMES);
+}
+
 /* ======================================================================
  * Delta Compression (XOR + RLE)
  * ====================================================================== */
