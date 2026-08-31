@@ -1234,8 +1234,18 @@ static void process_frame(const edge_ring_slot_t *slot)
     /* --- Step 9: Presence detection --- */
     s_presence_score = s_motion_energy;
 
-    /* Adaptive calibration: learn ambient noise level from first N frames. */
-    if (!s_calibrated && s_cfg.presence_thresh == 0.0f) {
+    /* Adaptive floor: runs on EVERY frame, not only during warm-up.
+     *
+     * This guard used to read `!s_calibrated && ...`, which meant the tracker
+     * stopped the moment warm-up finished -- so the leaky minimum below it
+     * never executed and the floor stayed frozen at whatever the seeding
+     * window happened to average. The continuous tracker was dead code past
+     * its first 1200 frames, which is precisely the boot-only behaviour it was
+     * written to replace.
+     *
+     * `presence_thresh != 0` still means the operator pinned a fixed threshold
+     * and does not want an adaptive one, so that half of the guard stays. */
+    if (s_cfg.presence_thresh == 0.0f) {
         calibration_update(s_motion_energy);
     }
 
