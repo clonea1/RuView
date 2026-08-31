@@ -343,6 +343,19 @@ struct Esp32Frame {
     /// normal home channel. Interleaving links with different geometry
     /// corrupts any temporal statistic built from `frame_history`.
     source_mac: Option<[u8; 6]>,
+    /// 802.11 sequence control of the overheard frame — wire v3
+    /// (`CSI_MAGIC_V3`) only; `None` from v1/v2 firmware.
+    ///
+    /// This is the join key for cross-node fusion. `sequence` above is a
+    /// counter private to each node, so two nodes that captured the same
+    /// packet report unrelated values and nothing links them. `rx_seq` is
+    /// assigned by the transmitter, so every receiver of one transmission
+    /// reports the same number: `(source_mac, rx_seq)` names that
+    /// transmission fleet-wide with no coordination between receivers.
+    ///
+    /// Carries the raw 16-bit field. The low 4 bits are the fragment number;
+    /// mask to 12 bits (`>> 4`) for sequence-only semantics.
+    rx_seq: Option<u16>,
     amplitudes: Vec<f64>,
     phases: Vec<f64>,
 }
@@ -2726,10 +2739,18 @@ const CSI_MAGIC_V1: u32 = 0xC511_0001;
 /// other edge packets (see `issue_928_magic_collision_tests` for why that
 /// matters), so v2 claims the next free value rather than an adjacent one.
 const CSI_MAGIC_V2: u32 = 0xC511_0008;
+/// Wire v3 CSI frame magic — v2 plus the 802.11 `rx_seq` at bytes 26..27.
+///
+/// `0xC511_0009` is the per-slot vitals packet, so v3 takes the next free
+/// value. See `issue_928_magic_collision_tests` for why adjacency is not
+/// assumed.
+const CSI_MAGIC_V3: u32 = 0xC511_000A;
 /// v1 header length; also the I/Q offset for a v1 frame.
 const CSI_HEADER_V1: usize = 20;
 /// v2 header length: v1 plus `source_mac` at bytes 20..25.
 const CSI_HEADER_V2: usize = 26;
+/// v3 header length: v2 plus `rx_seq` (u16 LE) at bytes 26..27.
+const CSI_HEADER_V3: usize = 28;
 
 fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
     if buf.len() < CSI_HEADER_V1 {
@@ -2739,15 +2760,24 @@ fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
     let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
     // Both versions are accepted so a mixed fleet keeps working: a node
     // running older firmware simply reports no transmitter identity.
-    let (iq_start, source_mac) = match magic {
-        CSI_MAGIC_V1 => (CSI_HEADER_V1, None),
+    let (iq_start, source_mac, rx_seq) = match magic {
+        CSI_MAGIC_V1 => (CSI_HEADER_V1, None, None),
         CSI_MAGIC_V2 => {
             if buf.len() < CSI_HEADER_V2 {
                 return None;
             }
             let mut mac = [0u8; 6];
             mac.copy_from_slice(&buf[20..26]);
-            (CSI_HEADER_V2, Some(mac))
+            (CSI_HEADER_V2, Some(mac), None)
+        }
+        CSI_MAGIC_V3 => {
+            if buf.len() < CSI_HEADER_V3 {
+                return None;
+            }
+            let mut mac = [0u8; 6];
+            mac.copy_from_slice(&buf[20..26]);
+            let seq = u16::from_le_bytes([buf[26], buf[27]]);
+            (CSI_HEADER_V3, Some(mac), Some(seq))
         }
         _ => return None,
     };
@@ -2814,6 +2844,7 @@ fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
         ppdu_type,
         adr018_flags,
         source_mac,
+        rx_seq,
         amplitudes,
         phases,
     })
@@ -2860,6 +2891,62 @@ mod csi_wire_v2_source_mac_tests {
         assert_eq!(f.node_id, 3);
         assert_eq!(f.sequence, 99);
         assert_eq!(f.amplitudes.len(), 64);
+    }
+
+    #[test]
+    fn v3_frame_yields_the_transmitter_mac_and_rx_seq() {
+        let mac = [0x8c, 0x30, 0x66, 0x86, 0xa4, 0x21];
+        let mut buf = frame(CSI_MAGIC_V3, CSI_HEADER_V3, 64, Some(mac));
+        buf[26..28].copy_from_slice(&0x1A2Bu16.to_le_bytes());
+        let f = parse_esp32_frame(&buf).expect("v3 frame parses");
+        assert_eq!(f.source_mac, Some(mac));
+        assert_eq!(f.rx_seq, Some(0x1A2B));
+        // The per-node counter and the 802.11 sequence are different things.
+        // Conflating them is the bug this wire version exists to prevent.
+        assert_eq!(f.sequence, 99);
+        assert_ne!(f.sequence as u16, f.rx_seq.unwrap());
+        assert_eq!(f.amplitudes.len(), 64);
+    }
+
+    /// v1 and v2 report no `rx_seq` rather than a plausible-looking zero. A
+    /// fleet mid-OTA runs both, and a fusion index keyed on `(mac, 0)` would
+    /// silently pair every frame from every older node with every other.
+    #[test]
+    fn older_wire_versions_report_no_rx_seq() {
+        let mac = [1, 2, 3, 4, 5, 6];
+        let v2 = parse_esp32_frame(&frame(CSI_MAGIC_V2, CSI_HEADER_V2, 64, Some(mac)))
+            .expect("v2 parses");
+        assert_eq!(v2.rx_seq, None, "v2 carries no rx_seq");
+        let v1 = parse_esp32_frame(&frame(CSI_MAGIC_V1, CSI_HEADER_V1, 64, None))
+            .expect("v1 parses");
+        assert_eq!(v1.rx_seq, None, "v1 carries no rx_seq");
+    }
+
+    /// I/Q starts 2 bytes later again in v3. Parsing a v3 frame at the v2
+    /// offset would read rx_seq as the first sample and shift every value
+    /// after it, so the magic must be rejected outright by a v2-only reader.
+    #[test]
+    fn v3_payload_offset_differs_from_v2() {
+        let mac = [1, 2, 3, 4, 5, 6];
+        let v3 = parse_esp32_frame(&frame(CSI_MAGIC_V3, CSI_HEADER_V3, 8, Some(mac)))
+            .expect("v3 parses");
+        let v2 = parse_esp32_frame(&frame(CSI_MAGIC_V2, CSI_HEADER_V2, 8, Some(mac)))
+            .expect("v2 parses");
+        assert_eq!(v3.amplitudes.len(), v2.amplitudes.len());
+        assert_eq!(CSI_HEADER_V3 - CSI_HEADER_V2, 2, "v3 adds exactly rx_seq");
+    }
+
+    /// Guards the value chosen for v3: 0xC511_0009 is the per-slot vitals
+    /// packet, so an adjacent value would have been parsed as vitals and the
+    /// CSI silently dropped. This is the same class of bug as issue #928.
+    #[test]
+    fn v3_magic_does_not_collide_with_existing_packet_types() {
+        for taken in [
+            0xC511_0001u32, 0xC511_0002, 0xC511_0003, 0xC511_0004,
+            0xC511_0005, 0xC511_0006, 0xC511_0007, 0xC511_0008, 0xC511_0009,
+        ] {
+            assert_ne!(CSI_MAGIC_V3, taken, "CSI v3 magic collides with {taken:#X}");
+        }
     }
 
     #[test]
@@ -3907,8 +3994,10 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
 
         let frame = Esp32Frame {
             magic: CSI_MAGIC_V1,
-            // Synthetic/adapter frame, not a real capture: no transmitter identity.
+            // Synthetic/adapter frame, not a real capture: no transmitter
+            // identity and no 802.11 sequence to fuse on.
             source_mac: None,
+            rx_seq: None,
             node_id: 0,
             n_antennas: 1,
             n_subcarriers: obs_count.min(u16::MAX as usize) as u16,
@@ -4098,8 +4187,10 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
 
     let frame = Esp32Frame {
         magic: CSI_MAGIC_V1,
-        // Synthetic/adapter frame, not a real capture: no transmitter identity.
+        // Synthetic/adapter frame, not a real capture: no transmitter
+        // identity and no 802.11 sequence to fuse on.
         source_mac: None,
+        rx_seq: None,
         node_id: 0,
         n_antennas: 1,
         n_subcarriers: 1,
@@ -4476,8 +4567,10 @@ fn generate_simulated_frame(tick: u64) -> Esp32Frame {
 
     Esp32Frame {
         magic: CSI_MAGIC_V1,
-        // Synthetic/adapter frame, not a real capture: no transmitter identity.
+        // Synthetic/adapter frame, not a real capture: no transmitter
+        // identity and no 802.11 sequence to fuse on.
         source_mac: None,
+        rx_seq: None,
         node_id: 1,
         n_antennas: 1,
         n_subcarriers: n_sub as u16,

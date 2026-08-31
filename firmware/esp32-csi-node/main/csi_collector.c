@@ -143,7 +143,7 @@ size_t csi_serialize_frame(const wifi_csi_info_t *info, uint8_t *buf, size_t buf
     uint16_t iq_len = (uint16_t)info->len;
     uint16_t n_subcarriers = iq_len / (2 * n_antennas);
 
-    size_t frame_size = CSI_HEADER_SIZE_V2 + iq_len;
+    size_t frame_size = CSI_HEADER_SIZE_V3 + iq_len;
     if (frame_size > buf_len) {
         ESP_LOGW(TAG, "Buffer too small: need %u, have %u", (unsigned)frame_size, (unsigned)buf_len);
         return 0;
@@ -162,10 +162,12 @@ size_t csi_serialize_frame(const wifi_csi_info_t *info, uint8_t *buf, size_t buf
         freq_mhz = 0;
     }
 
-    /* Magic (LE). Wire v2: identical to v1 through byte 19, then the
-     * transmitter MAC at 20..25 and I/Q from 26. A v1-only reader rejects the
-     * magic outright rather than misparsing the payload at the wrong offset. */
-    uint32_t magic = CSI_MAGIC_V2;
+    /* Magic (LE). Wire v3: identical to v2 through byte 25, then rx_seq at
+     * 26..27 and I/Q from 28. A reader that does not know v3 rejects the magic
+     * outright rather than misparsing the payload at the wrong offset -- which
+     * is the whole reason each layout change takes a new magic instead of
+     * appending silently. */
+    uint32_t magic = CSI_MAGIC_V3;
     memcpy(&buf[0], &magic, 4);
 
     /* Node ID (captured at init into s_node_id to survive memory corruption
@@ -256,8 +258,25 @@ size_t csi_serialize_frame(const wifi_csi_info_t *info, uint8_t *buf, size_t buf
      * which left the sink unable to tell one link from another. */
     memcpy(&buf[20], info->mac, 6);
 
+    /* Wire v3 bytes 26..27: the 802.11 sequence control field of the overheard
+     * frame, little-endian.
+     *
+     * This is the join key for cross-node fusion. The `sequence` at bytes
+     * 12..15 is this node's own counter and means nothing to any other node;
+     * rx_seq is assigned by the TRANSMITTER, so every receiver of the same
+     * packet reports the same value. (mac, rx_seq) therefore names one
+     * transmission across the whole fleet without any coordination between
+     * receivers -- no shared clock, no negotiation.
+     *
+     * Sent raw rather than masked to 12 bits: the low 4 bits are the fragment
+     * number, and discarding them here would merge fragments of one MSDU into
+     * a single key. The sink can mask if it wants sequence-only semantics; it
+     * cannot recover what the node threw away. */
+    uint16_t rx_seq = (uint16_t)info->rx_seq;
+    memcpy(&buf[26], &rx_seq, 2);
+
     /* I/Q data */
-    memcpy(&buf[CSI_HEADER_SIZE_V2], info->buf, iq_len);
+    memcpy(&buf[CSI_HEADER_SIZE_V3], info->buf, iq_len);
 
     return frame_size;
 }

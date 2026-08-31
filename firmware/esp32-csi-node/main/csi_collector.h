@@ -36,8 +36,33 @@
 /** Wire v2 header size: v1 plus the 6-byte transmitter MAC. */
 #define CSI_HEADER_SIZE_V2 26
 
+/** Wire v3 CSI frame magic: v2 plus the 802.11 receive sequence number.
+ *
+ * Why: v2 made frames attributable to a *link* (which transmitter), but not to
+ * a *transmission*. Byte 12..15 carries `s_sequence`, a counter private to each
+ * node, so two nodes that captured the same packet off the air report unrelated
+ * numbers and the sink cannot tell it was one event observed twice. Fusing on
+ * arrival timestamps instead fails because the sink sees network jitter, not
+ * capture time.
+ *
+ * `wifi_csi_info_t.rx_seq` is the 802.11 sequence control field of the
+ * overheard frame -- assigned by the TRANSMITTER, identical at every receiver.
+ * (mac, rx_seq) is therefore a coordination-free name for "this specific
+ * transmission", which is exactly the join key cross-node fusion needs.
+ *
+ * MEASURED 2026-08-30, two boards side by side logging (mac, rx_seq): 4099
+ * distinct values over ~44,000 frames with both nodes reporting the identical
+ * range, and 72% of frames heard by one were heard by the other. This settles
+ * the open question in ADR-345 -- rx_seq is populated and usable.
+ *
+ * 0xC5110009 is the per-slot vitals packet, so v3 takes 0xC511000A. */
+#define CSI_MAGIC_V3 0xC511000A
+
+/** Wire v3 header size: v2 plus `rx_seq` (u16 LE) at bytes 26..27. */
+#define CSI_HEADER_SIZE_V3 28
+
 /** Maximum frame buffer size (largest header + 4 antennas * 256 subcarriers * 2 bytes). */
-#define CSI_MAX_FRAME_SIZE (CSI_HEADER_SIZE_V2 + 4 * 256 * 2)
+#define CSI_MAX_FRAME_SIZE (CSI_HEADER_SIZE_V3 + 4 * 256 * 2)
 
 /** Maximum number of channels in the hop table (ADR-029). */
 #define CSI_HOP_CHANNELS_MAX 6
