@@ -16,6 +16,7 @@ mod engine_bridge;
 mod field_bridge;
 mod field_localize;
 mod model_format;
+mod fusion;
 mod links;
 mod multistatic_bridge;
 mod phase_diag;
@@ -1851,6 +1852,10 @@ struct AppStateInner {
     /// ranging is built on; see `links` for why it exists alongside, not
     /// instead of, the per-node model.
     link_table: links::LinkTable,
+    /// Cross-node transmission pairing, keyed on (tx_mac, rx_seq).
+    /// Only wire v3 frames can feed this; see `fusion` for why an
+    /// older frame must not be given a placeholder key.
+    fusion_index: fusion::FusionIndex,
     /// Latest per-slot vitals per node (magic 0xC511_0009). Distinct from
     /// `edge_vitals`, which carries only the aggregate.
     latest_vitals_slots: HashMap<u8, Esp32VitalsSlotsPacket>,
@@ -2194,6 +2199,7 @@ impl AppStateInner {
     pub(crate) fn minimal() -> Self {
         AppStateInner {
             link_table: links::LinkTable::new(),
+            fusion_index: fusion::FusionIndex::new(),
             latest_vitals_slots: HashMap::new(),
             latest_update: None,
             last_broadcast_at: None,
@@ -8879,6 +8885,54 @@ pub(crate) fn fleet_role_counts(snaps: &[(u8, NodeSyncSnapshot)]) -> (u64, u64) 
 /// transmitter, wherever the router happens to be) from a node-to-node link
 /// between two boards whose positions are known — the distinction that makes
 /// node-to-node links worth ~3x the angular spread.
+/// Cross-node pairing statistics — how often independent nodes captured the
+/// same transmission, keyed on `(tx_mac, rx_seq)`.
+///
+/// `paired_fraction` is the number that decides whether fusion is viable.
+/// Every node can look perfectly healthy — full frame rate, good RSSI, all
+/// links present — while no two of them ever hold the same packet, which is
+/// what the per-node CSI rate gate did before it was aligned to mesh time.
+///
+/// `by_receivers[n]` is transmissions captured by exactly n nodes, and
+/// `pairs` is the upper triangle of the node-by-node matrix: which specific
+/// pairs are fusable, not just how many.
+async fn fusion_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    let st = s.fusion_index.stats();
+
+    let mut pairs = Vec::new();
+    for a in 0..fusion::MAX_NODES {
+        for b in (a + 1)..fusion::MAX_NODES {
+            if st.pairs[a][b] > 0 {
+                pairs.push(serde_json::json!({
+                    "a": a, "b": b, "common": st.pairs[a][b]
+                }));
+            }
+        }
+    }
+
+    let by: Vec<serde_json::Value> = st
+        .by_receivers
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter(|(_, v)| **v > 0)
+        .map(|(n, v)| serde_json::json!({ "receivers": n, "transmissions": v }))
+        .collect();
+
+    Json(serde_json::json!({
+        "observations": st.observations,
+        "transmissions": st.transmissions,
+        "paired": st.paired(),
+        "paired_fraction": st.paired_fraction(),
+        "by_receivers": by,
+        "pairs": pairs,
+        "open_keys": s.fusion_index.open_len(),
+        "overflow": st.overflow,
+        "note": "wire v3 frames only; v1/v2 carry no rx_seq and are excluded"
+    }))
+}
+
 async fn links_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let s = state.read().await;
 
@@ -9758,6 +9812,15 @@ async fn udp_receiver_task(
                         s.link_table
                             .observe(node_id, tx, &frame.amplitudes, frame.rssi, now);
                         s.link_table.expire(now);
+                        // Wire v3 only. A v1/v2 frame has no transmission
+                        // identity, and keying it on a placeholder would pair
+                        // every older node's frames with every other node's --
+                        // exactly the state a partial OTA passes through, so
+                        // this cannot be an `unwrap_or(0)`.
+                        if let Some(rx_seq) = frame.rx_seq {
+                            s.fusion_index.observe(node_id, tx, rx_seq, now);
+                            s.fusion_index.expire(now);
+                        }
                     }
                     let ns = s.node_states.entry(node_id).or_insert_with(NodeState::new);
                     // ADR-110 iter 19 — feed the per-node fps EMA from real
@@ -11672,6 +11735,7 @@ async fn main() {
     let mut room_bounds: (f32, f32) = (0.0, 0.0);
     let state: SharedState = Arc::new(RwLock::new(AppStateInner {
         link_table: links::LinkTable::new(),
+        fusion_index: fusion::FusionIndex::new(),
         latest_vitals_slots: HashMap::new(),
         latest_update: None,
         last_broadcast_at: None,
@@ -12085,6 +12149,7 @@ async fn main() {
         .route("/api/v1/mesh/metrics", get(mesh_metrics_endpoint))
         // ADR-345: per-link CSI perturbation (receiver, transmitter).
         .route("/api/v1/links", get(links_endpoint))
+        .route("/api/v1/fusion", get(fusion_endpoint))
         // Vital sign endpoints
         .route("/api/v1/vital-signs", get(vital_signs_endpoint))
         .route("/api/v1/edge-vitals", get(edge_vitals_endpoint))
