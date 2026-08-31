@@ -2124,6 +2124,26 @@ struct AppStateInner {
     /// ranging is built on; see `links` for why it exists alongside, not
     /// instead of, the per-node model.
     link_table: links::LinkTable,
+    /// WiFi STA MAC of each node, reported by the node itself in its sync
+    /// packet (proto v2+).
+    ///
+    /// Replaces `links::infer_transmitting_node`, which guessed: a MAC heard
+    /// by every receiver except one was assumed to belong to that one. That
+    /// signature only exists while every node hears every other. MEASURED
+    /// 2026-08-31 with nine nodes placed through a house: it attributed 0 of
+    /// 32 links and reported every peer link as infrastructure, because a
+    /// node three rooms away is missing from far more than one hearing set.
+    ///
+    /// Keyed MAC -> node so link attribution is a lookup on the transmitter
+    /// address, which is what the CSI frame actually carries.
+    node_macs: HashMap<[u8; 6], u8>,
+    /// Source address of the most recent CSI frame from each node.
+    ///
+    /// Learned from the UDP datagram rather than configured, because it is
+    /// already ground truth: a node that is delivering has, by definition,
+    /// just told us where it is. A static list would go stale on a DHCP lease
+    /// change and be wrong exactly when it mattered.
+    node_addrs: HashMap<u8, std::net::IpAddr>,
     /// Cross-node transmission pairing, keyed on (tx_mac, rx_seq).
     /// Only wire v3 frames can feed this; see `fusion` for why an
     /// older frame must not be given a placeholder key.
@@ -2471,6 +2491,8 @@ impl AppStateInner {
     pub(crate) fn minimal() -> Self {
         AppStateInner {
             link_table: links::LinkTable::new(),
+            node_macs: HashMap::new(),
+            node_addrs: HashMap::new(),
             fusion_index: fusion::FusionIndex::new(),
             latest_vitals_slots: HashMap::new(),
             latest_update: None,
@@ -9208,17 +9230,19 @@ async fn fusion_endpoint(State(state): State<SharedState>) -> Json<serde_json::V
 async fn links_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let s = state.read().await;
 
-    // MACs of our own nodes, so a peer link can be labelled with the peer's
-    // node id instead of a bare address.
-    // Node identity is inferred from who did *not* hear a transmitter; see
-    // `links::infer_transmitting_node` for the reasoning and its limits.
+    // Attribute each link's transmitter. A node that reports its own MAC in
+    // its sync packet (proto v2+) is known outright; the old hearing-set
+    // inference is kept only as a fallback for a node still on older
+    // firmware, since it cannot work once boards are more than a room apart.
     let metrics = s.link_table.metrics();
     let (receivers, heard_by) = links::hearing_index(&metrics);
 
     let rows: Vec<serde_json::Value> = metrics
         .iter()
         .map(|m| {
-            let tx_node = links::infer_transmitting_node(&m.id.tx_mac, &receivers, &heard_by);
+            let tx_node = s.node_macs.get(&m.id.tx_mac).copied().or_else(|| {
+                links::infer_transmitting_node(&m.id.tx_mac, &receivers, &heard_by)
+            });
             serde_json::json!({
                 "rx_node": m.id.rx_node,
                 "tx_mac": format!(
@@ -9305,10 +9329,12 @@ fn rti_from_links(
         let Some(rx) = s.node_positions_config.get(&m.id.rx_node) else {
             continue;
         };
-        // Transmitter: one of our nodes (inferred), otherwise assumed to be the
-        // configured AP only when no receiver is missing — the same signature
-        // `infer_transmitting_node` uses, read the other way round.
-        let tx_node = links::infer_transmitting_node(&m.id.tx_mac, receivers, heard_by);
+        // Transmitter: known outright when the node reported its own MAC,
+        // otherwise the old hearing-set inference for nodes still on older
+        // firmware, otherwise assumed to be the configured AP.
+        let tx_node = s.node_macs.get(&m.id.tx_mac).copied().or_else(|| {
+            links::infer_transmitting_node(&m.id.tx_mac, receivers, heard_by)
+        });
         let tx = match tx_node {
             Some(id) => match s.node_positions_config.get(&id) {
                 Some(p) => [p[0] as f64, p[1] as f64],
@@ -9920,6 +9946,9 @@ async fn udp_receiver_task(
                                        sync.local_minus_epoch_us());
                                 let mut s = state.write().await;
                                 let node_id = sync.node_id;
+                                if let Some(mac) = sync.node_mac {
+                                    s.node_macs.insert(mac, node_id);
+                                }
                                 let ns = s.node_states.entry(node_id)
                                     .or_insert_with(NodeState::new);
                                 ns.apply_sync_packet(sync, std::time::Instant::now());
@@ -10069,6 +10098,7 @@ async fn udp_receiver_task(
                     // We scope the mutable borrow of node_states so we can
                     // access other AppStateInner fields afterward.
                     let node_id = frame.node_id;
+                    s.node_addrs.insert(node_id, src.ip());
                     // Clone adaptive model before mutable borrow of node_states
                     // to avoid unsafe raw pointer (review finding #2).
                     let adaptive_model_clone = s.adaptive_model.clone();
@@ -12007,6 +12037,8 @@ async fn main() {
     let mut room_bounds: (f32, f32) = (0.0, 0.0);
     let state: SharedState = Arc::new(RwLock::new(AppStateInner {
         link_table: links::LinkTable::new(),
+        node_macs: HashMap::new(),
+        node_addrs: HashMap::new(),
         fusion_index: fusion::FusionIndex::new(),
         latest_vitals_slots: HashMap::new(),
         latest_update: None,
@@ -12510,6 +12542,7 @@ async fn main() {
             "/api/v1/config/room",
             get(config_get_room).post(config_set_room),
         )
+        .route("/api/v1/calibrate", post(config_calibrate))
         // Ground-truth marker for attended signal experiments. GET so it can be
         // triggered from a phone browser mid-walk without a REST client.
         // axum 0.7 path-param syntax is `:label`; `{label}` is a literal segment.
@@ -13175,10 +13208,19 @@ async fn config_get_room(State(state): State<SharedState>) -> Json<serde_json::V
         "depth_m": saved.depth_m,
         "nodes": nodes,
         "ap_position": s.ap_position,
-        // Storeys and walls are pure geometry with no live counterpart in
-        // memory, so they are served straight from the persisted config.
+        // Storeys, walls and the AP's storey are pure geometry with no live
+        // counterpart in memory, so they are served straight from the
+        // persisted config.
+        //
+        // ap_floor was missing here while being saved correctly, which looked
+        // exactly like "the setting will not stick": the round trip lost it on
+        // the way OUT, so the UI defaulted to floor 1 and then displayed the
+        // AP's absolute height as if it were measured from the ground floor.
+        // Any field added to RoomConfig has to be added here too — this list
+        // is hand-maintained and will not complain when it falls behind.
         "floors": saved.floors,
         "walls": saved.walls,
+        "ap_floor": saved.ap_floor,
     }))
 }
 
@@ -13304,6 +13346,140 @@ pub(crate) fn validate_room_config(config: &RoomConfig) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Read the fleet OTA pre-shared key, which also authenticates recalibration.
+///
+/// From a FILE path in `RUVIEW_OTA_PSK_FILE`, not from a variable holding the
+/// key itself: environment variables are visible in process listings on this
+/// platform, and the same key can replace firmware. The path points at the
+/// file `provision_node.py` already writes, so there is one copy of the
+/// secret rather than two that can disagree.
+fn ota_psk_from_env() -> Option<String> {
+    let path = std::env::var("RUVIEW_OTA_PSK_FILE").ok()?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    let psk = raw.trim_start_matches('\u{feff}').trim().to_string();
+    if psk.is_empty() { None } else { Some(psk) }
+}
+
+/// Send `POST /calibrate` to one node and report whether it accepted.
+///
+/// Written directly on a TcpStream rather than pulling in an HTTP client:
+/// this crate has no such dependency, the request is a fixed handful of
+/// bytes to a device on the LAN, and adding a TLS-capable client to send it
+/// would be more supply chain than the feature is worth. Only the status
+/// line is parsed, because that is the only part that carries a decision.
+async fn node_calibrate(ip: std::net::IpAddr, psk: &str) -> Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let addr = format!("{ip}:8032");
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    .map_err(|_| "connect timed out".to_string())?
+    .map_err(|e| e.to_string())?;
+
+    let req = format!(
+        "POST /calibrate HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {psk}\r\n\
+         Content-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut buf = [0u8; 256];
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read(&mut buf),
+    )
+    .await
+    .map_err(|_| "no response".to_string())?
+    .map_err(|e| e.to_string())?;
+
+    let head = String::from_utf8_lossy(&buf[..n]);
+    let status = head.split_whitespace().nth(1).unwrap_or("?");
+    if status == "200" {
+        Ok(())
+    } else {
+        Err(format!("HTTP {status}"))
+    }
+}
+
+/// `POST /api/v1/calibrate` — tell nodes to clear and re-seed their adaptive
+/// floor. Body `{"node": 3}` for one, `{}` or no body for the whole fleet.
+///
+/// The continuous floor tracker handles gradual drift on its own, but it is
+/// deliberately asymmetric: it drops to a new low instantly and climbs at
+/// well under a percent a minute, so an occupant standing still never becomes
+/// the new normal. The cost is that a node calibrated somewhere quiet and
+/// then carried somewhere busier stays over-sensitive for an hour or two.
+/// This is the "I just moved it" shortcut, and it cannot be inferred: a node
+/// has no way to tell relocation from a room that simply got louder.
+///
+/// Fanned out from the server because the point is doing it to nine nodes at
+/// once, from outside the room. Walking to each board is motion recorded by
+/// every other board, which is the problem recalibration exists to fix.
+///
+/// Addresses are learned from inbound CSI, so a node that has never delivered
+/// is reported unreachable rather than silently skipped.
+async fn config_calibrate(
+    State(state): State<SharedState>,
+    body: Option<Json<serde_json::Value>>,
+) -> Json<serde_json::Value> {
+    let want: Option<u8> = body
+        .and_then(|Json(v)| v.get("node").and_then(|n| n.as_u64()))
+        .and_then(|n| u8::try_from(n).ok());
+
+    let targets: Vec<(u8, std::net::IpAddr)> = {
+        let s = state.read().await;
+        let mut t: Vec<(u8, std::net::IpAddr)> = s
+            .node_addrs
+            .iter()
+            .filter(|(id, _)| want.map_or(true, |w| **id == w))
+            .map(|(id, ip)| (*id, *ip))
+            .collect();
+        t.sort_unstable_by_key(|(id, _)| *id);
+        t
+    };
+
+    if targets.is_empty() {
+        return Json(serde_json::json!({
+            "error": match want {
+                Some(n) => format!("node {n} has not sent any CSI, so its address is unknown"),
+                None => "no nodes have sent CSI yet".to_string(),
+            }
+        }));
+    }
+
+    let Some(psk) = ota_psk_from_env() else {
+        return Json(serde_json::json!({
+            "error": "no OTA key available: set RUVIEW_OTA_PSK_FILE to the path of the fleet key"
+        }));
+    };
+
+    let mut ok: Vec<u8> = Vec::new();
+    let mut failed: Vec<serde_json::Value> = Vec::new();
+    for (id, ip) in targets {
+        match node_calibrate(ip, &psk).await {
+            Ok(()) => ok.push(id),
+            Err(e) => failed.push(serde_json::json!({ "node": id, "error": e })),
+        }
+    }
+
+    info!(
+        "recalibration requested: {} ok, {} failed",
+        ok.len(),
+        failed.len()
+    );
+    Json(serde_json::json!({
+        "status": if failed.is_empty() { "ok" } else { "partial" },
+        "recalibrated": ok,
+        "failed": failed,
+        "note": "each node clears its floor and re-seeds over ~1200 frames (~30 s)"
+    }))
 }
 
 async fn config_set_room(

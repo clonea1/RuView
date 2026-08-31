@@ -132,22 +132,24 @@ export class RoomBuilderTab {
    * that is now inside the ceiling below.
    */
   _reflowElevations() {
-    const before = new Map(this._floors().map((f) => [f.level, this._elevationOf(f.level)]));
+    // Read every measured height BEFORE the elevations move, then write them
+    // back after. Preserving the measurement is the intent; shifting z by a
+    // delta was the mechanism, and it double-applied whenever another writer
+    // had already accounted for the same elevation.
+    const heights = this.config.nodes.map((n) => this._nodeHeight(n));
+    const apLevel = Number.isFinite(this.config.ap_floor) ? this.config.ap_floor : 1;
+    const apHeight = Array.isArray(this.config.ap_position)
+      ? this.config.ap_position[2] - this._elevationOf(apLevel)
+      : null;
+
     const floors = this._floors();
     floors.forEach((f) => { f.elevation_m = this._derivedElevation(f.level); });
     this.config.floors = floors;
-    this.config.nodes.forEach((n) => {
-      const lvl = this._floorOf(n);
-      const shift = (this._elevationOf(lvl) - (before.get(lvl) ?? 0));
-      if (Number.isFinite(n.z) && shift) n.z = Math.round((n.z + shift) * 10000) / 10000;
-    });
-    if (Array.isArray(this.config.ap_position)) {
-      const lvl = Number.isFinite(this.config.ap_floor) ? this.config.ap_floor : 1;
-      const shift = (this._elevationOf(lvl) - (before.get(lvl) ?? 0));
-      if (shift) {
-        this.config.ap_position[2] =
-          Math.round((this.config.ap_position[2] + shift) * 10000) / 10000;
-      }
+
+    this.config.nodes.forEach((n, i) => this._setNodeHeight(n, heights[i]));
+    if (apHeight !== null) {
+      this.config.ap_position[2] =
+        Math.round((apHeight + this._elevationOf(apLevel)) * 10000) / 10000;
     }
   }
 
@@ -338,6 +340,19 @@ export class RoomBuilderTab {
             </div>
           </div>
           <div class="rb-actions">
+            <button class="rb-btn secondary" id="rbCalibrate"
+                    title="Clear every node's ambient floor and re-learn it from the room as it is now">
+              Recalibrate All Nodes
+            </button>
+          </div>
+          <p class="rb-hint">
+            Use after moving boards or rearranging a room. Nodes adapt on their own,
+            but they climb back down to a lower floor slowly on purpose — so a person
+            standing still is never mistaken for the new normal. This skips the wait.
+            <strong>Leave the area first:</strong> each node re-learns from roughly the
+            next 30&nbsp;seconds, so whatever is moving then becomes its idea of quiet.
+          </p>
+          <div class="rb-actions">
             <button class="rb-btn" id="rbSave">Save</button>
             <button class="rb-btn secondary" id="rbReload" title="Discard unsaved changes and reload the last saved config">Reload from Saved</button>
           </div>
@@ -488,6 +503,37 @@ export class RoomBuilderTab {
         this._render();
       });
     });
+    this.container.querySelector('#rbCalibrate').addEventListener('click', async (e) => {
+      const btn = e.target;
+      btn.disabled = true;
+      const was = btn.textContent;
+      btn.textContent = 'Recalibrating…';
+      try {
+        const r = await apiService.post('/api/v1/calibrate', {});
+        if (r && r.error) {
+          toastManager.error(`Recalibrate failed: ${r.error}`);
+        } else {
+          const okList = (r && r.recalibrated) || [];
+          const bad = (r && r.failed) || [];
+          // Name the nodes that did not take it. "Partial success" with no
+          // list means walking the house to work out which board to look at.
+          if (bad.length) {
+            toastManager.error(
+              `Recalibrated ${okList.length}; failed on node(s) ${bad.map((f) => f.node).join(', ')}`
+            );
+          } else {
+            toastManager.success(
+              `Recalibrating ${okList.length} node(s) — they re-learn over about 30 seconds.`
+            );
+          }
+        }
+      } catch (err) {
+        toastManager.error(`Recalibrate failed: ${err.message}`);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = was;
+      }
+    });
     this.container.querySelector('#rbSave').addEventListener('click', () => {
       this._save();
     });
@@ -523,6 +569,28 @@ export class RoomBuilderTab {
     return Number.isFinite(node.floor) ? node.floor : 1;
   }
 
+  /** A node's height above its OWN storey — the number a person measured. */
+  _nodeHeight(node) {
+    return node.z - this._elevationOf(this._floorOf(node));
+  }
+
+  /** The ONLY place node.z is written.
+   *
+   * z is stored absolute (above the ground floor) because geometry needs one
+   * axis, but every height in this form is entered relative to its own storey.
+   * That conversion used to happen in three places — the input sync, the
+   * storey selector, and the elevation reflow — each adding the storey
+   * elevation independently. Any two firing for one edit added it twice, which
+   * is how nodes ended up at 122 and 246 inches above their own ceilings.
+   *
+   * Now there is one writer and one reader, and both go through the same
+   * elevation lookup, so the round trip is idempotent no matter how many times
+   * it runs. */
+  _setNodeHeight(node, relMeters) {
+    if (!Number.isFinite(relMeters)) return;
+    node.z = Math.round((relMeters + this._elevationOf(this._floorOf(node))) * 10000) / 10000;
+  }
+
   _elevationOf(level) {
     const f = this._floors().find((x) => x.level === level);
     return f ? f.elevation_m : 0;
@@ -532,11 +600,25 @@ export class RoomBuilderTab {
     try {
       const data = await apiService.get(ENDPOINT);
       if (data && typeof data === 'object') {
+        // Spread first, then override only the fields that need defaulting.
+        //
+        // This was an explicit allowlist of four fields, which silently
+        // discarded everything the server sent that was not on it — floors,
+        // walls and ap_floor were all dropped on load. The visible symptom was
+        // storeys vanishing from the picker after a refresh, but the real
+        // danger was the next Save: config no longer held them, so it would
+        // POST an empty list and destroy the storeys on disk for real.
+        //
+        // Spreading means a field added to the server is carried through
+        // rather than quietly deleted by a UI that predates it.
         this.config = {
+          ...data,
           width_m: data.width_m > 0 ? data.width_m : 5,
           depth_m: data.depth_m > 0 ? data.depth_m : 4,
           nodes: Array.isArray(data.nodes) ? data.nodes : [],
           ap_position: Array.isArray(data.ap_position) ? data.ap_position : null,
+          floors: Array.isArray(data.floors) ? data.floors : [],
+          walls: Array.isArray(data.walls) ? data.walls : [],
         };
       }
     } catch (e) {
@@ -708,10 +790,9 @@ export class RoomBuilderTab {
       node.label = row.querySelector('.rb-label').value;
       node.x = this._fromDisplay(parseFloat(row.querySelector('.rb-x').value) || 0);
       node.y = this._fromDisplay(parseFloat(row.querySelector('.rb-y').value) || 0);
-      // The field holds height above this node's own storey; storage is
-      // absolute (above the ground floor), so add the storey's elevation back.
-      const rel = this._fromHeight(parseFloat(row.querySelector('.rb-z').value) || 0);
-      node.z = Math.round((rel + this._elevationOf(this._floorOf(node))) * 10000) / 10000;
+      // The field holds height above this node's own storey; _setNodeHeight
+      // is the single place that turns that into absolute z.
+      this._setNodeHeight(node, this._fromHeight(parseFloat(row.querySelector('.rb-z').value) || 0));
     });
     this._warnOnDuplicateIds();
   }
@@ -764,16 +845,12 @@ export class RoomBuilderTab {
           // ground-floor height after being moved upstairs. z is measured from
           // the FIRST floor, so moving between storeys has to move z too or the
           // node silently ends up inside the ceiling below.
-          // Keep the height the person measured. The Z field is relative to
-          // the node's own storey, so moving upstairs must move the absolute
-          // z by the difference in storey elevations or the node would stay
-          // at ground-floor height with a second-floor label.
-          const prev = this._elevationOf(this._floorOf(node));
-          const next = this._elevationOf(Number(floorSel.value));
+          // Keep the height the person measured: read it against the OLD
+          // storey, change storey, write it back against the NEW one. The
+          // elevation is applied by _setNodeHeight and nowhere else.
+          const rel = this._nodeHeight(node);
           node.floor = Number(floorSel.value);
-          if (Number.isFinite(node.z)) {
-            node.z = Math.round((node.z - prev + next) * 10000) / 10000;
-          }
+          this._setNodeHeight(node, rel);
           this._renderNodeList();
           this._render();
         });

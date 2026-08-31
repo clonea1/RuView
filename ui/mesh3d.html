@@ -78,6 +78,13 @@
 <header>
   <h1>RF Distance Map</h1>
   <div class="sub">Laid out by signal isolation, not geometry. Drag to orbit, scroll to zoom.</div>
+  <div style="margin:8px 0 4px;">
+    <button id="vTop">Top &mdash; N up</button>
+    <button id="vNorth">Look north</button>
+    <button id="vWest">Look west</button>
+    <button id="vIso">Isometric</button>
+    <span class="sub" style="margin-left:10px;">presets match the floor plan: east is right, south is down</span>
+  </div>
 </header>
 
 <div class="wrap">
@@ -138,14 +145,22 @@ var M2F = 3.28084;
 //
 // Unknown nodes still get MDS, anchored against the known ones -- which is
 // what a newly plugged-in board looks like before it has been surveyed.
+// Room space is x=east, y=south, z=up. The projector below treats y as the
+// VERTICAL screen axis and rotates azimuth in the x-z plane, so surveyed
+// positions have to be remapped or the building is drawn lying on its side --
+// north-south pointing at the ceiling, and no amount of orbiting can align it
+// to the real house. Swapping here rather than in project() keeps MDS output
+// (which has no meaningful orientation anyway) in the same convention.
+function toView(east, south, up){ return {x: east, y: up, z: south}; }
+
 function truthPos(id){
   if (!truth) return null;
   if (id === 'AP') {
     var a = truth.ap_position;
-    return a ? {x:a[0]*M2F, y:a[1]*M2F, z:a[2]*M2F} : null;
+    return a ? toView(a[0]*M2F, a[1]*M2F, a[2]*M2F) : null;
   }
   var n = (truth.nodes || []).filter(function(x){ return String(x.id) === String(id); })[0];
-  return n ? {x:n.x*M2F, y:n.y*M2F, z:n.z*M2F} : null;
+  return n ? toView(n.x*M2F, n.y*M2F, n.z*M2F) : null;
 }
 function trueFeet(a, b){
   var A = truthPos(a), B = truthPos(b);
@@ -317,6 +332,20 @@ function recompute(){
     }
   }
 
+  // Re-centre on the whole layout.
+  //
+  // layout() centres the MDS cloud, but anchoring then overwrites nodes with
+  // RAW room coordinates, which run 0..44 ft from the north-west corner. Since
+  // project() rotates about the origin, the building ended up orbiting a point
+  // at its own corner -- outside the house -- which reads as "it picks an
+  // anchor and pivots around that". Once every node is surveyed, every node is
+  // overwritten, so the centring done inside layout() is entirely discarded.
+  var cc = {x:0, y:0, z:0}, ck = ids.length || 1;
+  ids.forEach(function(id){ cc.x += pos[id].x; cc.y += pos[id].y; cc.z += pos[id].z; });
+  ids.forEach(function(id){
+    pos[id].x -= cc.x/ck; pos[id].y -= cc.y/ck; pos[id].z -= cc.z/ck;
+  });
+
   var rows = '<tr><td>pair</td><td class="n">true</td><td class="n">rf</td><td class="n">excess</td></tr>';
   pairs.sort(function(a,b){
     return (b.ratio || 0) - (a.ratio || 0);
@@ -468,6 +497,15 @@ document.getElementById('auto').onclick = function(){
   }
   note.innerHTML = msg;
 };
+
+// Fixed viewpoints. Orbiting from an arbitrary angle to a recognisable one is
+// fiddly, and the whole point of the surveyed layout is that it CAN be matched
+// to the real building -- so give it known orientations to snap to.
+function setView(a, e2){ az = a; el = e2; zoom = 1; draw(); }
+document.getElementById('vTop').onclick   = function(){ setView(0, 1.4); };
+document.getElementById('vNorth').onclick = function(){ setView(0, 0.12); };
+document.getElementById('vWest').onclick  = function(){ setView(Math.PI/2, 0.12); };
+document.getElementById('vIso').onclick   = function(){ setView(0.6, 0.4); };
 
 cv.addEventListener('mousedown', function(e){ drag = {x:e.clientX, y:e.clientY}; });
 window.addEventListener('mouseup', function(){ drag = null; });
