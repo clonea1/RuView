@@ -20,11 +20,16 @@ const NODE_RADIUS = 9;
 const AP_RADIUS = 8;
 const LIVE_DOT_RADIUS = 8;
 const METERS_PER_FOOT = 0.3048;
+const METERS_PER_INCH = 0.0254;
+// Typical residential defaults, used when a storey is first added.
+const DEFAULT_CEILING_IN = 96;    // 8 ft
+const DEFAULT_SUBFLOOR_IN = 16;   // joists + subfloor between storeys
 const UNITS_STORAGE_KEY = 'roombuilder-units';
-// Default storey geometry when adding a floor, in metres. Typical UK/US
-// residential: ~2.7 m ceiling, ~0.3 m of joist and subfloor between storeys.
-const DEFAULT_CEILING_M = 2.7;
-const DEFAULT_STOREY_PITCH_M = 3.0;
+// Derived from the inch figures above so there is one source of truth for a
+// default storey; a second one in metres drifted from it the moment ceiling
+// height became an input rather than a constant.
+const DEFAULT_CEILING_M = DEFAULT_CEILING_IN * METERS_PER_INCH;
+const DEFAULT_SUBFLOOR_M = DEFAULT_SUBFLOOR_IN * METERS_PER_INCH;
 // Click within this many pixels of a wall endpoint to grab it.
 const WALL_HIT_PX = 7;
 
@@ -60,7 +65,7 @@ export class RoomBuilderTab {
     this._unsubSensingData = null;
     // Display-only - this.config always stays in meters (that's what the
     // server/API/saved file use); only input values and labels convert.
-    this._units = 'metric';
+    this._units = 'imperial';
     try {
       const saved = localStorage.getItem(UNITS_STORAGE_KEY);
       if (saved === 'metric' || saved === 'imperial') this._units = saved;
@@ -79,6 +84,71 @@ export class RoomBuilderTab {
 
   _unitLabel() {
     return this._units === 'imperial' ? 'ft' : 'm';
+  }
+
+  /** Heights are entered in INCHES when imperial, not feet.
+   *
+   * A person siting a node measures "the outlet is 20 inches" and "the
+   * ceiling is 8 foot". Forcing one unit on both means every height becomes a
+   * conversion done by hand, and a conversion done nine times is one done
+   * wrong at least once. Plan distances stay in feet, where feet are natural.
+   */
+  _toHeight(meters) {
+    return this._units === 'imperial' ? meters / METERS_PER_INCH : meters;
+  }
+
+  _fromHeight(value) {
+    return this._units === 'imperial' ? value * METERS_PER_INCH : value;
+  }
+
+  _heightLabel() {
+    return this._units === 'imperial' ? 'in' : 'm';
+  }
+
+  /** Derived elevation of a storey's floor surface above the origin.
+   *
+   * Not measured, and not editable: nobody can put a tape on the height of a
+   * second floor above a first. It is the running sum of the ceiling height
+   * and subfloor thickness of every storey below, both of which a person can
+   * actually measure or look up.
+   */
+  _derivedElevation(level) {
+    const floors = this._floors();
+    let z = 0;
+    for (const f of floors) {
+      if (f.level >= level) break;
+      z += (f.ceiling_m || 0) + (f.subfloor_m || 0);
+    }
+    return Math.round(z * 10000) / 10000;
+  }
+
+  /** Recompute every storey's elevation from ceiling + subfloor, and carry
+   * anything standing on those storeys along with them.
+   *
+   * A node's stored z is absolute (height above the ground floor), but the
+   * height a person entered was relative to its own storey. If floor 1's
+   * ceiling changes, floor 2 moves, and a node 20 inches above floor 2 must
+   * stay 20 inches above floor 2 rather than staying at an absolute height
+   * that is now inside the ceiling below.
+   */
+  _reflowElevations() {
+    const before = new Map(this._floors().map((f) => [f.level, this._elevationOf(f.level)]));
+    const floors = this._floors();
+    floors.forEach((f) => { f.elevation_m = this._derivedElevation(f.level); });
+    this.config.floors = floors;
+    this.config.nodes.forEach((n) => {
+      const lvl = this._floorOf(n);
+      const shift = (this._elevationOf(lvl) - (before.get(lvl) ?? 0));
+      if (Number.isFinite(n.z) && shift) n.z = Math.round((n.z + shift) * 10000) / 10000;
+    });
+    if (Array.isArray(this.config.ap_position)) {
+      const lvl = Number.isFinite(this.config.ap_floor) ? this.config.ap_floor : 1;
+      const shift = (this._elevationOf(lvl) - (before.get(lvl) ?? 0));
+      if (shift) {
+        this.config.ap_position[2] =
+          Math.round((this.config.ap_position[2] + shift) * 10000) / 10000;
+      }
+    }
   }
 
   async init() {
@@ -157,6 +227,9 @@ export class RoomBuilderTab {
         .rb-room-dims { display: flex; gap: 12px; }
         .rb-room-dims label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: #8b93a7; }
         .rb-room-dims input, .rb-node-row input { background: #0d1117; border: 1px solid #2a2f3a; border-radius: 4px; color: #e6e9ef; padding: 5px 7px; font-size: 13px; box-sizing: border-box; }
+        .rb-wall-entry { display: grid; grid-template-columns: repeat(4, 1fr) auto; gap: 6px; align-items: end; margin-top: 8px; }
+        .rb-wall-entry label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: #6b7280; }
+        .rb-wall-entry input { background: #0d1117; border: 1px solid #2a2f3a; border-radius: 4px; color: #e6e9ef; padding: 5px 6px; font-size: 13px; width: 100%; box-sizing: border-box; }
         .rb-node-row select { background: #0d1117; border: 1px solid #2a2f3a; border-radius: 4px; color: #e6e9ef; padding: 5px 4px; font-size: 13px; width: 100%; box-sizing: border-box; }
         .rb-room-dims input { width: 72px; }
         .rb-room-dims select { background: #0d1117; border: 1px solid #2a2f3a; border-radius: 4px; color: #e6e9ef; padding: 5px 7px; font-size: 13px; }
@@ -220,6 +293,18 @@ export class RoomBuilderTab {
               storey. Other storeys stay visible, faintly, so you can line one up
               with the floor below.
             </p>
+            <div class="rb-wall-entry">
+              <label><span>From X</span><input type="number" id="rbWallX1" step="0.25" value="0"></label>
+              <label><span>From Y</span><input type="number" id="rbWallY1" step="0.25" value="0"></label>
+              <label><span>To X</span><input type="number" id="rbWallX2" step="0.25" value="0"></label>
+              <label><span>To Y</span><input type="number" id="rbWallY2" step="0.25" value="0"></label>
+              <button class="rb-btn secondary" id="rbAddWall">Add</button>
+            </div>
+            <p class="rb-hint" style="margin:4px 2px 8px;">
+              Coordinates in <span class="rb-unit-label">${this._unitLabel()}</span> from the
+              north-west corner. Typing exact numbers beats dragging for a wall you
+              measured; dragging is faster for one you are eyeballing.
+            </p>
             <div id="rbWallList"></div>
           </div>
           <div class="rb-card">
@@ -232,7 +317,8 @@ export class RoomBuilderTab {
             <div class="rb-room-dims" id="rbApFields" style="${this.config.ap_position ? '' : 'display:none;'}">
               <label><span>X (<span class="rb-unit-label">${this._unitLabel()}</span>)</span> <input type="number" id="rbApX" step="0.05" value="${this._toDisplay(this.config.ap_position?.[0] ?? 0).toFixed(2)}"></label>
               <label><span>Y (<span class="rb-unit-label">${this._unitLabel()}</span>)</span> <input type="number" id="rbApY" step="0.05" value="${this._toDisplay(this.config.ap_position?.[1] ?? 0).toFixed(2)}"></label>
-              <label><span>Z (<span class="rb-unit-label">${this._unitLabel()}</span>)</span> <input type="number" id="rbApZ" step="0.05" value="${this._toDisplay(this.config.ap_position?.[2] ?? 0).toFixed(2)}"></label>
+              <label><span>Z (<span class="rb-hunit-label">${this._heightLabel()}</span>)</span> <input type="number" id="rbApZ" step="0.5" title="Height above the AP's own floor" value="${this._toHeight(this.config.ap_position?.[2] ?? 0).toFixed(1)}"></label>
+              <label><span>Floor</span> <select id="rbApFloor"></select></label>
             </div>
             <div class="rb-actions" style="margin-top:${this.config.ap_position ? '10px' : '0'};">
               <button class="rb-btn secondary" id="rbAddAp" style="${this.config.ap_position ? 'display:none;' : ''}">+ Set AP Position</button>
@@ -242,7 +328,7 @@ export class RoomBuilderTab {
           <div class="rb-card">
             <div class="rb-card-title">Sensor Nodes</div>
             <div class="rb-col-headers">
-              <span>ID</span><span>Label</span><span>X (<span class="rb-unit-label">${this._unitLabel()}</span>)</span><span>Y (<span class="rb-unit-label">${this._unitLabel()}</span>)</span><span>Z (<span class="rb-unit-label">${this._unitLabel()}</span>)</span><span>Floor</span><span></span>
+              <span>ID</span><span>Label</span><span>X (<span class="rb-unit-label">${this._unitLabel()}</span>)</span><span>Y (<span class="rb-unit-label">${this._unitLabel()}</span>)</span><span>Z (<span class="rb-hunit-label">${this._heightLabel()}</span>)</span><span>Floor</span><span></span>
             </div>
             <div id="rbNodeList"></div>
             <div class="rb-actions">
@@ -293,8 +379,39 @@ export class RoomBuilderTab {
       this._addNode();
     });
     this.container.querySelector('#rbAddAp').addEventListener('click', () => {
-      this.config.ap_position = [this.config.width_m / 2, this.config.depth_m / 2, 2.5];
+      // Default to head height on the storey currently being edited, rather
+      // than an absolute 2.5 m that would be inside the ceiling upstairs.
+      this.config.ap_floor = this._activeFloor;
+      this.config.ap_position = [
+        this.config.width_m / 2,
+        this.config.depth_m / 2,
+        Math.round((this._elevationOf(this._activeFloor) + 2.2) * 10000) / 10000,
+      ];
       this._renderApFields();
+      this._render();
+    });
+    this.container.querySelector('#rbAddWall').addEventListener('click', () => {
+      const num = (id) => parseFloat(this.container.querySelector(`#${id}`).value);
+      const x1 = this._fromDisplay(num('rbWallX1') || 0);
+      const y1 = this._fromDisplay(num('rbWallY1') || 0);
+      const x2 = this._fromDisplay(num('rbWallX2') || 0);
+      const y2 = this._fromDisplay(num('rbWallY2') || 0);
+      if (Math.hypot(x2 - x1, y2 - y1) < 0.1) {
+        toastManager.error('That wall has no length — give it a different end point.');
+        return;
+      }
+      if (!Array.isArray(this.config.walls)) this.config.walls = [];
+      const r = (v) => Math.round(v * 10000) / 10000;
+      this.config.walls.push({
+        level: this._activeFloor,
+        x1: r(x1), y1: r(y1), x2: r(x2), y2: r(y2),
+      });
+      // Chain from the end point: walls in a room almost always meet, so the
+      // next one usually starts where this one stopped.
+      this.container.querySelector('#rbWallX1').value = num('rbWallX2');
+      this.container.querySelector('#rbWallY1').value = num('rbWallY2');
+      this._renderWallList();
+      this._renderFloorControls();
       this._render();
     });
     this.container.querySelector('#rbAddFloor').addEventListener('click', () => {
@@ -357,7 +474,7 @@ export class RoomBuilderTab {
    * which is how every config written before storeys existed behaves. */
   _floors() {
     if (!Array.isArray(this.config.floors) || this.config.floors.length === 0) {
-      return [{ level: 1, name: 'First', elevation_m: 0, ceiling_m: DEFAULT_CEILING_M }];
+      return [{ level: 1, name: 'First', elevation_m: 0, ceiling_m: DEFAULT_CEILING_M, subfloor_m: DEFAULT_SUBFLOOR_M }];
     }
     return [...this.config.floors].sort((a, b) => a.level - b.level);
   }
@@ -405,6 +522,12 @@ export class RoomBuilderTab {
     this.container.querySelectorAll('.rb-unit-label').forEach((el) => {
       el.textContent = label;
     });
+    // Heights use their own unit (inches when imperial), so they have their
+    // own label class. Missing this leaves "ft" beside a field holding inches.
+    const hLabel = this._heightLabel();
+    this.container.querySelectorAll('.rb-hunit-label').forEach((el) => {
+      el.textContent = hLabel;
+    });
     this.container.querySelector('#rbWidth').value = this._toDisplay(this.config.width_m).toFixed(2);
     this.container.querySelector('#rbDepth').value = this._toDisplay(this.config.depth_m).toFixed(2);
     this._renderNodeList();
@@ -425,9 +548,38 @@ export class RoomBuilderTab {
     removeBtn.style.display = has ? '' : 'none';
     if (has) {
       const [x, y, z] = this.config.ap_position;
+      const lvl = Number.isFinite(this.config.ap_floor) ? this.config.ap_floor : 1;
       this.container.querySelector('#rbApX').value = this._toDisplay(x).toFixed(2);
       this.container.querySelector('#rbApY').value = this._toDisplay(y).toFixed(2);
-      this.container.querySelector('#rbApZ').value = this._toDisplay(z).toFixed(2);
+      // Shown as height above the AP's own storey, like every other height in
+      // this form. Storage stays absolute.
+      this.container.querySelector('#rbApZ').value =
+        this._toHeight(z - this._elevationOf(lvl)).toFixed(1);
+
+      const sel = this.container.querySelector('#rbApFloor');
+      if (sel) {
+        sel.innerHTML = this._floors()
+          .map((f) => `<option value="${f.level}" ${f.level === lvl ? 'selected' : ''}>${f.level}</option>`)
+          .join('');
+        if (!sel.dataset.wired) {
+          sel.dataset.wired = '1';
+          sel.addEventListener('change', () => {
+            // Keep the measured height: moving the AP upstairs moves its
+            // absolute z by the difference in storey elevations.
+            const prev = this._elevationOf(
+              Number.isFinite(this.config.ap_floor) ? this.config.ap_floor : 1
+            );
+            const next = this._elevationOf(Number(sel.value));
+            this.config.ap_floor = Number(sel.value);
+            if (Array.isArray(this.config.ap_position)) {
+              this.config.ap_position[2] =
+                Math.round((this.config.ap_position[2] - prev + next) * 10000) / 10000;
+            }
+            this._renderApFields();
+            this._render();
+          });
+        }
+      }
     }
   }
 
@@ -437,7 +589,9 @@ export class RoomBuilderTab {
     if (!Array.isArray(this.config.ap_position)) return;
     const x = this._fromDisplay(parseFloat(this.container.querySelector('#rbApX').value) || 0);
     const y = this._fromDisplay(parseFloat(this.container.querySelector('#rbApY').value) || 0);
-    const z = this._fromDisplay(parseFloat(this.container.querySelector('#rbApZ').value) || 0);
+    const lvl = Number.isFinite(this.config.ap_floor) ? this.config.ap_floor : 1;
+    const relZ = this._fromHeight(parseFloat(this.container.querySelector('#rbApZ').value) || 0);
+    const z = Math.round((relZ + this._elevationOf(lvl)) * 10000) / 10000;
     this.config.ap_position = [x, y, z];
   }
 
@@ -514,7 +668,10 @@ export class RoomBuilderTab {
       node.label = row.querySelector('.rb-label').value;
       node.x = this._fromDisplay(parseFloat(row.querySelector('.rb-x').value) || 0);
       node.y = this._fromDisplay(parseFloat(row.querySelector('.rb-y').value) || 0);
-      node.z = this._fromDisplay(parseFloat(row.querySelector('.rb-z').value) || 0);
+      // The field holds height above this node's own storey; storage is
+      // absolute (above the ground floor), so add the storey's elevation back.
+      const rel = this._fromHeight(parseFloat(row.querySelector('.rb-z').value) || 0);
+      node.z = Math.round((rel + this._elevationOf(this._floorOf(node))) * 10000) / 10000;
     });
     this._warnOnDuplicateIds();
   }
@@ -553,7 +710,8 @@ export class RoomBuilderTab {
         <input class="rb-label" type="text" value="${node.label || ''}" placeholder="e.g. front-right">
         <input class="rb-x" type="number" step="0.05" value="${this._toDisplay(safe(node.x)).toFixed(2)}">
         <input class="rb-y" type="number" step="0.05" value="${this._toDisplay(safe(node.y)).toFixed(2)}">
-        <input class="rb-z" type="number" step="0.05" value="${this._toDisplay(safe(node.z)).toFixed(2)}">
+        <input class="rb-z" type="number" step="0.5" title="Height above this node's own floor"
+               value="${this._toHeight(safe(node.z) - this._elevationOf(this._floorOf(node))).toFixed(1)}">
         <select class="rb-floor" title="Which storey this node is mounted on">
           ${this._floors().map((f) => `<option value="${f.level}" ${this._floorOf(node) === f.level ? 'selected' : ''}>${f.level}</option>`).join('')}
         </select>
@@ -566,10 +724,16 @@ export class RoomBuilderTab {
           // ground-floor height after being moved upstairs. z is measured from
           // the FIRST floor, so moving between storeys has to move z too or the
           // node silently ends up inside the ceiling below.
+          // Keep the height the person measured. The Z field is relative to
+          // the node's own storey, so moving upstairs must move the absolute
+          // z by the difference in storey elevations or the node would stay
+          // at ground-floor height with a second-floor label.
           const prev = this._elevationOf(this._floorOf(node));
           const next = this._elevationOf(Number(floorSel.value));
           node.floor = Number(floorSel.value);
-          if (Number.isFinite(node.z)) node.z = Math.round((node.z - prev + next) * 100) / 100;
+          if (Number.isFinite(node.z)) {
+            node.z = Math.round((node.z - prev + next) * 10000) / 10000;
+          }
           this._renderNodeList();
           this._render();
         });
@@ -677,13 +841,21 @@ export class RoomBuilderTab {
     this._render();
   }
 
-  /** Storey selector plus the elevation/ceiling of the active one. */
+  /** Storey selector, plus the two numbers a person can actually measure.
+   *
+   * Ceiling height and subfloor thickness are the inputs; elevation is
+   * derived from them and shown read-only. Nobody can put a tape measure on
+   * "height of the second floor above the first", but anyone can measure a
+   * ceiling and look up a joist depth -- and deriving it means every height
+   * elsewhere in this form is relative to the floor you are standing on.
+   */
   _renderFloorControls() {
     const host = this.container.querySelector('#rbFloorControls');
     if (!host) return;
     const floors = this._floors();
     const active = floors.find((f) => f.level === this._activeFloor) || floors[0];
     this._activeFloor = active.level;
+    const hu = this._heightLabel();
 
     const opts = floors
       .map((f) => {
@@ -695,46 +867,55 @@ export class RoomBuilderTab {
       })
       .join('');
 
-    // Floor 1 defines the origin, so its elevation is not editable: if the
-    // ground floor could float, every coordinate in the building would be
-    // silently offset. The server rejects it too.
-    const isGround = this._activeFloor === 1;
+    const elev = this._derivedElevation(active.level);
     host.innerHTML = `
       <div class="rb-room-dims">
         <label><span>Editing storey</span>
           <select id="rbFloorSelect">${opts}</select>
         </label>
-        <label><span>Floor height (<span class="rb-unit-label">${this._unitLabel()}</span>)</span>
-          <input type="number" id="rbFloorElev" step="0.05"
-                 value="${this._toDisplay(active.elevation_m).toFixed(2)}"
-                 ${isGround ? 'disabled title="The ground floor defines the origin"' : ''}></label>
-        <label><span>Ceiling (<span class="rb-unit-label">${this._unitLabel()}</span>)</span>
-          <input type="number" id="rbFloorCeil" step="0.05"
-                 value="${this._toDisplay(active.ceiling_m).toFixed(2)}"></label>
-      </div>`;
+        <label><span>Floor to ceiling (<span class="rb-hunit-label">${hu}</span>)</span>
+          <input type="number" id="rbFloorCeil" min="1" step="0.5"
+                 value="${this._toHeight(active.ceiling_m).toFixed(1)}"
+                 title="Measured floor surface to ceiling on this storey"></label>
+        <label><span>Subfloor / joists (<span class="rb-hunit-label">${hu}</span>)</span>
+          <input type="number" id="rbFloorSub" min="0" step="0.5"
+                 value="${this._toHeight(active.subfloor_m || 0).toFixed(1)}"
+                 title="Structure between this ceiling and the floor above"></label>
+      </div>
+      <p class="rb-hint" style="margin:6px 2px 0;">
+        This storey's floor sits <strong>${this._toHeight(elev).toFixed(1)} ${hu}</strong>
+        above the ground floor${active.level === 1 ? ' (it defines the origin)' : ''}.
+        Heights you enter below are measured from <em>this</em> floor, so an outlet
+        20&nbsp;${hu} up is just 20.
+      </p>`;
 
     const sel = host.querySelector('#rbFloorSelect');
     if (sel) sel.addEventListener('change', () => {
       this._activeFloor = Number(sel.value);
       this._renderFloorControls();
+      this._renderNodeList();
       this._renderWallList();
       this._render();
     });
-    const elev = host.querySelector('#rbFloorElev');
-    if (elev) elev.addEventListener('change', () => {
+
+    const commit = () => {
       const f = this._floors().find((x) => x.level === this._activeFloor);
-      if (f && !isGround) {
-        f.elevation_m = this._fromDisplay(parseFloat(elev.value) || 0);
-        this.config.floors = this._floors();
-      }
-    });
-    const ceil = host.querySelector('#rbFloorCeil');
-    if (ceil) ceil.addEventListener('change', () => {
-      const f = this._floors().find((x) => x.level === this._activeFloor);
-      if (f) {
-        f.ceiling_m = this._fromDisplay(parseFloat(ceil.value) || DEFAULT_CEILING_M);
-        this.config.floors = this._floors();
-      }
+      if (!f) return;
+      const c = parseFloat(host.querySelector('#rbFloorCeil').value);
+      const sub = parseFloat(host.querySelector('#rbFloorSub').value);
+      if (Number.isFinite(c) && c > 0) f.ceiling_m = this._fromHeight(c);
+      if (Number.isFinite(sub) && sub >= 0) f.subfloor_m = this._fromHeight(sub);
+      this.config.floors = this._floors();
+      // Changing a ceiling moves every storey above it, and everything on them.
+      this._reflowElevations();
+      this._renderFloorControls();
+      this._renderNodeList();
+      this._renderApFields();
+      this._render();
+    };
+    ['#rbFloorCeil', '#rbFloorSub'].forEach((id) => {
+      const el = host.querySelector(id);
+      if (el) el.addEventListener('change', commit);
     });
   }
 
@@ -816,15 +997,24 @@ export class RoomBuilderTab {
     const next = {
       level: top.level + 1,
       name: `Floor ${top.level + 1}`,
-      elevation_m: Math.round((top.elevation_m + DEFAULT_STOREY_PITCH_M) * 100) / 100,
-      ceiling_m: DEFAULT_CEILING_M,
+      // Placeholder; _reflowElevations derives the real value from the
+      // ceiling and subfloor of every storey below.
+      elevation_m: 0,
+      ceiling_m: top.ceiling_m || DEFAULT_CEILING_M,
+      subfloor_m: DEFAULT_SUBFLOOR_M,
     };
     // Materialise the implicit ground floor too, otherwise saving a second
     // storey would leave the first undeclared and the server would reject
     // every node on it as living on an undefined floor.
+    // A storey below with no subfloor recorded would put the new floor
+    // exactly on the old ceiling, which is never true of a real building.
+    const below = floors[floors.length - 1];
+    if (!below.subfloor_m) below.subfloor_m = DEFAULT_SUBFLOOR_M;
     this.config.floors = [...floors, next];
     this._activeFloor = next.level;
+    this._reflowElevations();
     this._renderFloorControls();
+    this._renderNodeList();
     this._render();
   }
 

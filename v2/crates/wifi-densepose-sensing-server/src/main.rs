@@ -1657,6 +1657,17 @@ pub(crate) struct Floor {
     /// Ceiling height above this storey's own floor surface (not above the
     /// origin), because that is the number a person reads off a tape measure.
     pub ceiling_m: f32,
+    /// Thickness of the structure between this storey's ceiling and the next
+    /// storey's floor surface: joists, subfloor, and any service void.
+    ///
+    /// Recorded so `elevation_m` can be DERIVED rather than measured. Nobody
+    /// can put a tape measure on the height of a second floor above a first
+    /// floor, but everyone can measure a ceiling and look up a joist depth.
+    /// Without it, siting a node meant arithmetic like "8 ft + 16 in + 20 in"
+    /// at every measurement, and arithmetic done nine times is arithmetic done
+    /// wrong at least once.
+    #[serde(default)]
+    pub subfloor_m: f32,
 }
 
 /// An interior or exterior wall segment, in plan view.
@@ -1722,6 +1733,15 @@ pub(crate) struct RoomConfig {
     /// Wall segments in plan view, tagged by storey.
     #[serde(default)]
     pub walls: Vec<Wall>,
+    /// Which storey the access point is on. `None` means the first floor.
+    ///
+    /// `ap_position` already carries an absolute z, so this is not needed for
+    /// geometry. It exists so the Room Builder can show the AP's height the
+    /// way it was measured -- above its own floor -- rather than as a total
+    /// from the ground floor, and so the AP appears on the storey it is
+    /// actually on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ap_floor: Option<i32>,
 }
 
 /// Load persisted room config from `<data_dir>/room_config.json`.
@@ -1757,13 +1777,14 @@ mod room_config_tests {
             depth_m: 10.4,
             nodes: Vec::new(),
             ap_position: None,
+            ap_floor: None,
             floors: Vec::new(),
             walls: Vec::new(),
         }
     }
 
     fn floor(level: i32, elevation_m: f32) -> Floor {
-        Floor { level, name: None, elevation_m, ceiling_m: 2.7 }
+        Floor { level, name: None, elevation_m, ceiling_m: 2.7, subfloor_m: 0.3 }
     }
 
     /// The whole coordinate system hangs off this. If floor 1 is allowed to
@@ -1824,6 +1845,61 @@ mod room_config_tests {
 
     /// Zero-length walls make any segment-intersection test degenerate rather
     /// than merely wrong, so they are rejected at the door.
+    #[test]
+    fn negative_subfloor_is_rejected() {
+        let mut c = base();
+        let mut f = floor(2, 3.0);
+        f.subfloor_m = -0.1;
+        c.floors = vec![floor(1, 0.0), f];
+        assert!(validate_room_config(&c).unwrap_err().contains("subfloor_m"));
+    }
+
+    /// A flat slab between storeys is legitimate (a concrete floor), so zero
+    /// must be allowed even though negative is not.
+    #[test]
+    fn zero_subfloor_is_allowed() {
+        let mut c = base();
+        let mut f = floor(2, 3.0);
+        f.subfloor_m = 0.0;
+        c.floors = vec![floor(1, 0.0), f];
+        assert!(validate_room_config(&c).is_ok());
+    }
+
+    #[test]
+    fn ap_cannot_be_on_an_undeclared_floor() {
+        let mut c = base();
+        c.floors = vec![floor(1, 0.0)];
+        c.ap_position = Some([2.0, 2.0, 2.2]);
+        c.ap_floor = Some(3);
+        assert!(validate_room_config(&c).unwrap_err().contains("ap_floor"));
+        c.ap_floor = Some(1);
+        assert!(validate_room_config(&c).is_ok());
+    }
+
+    /// Elevations are derived in the UI from ceiling + subfloor, so the
+    /// arithmetic that produces them has to survive a round trip intact --
+    /// otherwise every height on the upper storey silently shifts.
+    #[test]
+    fn ceiling_and_subfloor_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = base();
+        let mut f1 = floor(1, 0.0);
+        f1.ceiling_m = 2.44;   // 8 ft
+        f1.subfloor_m = 0.41;  // 16 in
+        let mut f2 = floor(2, 2.85);
+        f2.ceiling_m = 2.44;
+        f2.subfloor_m = 0.0;
+        c.floors = vec![f1, f2];
+        save_room_config(dir.path(), &c);
+        let loaded = load_room_config(dir.path());
+        assert!((loaded.floors[0].ceiling_m - 2.44).abs() < 1e-6);
+        assert!((loaded.floors[0].subfloor_m - 0.41).abs() < 1e-6);
+        // floor 2 sits at floor 1's ceiling plus its structure
+        let derived = loaded.floors[0].ceiling_m + loaded.floors[0].subfloor_m;
+        assert!((loaded.floors[1].elevation_m - derived).abs() < 1e-6,
+                "elevation must equal ceiling + subfloor of the storey below");
+    }
+
     #[test]
     fn zero_length_walls_are_rejected() {
         let mut c = base();
@@ -1899,6 +1975,7 @@ mod room_config_tests {
                 RoomNode { id: 1, x: 3.66, y: 0.0, z: 0.4, floor: None, label: None },
             ],
             ap_position: Some([2.5, -1.0, 2.2]),
+            ap_floor: None,
         floors: Vec::new(),
         walls: Vec::new(),
         };
@@ -1936,6 +2013,7 @@ mod room_config_tests {
                 RoomNode { id: 1, x: 3.66, y: 0.0, z: 0.4, floor: None, label: None },
             ],
             ap_position: None,
+            ap_floor: None,
         floors: Vec::new(),
         walls: Vec::new(),
         }
@@ -13152,6 +13230,12 @@ pub(crate) fn validate_room_config(config: &RoomConfig) -> Result<(), String> {
         if f.ceiling_m <= 0.0 {
             return Err(format!("floor {} ceiling_m must be positive", f.level));
         }
+        if !f.subfloor_m.is_finite() || f.subfloor_m < 0.0 {
+            return Err(format!(
+                "floor {} subfloor_m must be zero or positive",
+                f.level
+            ));
+        }
         // Level 1 defines the origin, so it cannot float. Catching this here
         // stops a plan whose every coordinate is silently offset.
         if f.level == 1 && f.elevation_m != 0.0 {
@@ -13182,6 +13266,14 @@ pub(crate) fn validate_room_config(config: &RoomConfig) -> Result<(), String> {
             let lvl = n.floor.unwrap_or(1);
             if !levels.contains(&lvl) {
                 return Err(format!("node {} is on undefined floor {}", n.id, lvl));
+            }
+        }
+    }
+
+    if !config.floors.is_empty() {
+        if let Some(lvl) = config.ap_floor {
+            if !levels.contains(&lvl) {
+                return Err(format!("ap_floor {lvl} is not a declared floor"));
             }
         }
     }
