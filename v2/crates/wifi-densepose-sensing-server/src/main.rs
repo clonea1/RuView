@@ -1790,6 +1790,38 @@ mod room_config_tests {
     /// The whole coordinate system hangs off this. If floor 1 is allowed to
     /// float, every node coordinate in the building is silently offset and
     /// nothing downstream can detect it.
+    /// Every field on RoomConfig must survive the GET response.
+    ///
+    /// The response used to be built field-by-field, and twice that list fell
+    /// behind the struct: floors/walls, then ap_floor. Both were saved fine
+    /// and lost on the way out, which looks exactly like a setting that will
+    /// not stick. Serialising the struct fixes it; this pins it so a future
+    /// field cannot silently go missing again.
+    #[test]
+    fn every_room_config_field_survives_serialisation() {
+        let mut c = base();
+        c.floors = vec![floor(1, 0.0), floor(2, 3.0)];
+        c.walls = vec![Wall {
+            level: 1, x1: 0.0, y1: 0.0, x2: 4.0, y2: 0.0,
+            height_m: Some(2.4), kind: Some("interior".into()),
+        }];
+        c.ap_position = Some([2.0, 3.0, 2.4]);
+        c.ap_floor = Some(2);
+        c.nodes = vec![RoomNode {
+            id: 1, x: 1.0, y: 1.0, z: 3.5, floor: Some(2), label: Some("kids".into()),
+        }];
+
+        let v = serde_json::to_value(&c).expect("serialises");
+        for key in ["width_m", "depth_m", "nodes", "ap_position", "ap_floor",
+                    "floors", "walls"] {
+            assert!(v.get(key).is_some(), "GET response is missing `{key}`");
+        }
+        // And the nested optionals that were also dropped at various points.
+        assert!(v["nodes"][0].get("floor").is_some(), "node.floor missing");
+        assert!(v["walls"][0].get("kind").is_some(), "wall.kind missing");
+        assert!(v["floors"][0].get("subfloor_m").is_some(), "floor.subfloor_m missing");
+    }
+
     #[test]
     fn first_floor_must_sit_at_the_origin() {
         let mut c = base();
@@ -1898,6 +1930,56 @@ mod room_config_tests {
         let derived = loaded.floors[0].ceiling_m + loaded.floors[0].subfloor_m;
         assert!((loaded.floors[1].elevation_m - derived).abs() < 1e-6,
                 "elevation must equal ceiling + subfloor of the storey below");
+    }
+
+    /// The AP must never be attributed to a node.
+    ///
+    /// MEASURED 2026-08-31: the hearing-set heuristic infers "a MAC heard by
+    /// every receiver except one belongs to that one". When a single node's AP
+    /// link aged out of the rolling window, exactly one receiver was missing
+    /// from the AP's hearing set, so all nine AP links were reattributed to
+    /// that node — the mesh view's AP column blinked out, and the geometry
+    /// code would have placed the AP's transmissions at that node's position.
+    #[test]
+    fn a_known_fleet_never_guesses_the_transmitter() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let ap = [0x8c, 0x30, 0x66, 0x86, 0xa4, 0x21];
+        let n5 = [0xe8, 0xf6, 0x0a, 0xfc, 0xfb, 0x6c];
+
+        let mut node_macs = HashMap::new();
+        node_macs.insert(n5, 5u8);
+
+        // Eight of nine receivers hear the AP: exactly the shape that fooled
+        // the heuristic into naming the ninth as the transmitter.
+        let receivers: BTreeSet<u8> = (0..9u8).collect();
+        let mut heard: BTreeMap<[u8; 6], BTreeSet<u8>> = BTreeMap::new();
+        heard.insert(ap, (0..9u8).filter(|n| *n != 5).collect());
+
+        assert_eq!(
+            attribute_transmitter(&ap, &node_macs, &receivers, &heard),
+            None,
+            "the AP is not one of our nodes and must stay unattributed"
+        );
+        assert_eq!(
+            attribute_transmitter(&n5, &node_macs, &receivers, &heard),
+            Some(5),
+            "a MAC a node reported for itself is attributed to that node"
+        );
+    }
+
+    /// Before any node has reported a MAC — a fleet entirely on pre-v2
+    /// firmware — the heuristic is still better than nothing.
+    #[test]
+    fn an_unknown_fleet_still_falls_back_to_the_heuristic() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let peer = [1, 2, 3, 4, 5, 6];
+        let receivers: BTreeSet<u8> = (0..3u8).collect();
+        let mut heard: BTreeMap<[u8; 6], BTreeSet<u8>> = BTreeMap::new();
+        heard.insert(peer, [0u8, 1].into_iter().collect());
+        assert_eq!(
+            attribute_transmitter(&peer, &HashMap::new(), &receivers, &heard),
+            Some(2)
+        );
     }
 
     #[test]
@@ -9240,9 +9322,8 @@ async fn links_endpoint(State(state): State<SharedState>) -> Json<serde_json::Va
     let rows: Vec<serde_json::Value> = metrics
         .iter()
         .map(|m| {
-            let tx_node = s.node_macs.get(&m.id.tx_mac).copied().or_else(|| {
-                links::infer_transmitting_node(&m.id.tx_mac, &receivers, &heard_by)
-            });
+            let tx_node =
+                attribute_transmitter(&m.id.tx_mac, &s.node_macs, &receivers, &heard_by);
             serde_json::json!({
                 "rx_node": m.id.rx_node,
                 "tx_mac": format!(
@@ -9332,9 +9413,8 @@ fn rti_from_links(
         // Transmitter: known outright when the node reported its own MAC,
         // otherwise the old hearing-set inference for nodes still on older
         // firmware, otherwise assumed to be the configured AP.
-        let tx_node = s.node_macs.get(&m.id.tx_mac).copied().or_else(|| {
-            links::infer_transmitting_node(&m.id.tx_mac, receivers, heard_by)
-        });
+        let tx_node =
+            attribute_transmitter(&m.id.tx_mac, &s.node_macs, receivers, heard_by);
         let tx = match tx_node {
             Some(id) => match s.node_positions_config.get(&id) {
                 Some(p) => [p[0] as f64, p[1] as f64],
@@ -12844,6 +12924,7 @@ mod sync_snapshot_helper_tests {
             local_us: 28_798_450,
             epoch_us: 27_634_885,
             sequence: 20,
+            node_mac: None,
             health: wifi_densepose_hardware::NodeHealth::default(),
         }
     }
@@ -13203,25 +13284,27 @@ async fn config_get_room(State(state): State<SharedState>) -> Json<serde_json::V
             }
         })
         .collect();
-    Json(serde_json::json!({
-        "width_m": saved.width_m,
-        "depth_m": saved.depth_m,
-        "nodes": nodes,
-        "ap_position": s.ap_position,
-        // Storeys, walls and the AP's storey are pure geometry with no live
-        // counterpart in memory, so they are served straight from the
-        // persisted config.
-        //
-        // ap_floor was missing here while being saved correctly, which looked
-        // exactly like "the setting will not stick": the round trip lost it on
-        // the way OUT, so the UI defaulted to floor 1 and then displayed the
-        // AP's absolute height as if it were measured from the ground floor.
-        // Any field added to RoomConfig has to be added here too — this list
-        // is hand-maintained and will not complain when it falls behind.
-        "floors": saved.floors,
-        "walls": saved.walls,
-        "ap_floor": saved.ap_floor,
-    }))
+    // Serialise the RoomConfig struct instead of listing fields by hand.
+    //
+    // This response was assembled field-by-field, and twice that list silently
+    // fell behind the model: `floors`/`walls` when storeys were added, then
+    // `ap_floor`. Both were SAVED correctly and dropped on the way out, which
+    // presents as "the setting will not stick" while the data on disk is
+    // perfectly fine — close to the most misleading failure available, and it
+    // cost real debugging time twice.
+    //
+    // Through serde, a new field on RoomConfig appears here automatically.
+    // Only the values that come from live memory are overlaid.
+    let cfg = RoomConfig {
+        width_m: saved.width_m,
+        depth_m: saved.depth_m,
+        nodes,
+        ap_position: s.ap_position,
+        ap_floor: saved.ap_floor,
+        floors: saved.floors,
+        walls: saved.walls,
+    };
+    Json(serde_json::to_value(&cfg).unwrap_or_else(|_| serde_json::json!({})))
 }
 
 /// `POST /api/v1/config/room` — set room geometry + node positions from the
@@ -13425,6 +13508,37 @@ async fn node_calibrate(ip: std::net::IpAddr, psk: &str) -> Result<(), String> {
 ///
 /// Addresses are learned from inbound CSI, so a node that has never delivered
 /// is reported unreachable rather than silently skipped.
+/// Which of our nodes transmitted a frame, or `None` for anything else.
+///
+/// Once ANY node has reported its own MAC (sync proto v2+), `node_macs` is a
+/// complete and authoritative answer: a MAC that is not in it is not one of
+/// ours. The old hearing-set heuristic is then not merely redundant but
+/// actively wrong, and it fails on the most important transmitter in the
+/// building.
+///
+/// MEASURED 2026-08-31: the heuristic infers "a MAC heard by every receiver
+/// except one belongs to that one". Whenever a single node's AP link aged out
+/// of the rolling window, exactly one receiver was missing from the AP's
+/// hearing set, so all nine of the AP's links were reattributed to that node.
+/// The mesh view showed the AP column blinking out; worse, `rti_from_links`
+/// would have placed the AP's transmissions at that node's coordinates and
+/// corrupted the geometry.
+///
+/// The heuristic survives only for a fleet where nothing has reported a MAC
+/// yet — every node on pre-v2 firmware — which is the case it was written for
+/// and the only one where a guess beats nothing.
+fn attribute_transmitter(
+    tx_mac: &[u8; 6],
+    node_macs: &HashMap<[u8; 6], u8>,
+    receivers: &std::collections::BTreeSet<u8>,
+    heard_by: &std::collections::BTreeMap<[u8; 6], std::collections::BTreeSet<u8>>,
+) -> Option<u8> {
+    if !node_macs.is_empty() {
+        return node_macs.get(tx_mac).copied();
+    }
+    links::infer_transmitting_node(tx_mac, receivers, heard_by)
+}
+
 async fn config_calibrate(
     State(state): State<SharedState>,
     body: Option<Json<serde_json::Value>>,
