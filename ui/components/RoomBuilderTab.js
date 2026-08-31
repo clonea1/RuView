@@ -21,6 +21,12 @@ const AP_RADIUS = 8;
 const LIVE_DOT_RADIUS = 8;
 const METERS_PER_FOOT = 0.3048;
 const UNITS_STORAGE_KEY = 'roombuilder-units';
+// Default storey geometry when adding a floor, in metres. Typical UK/US
+// residential: ~2.7 m ceiling, ~0.3 m of joist and subfloor between storeys.
+const DEFAULT_CEILING_M = 2.7;
+const DEFAULT_STOREY_PITCH_M = 3.0;
+// Click within this many pixels of a wall endpoint to grab it.
+const WALL_HIT_PX = 7;
 
 export class RoomBuilderTab {
   /** @param {HTMLElement} container - the #roombuilder section element */
@@ -29,6 +35,15 @@ export class RoomBuilderTab {
     this.config = { width_m: 5, depth_m: 4, nodes: [], ap_position: null };
     this._dragIndex = null;
     this._draggingAp = false;
+    // Which storey the canvas is editing. Nodes and walls on other storeys
+    // are drawn faintly rather than hidden, so you can line up a second-floor
+    // node with the wall below it -- which is the whole point of stacking
+    // storeys on a shared origin.
+    this._activeFloor = 1;
+    // 'select' drags nodes and the AP; 'wall' draws segments.
+    this._mode = 'select';
+    this._wallStart = null;
+    this._wallPreview = null;
     this._loaded = false;
     // Live tracked-position overlay, fed by sensingService (/ws/sensing).
     // `_liveDot` is only ever set from a "bistatic_velocity", "doppler_centroid",
@@ -142,9 +157,10 @@ export class RoomBuilderTab {
         .rb-room-dims { display: flex; gap: 12px; }
         .rb-room-dims label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: #8b93a7; }
         .rb-room-dims input, .rb-node-row input { background: #0d1117; border: 1px solid #2a2f3a; border-radius: 4px; color: #e6e9ef; padding: 5px 7px; font-size: 13px; box-sizing: border-box; }
+        .rb-node-row select { background: #0d1117; border: 1px solid #2a2f3a; border-radius: 4px; color: #e6e9ef; padding: 5px 4px; font-size: 13px; width: 100%; box-sizing: border-box; }
         .rb-room-dims input { width: 72px; }
         .rb-room-dims select { background: #0d1117; border: 1px solid #2a2f3a; border-radius: 4px; color: #e6e9ef; padding: 5px 7px; font-size: 13px; }
-        .rb-node-row { display: grid; grid-template-columns: 42px 1fr 60px 60px 60px 1fr 24px; gap: 6px; align-items: center; margin-bottom: 6px; }
+        .rb-node-row { display: grid; grid-template-columns: 42px 1fr 60px 60px 60px 52px 24px; gap: 6px; align-items: center; margin-bottom: 6px; }
         .rb-node-row input { width: 100%; }
         .rb-node-row .rb-id { color: #32b8c6; font-weight: 600; font-size: 13px; }
         /* Number inputs' native up/down spinner eats most of the width in
@@ -158,7 +174,7 @@ export class RoomBuilderTab {
         .rb-btn.secondary { background: transparent; color: #32b8c6; border: 1px solid #32b8c6; }
         .rb-actions { display: flex; gap: 10px; margin-top: 8px; }
         .rb-hint { color: #6b7280; font-size: 12px; margin-top: 8px; line-height: 1.5; }
-        .rb-col-headers { display: grid; grid-template-columns: 42px 1fr 60px 60px 60px 1fr 24px; gap: 6px; font-size: 11px; color: #6b7280; margin-bottom: 6px; }
+        .rb-col-headers { display: grid; grid-template-columns: 42px 1fr 60px 60px 60px 52px 24px; gap: 6px; font-size: 11px; color: #6b7280; margin-bottom: 6px; }
       </style>
       <h2>Room Builder</h2>
       <p class="rb-hint" style="margin-bottom:16px;">
@@ -186,6 +202,27 @@ export class RoomBuilderTab {
             </div>
           </div>
           <div class="rb-card">
+            <div class="rb-card-title">Storeys &amp; Walls</div>
+            <p class="rb-hint" style="margin-top:0;">
+              The origin (0,&nbsp;0,&nbsp;0) is the <strong>north-west corner of the
+              first floor</strong>, at floor level. Every storey shares it — the
+              second floor is not re-zeroed — so a node's X/Y means the same
+              thing on any storey and Z is height above the ground floor.
+            </p>
+            <div id="rbFloorControls"></div>
+            <div class="rb-actions" style="margin-top:10px;">
+              <button class="rb-btn secondary" id="rbAddFloor">+ Add Storey</button>
+              <button class="rb-btn secondary" id="rbRemoveFloor">Remove Top Storey</button>
+              <button class="rb-btn secondary" id="rbWallMode">Draw Walls</button>
+            </div>
+            <p class="rb-hint" id="rbWallHint" style="margin-bottom:6px;">
+              In wall mode, drag on the canvas to draw a segment on the selected
+              storey. Other storeys stay visible, faintly, so you can line one up
+              with the floor below.
+            </p>
+            <div id="rbWallList"></div>
+          </div>
+          <div class="rb-card">
             <div class="rb-card-title">Access Point</div>
             <p class="rb-hint" style="margin-top:0;">
               Optional — needed for Doppler-based position geometry. One AP,
@@ -205,7 +242,7 @@ export class RoomBuilderTab {
           <div class="rb-card">
             <div class="rb-card-title">Sensor Nodes</div>
             <div class="rb-col-headers">
-              <span>ID</span><span>Label</span><span>X (<span class="rb-unit-label">${this._unitLabel()}</span>)</span><span>Y (<span class="rb-unit-label">${this._unitLabel()}</span>)</span><span>Z (<span class="rb-unit-label">${this._unitLabel()}</span>)</span><span></span><span></span>
+              <span>ID</span><span>Label</span><span>X (<span class="rb-unit-label">${this._unitLabel()}</span>)</span><span>Y (<span class="rb-unit-label">${this._unitLabel()}</span>)</span><span>Z (<span class="rb-unit-label">${this._unitLabel()}</span>)</span><span>Floor</span><span></span>
             </div>
             <div id="rbNodeList"></div>
             <div class="rb-actions">
@@ -260,6 +297,29 @@ export class RoomBuilderTab {
       this._renderApFields();
       this._render();
     });
+    this.container.querySelector('#rbAddFloor').addEventListener('click', () => {
+      this._addFloor();
+    });
+    this.container.querySelector('#rbRemoveFloor').addEventListener('click', () => {
+      this._removeTopFloor();
+    });
+    this.container.querySelector('#rbWallMode').addEventListener('click', (e) => {
+      this._mode = this._mode === 'wall' ? 'select' : 'wall';
+      // Abandon a half-drawn segment rather than leaving it to commit on the
+      // next unrelated click.
+      this._wallStart = null;
+      this._wallPreview = null;
+      e.target.textContent = this._mode === 'wall' ? 'Done Drawing' : 'Draw Walls';
+      const canvas = this.container.querySelector('#rbCanvas');
+      if (canvas) canvas.style.cursor = this._mode === 'wall' ? 'crosshair' : 'default';
+      const hint = this.container.querySelector('#rbWallHint');
+      if (hint) {
+        hint.textContent = this._mode === 'wall'
+          ? 'Drag on the canvas to draw a wall on the selected storey. Dragging no longer moves nodes.'
+          : 'In wall mode, drag on the canvas to draw a segment on the selected storey. Other storeys stay visible, faintly, so you can line one up with the floor below.';
+      }
+      this._render();
+    });
     this.container.querySelector('#rbRemoveAp').addEventListener('click', () => {
       this.config.ap_position = null;
       this._renderApFields();
@@ -282,10 +342,34 @@ export class RoomBuilderTab {
     const canvas = this.container.querySelector('#rbCanvas');
     canvas.addEventListener('mousedown', (e) => this._onCanvasDown(e));
     canvas.addEventListener('mousemove', (e) => this._onCanvasMove(e));
-    window.addEventListener('mouseup', () => { this._dragIndex = null; this._draggingAp = false; });
+    window.addEventListener('mouseup', (e) => {
+      if (this._mode === 'wall' && this._wallStart) {
+        this._commitWall(e);
+      }
+      this._dragIndex = null;
+      this._draggingAp = false;
+    });
   }
 
   // ---- Data -----------------------------------------------------------------
+
+  /** Storeys, ascending. An empty list means a single implicit ground floor,
+   * which is how every config written before storeys existed behaves. */
+  _floors() {
+    if (!Array.isArray(this.config.floors) || this.config.floors.length === 0) {
+      return [{ level: 1, name: 'First', elevation_m: 0, ceiling_m: DEFAULT_CEILING_M }];
+    }
+    return [...this.config.floors].sort((a, b) => a.level - b.level);
+  }
+
+  _floorOf(node) {
+    return Number.isFinite(node.floor) ? node.floor : 1;
+  }
+
+  _elevationOf(level) {
+    const f = this._floors().find((x) => x.level === level);
+    return f ? f.elevation_m : 0;
+  }
 
   async _load() {
     try {
@@ -308,6 +392,14 @@ export class RoomBuilderTab {
   /** Re-render everything that shows a unit-dependent value, using the
    * current `this._units` - called on load and whenever the unit toggle
    * changes. `this.config` itself never changes here; only what's displayed. */
+  /** Re-render every panel that depends on the loaded config. Called from the
+   * same places as _renderNodeList, so storeys and walls cannot drift out of
+   * sync with what was loaded or saved. */
+  _renderStoreyPanels() {
+    this._renderFloorControls();
+    this._renderWallList();
+  }
+
   _refreshUnitDisplay() {
     const label = this._unitLabel();
     this.container.querySelectorAll('.rb-unit-label').forEach((el) => {
@@ -316,6 +408,7 @@ export class RoomBuilderTab {
     this.container.querySelector('#rbWidth').value = this._toDisplay(this.config.width_m).toFixed(2);
     this.container.querySelector('#rbDepth').value = this._toDisplay(this.config.depth_m).toFixed(2);
     this._renderNodeList();
+    this._renderStoreyPanels();
     this._renderApFields();
     this._render();
   }
@@ -389,12 +482,14 @@ export class RoomBuilderTab {
       label: '',
     });
     this._renderNodeList();
+    this._renderStoreyPanels();
     this._render();
   }
 
   _removeNode(index) {
     this.config.nodes.splice(index, 1);
     this._renderNodeList();
+    this._renderStoreyPanels();
     this._render();
   }
 
@@ -459,9 +554,26 @@ export class RoomBuilderTab {
         <input class="rb-x" type="number" step="0.05" value="${this._toDisplay(safe(node.x)).toFixed(2)}">
         <input class="rb-y" type="number" step="0.05" value="${this._toDisplay(safe(node.y)).toFixed(2)}">
         <input class="rb-z" type="number" step="0.05" value="${this._toDisplay(safe(node.z)).toFixed(2)}">
-        <span></span>
+        <select class="rb-floor" title="Which storey this node is mounted on">
+          ${this._floors().map((f) => `<option value="${f.level}" ${this._floorOf(node) === f.level ? 'selected' : ''}>${f.level}</option>`).join('')}
+        </select>
         <button class="rb-remove-btn" title="Remove node">&times;</button>
       `;
+      const floorSel = row.querySelector('.rb-floor');
+      if (floorSel) {
+        floorSel.addEventListener('change', () => {
+          // Store the storey, and lift z onto it so the node does not stay at
+          // ground-floor height after being moved upstairs. z is measured from
+          // the FIRST floor, so moving between storeys has to move z too or the
+          // node silently ends up inside the ceiling below.
+          const prev = this._elevationOf(this._floorOf(node));
+          const next = this._elevationOf(Number(floorSel.value));
+          node.floor = Number(floorSel.value);
+          if (Number.isFinite(node.z)) node.z = Math.round((node.z - prev + next) * 100) / 100;
+          this._renderNodeList();
+          this._render();
+        });
+      }
       row.querySelectorAll('input').forEach((inp) => {
         inp.addEventListener('input', () => {
           this._syncNodesFromInputs();
@@ -512,6 +624,16 @@ export class RoomBuilderTab {
 
   _onCanvasDown(e) {
     const pos = this._canvasPos(e);
+
+    if (this._mode === 'wall') {
+      // Walls are not clamped to the room rectangle. width_m/depth_m describe
+      // the sensed area, and an exterior wall is legitimately on or slightly
+      // outside that boundary.
+      const room = this._toRoom(pos.x, pos.y, { clamp: false });
+      this._wallStart = { x: room.x, y: room.y };
+      this._wallPreview = { x: pos.x, y: pos.y };
+      return;
+    }
     if (Array.isArray(this.config.ap_position)) {
       const { px, py } = this._toPixel(this.config.ap_position[0], this.config.ap_position[1]);
       if (Math.hypot(px - pos.x, py - pos.y) <= AP_RADIUS + 4) {
@@ -528,6 +650,12 @@ export class RoomBuilderTab {
   }
 
   _onCanvasMove(e) {
+    if (this._mode === 'wall' && this._wallStart) {
+      const pos = this._canvasPos(e);
+      this._wallPreview = { x: pos.x, y: pos.y };
+      this._render();
+      return;
+    }
     if (this._draggingAp) {
       const pos = this._canvasPos(e);
       const room = this._toRoom(pos.x, pos.y, { clamp: false });
@@ -545,6 +673,188 @@ export class RoomBuilderTab {
     node.x = Math.round(room.x * 100) / 100;
     node.y = Math.round(room.y * 100) / 100;
     this._renderNodeList();
+    this._renderStoreyPanels();
+    this._render();
+  }
+
+  /** Storey selector plus the elevation/ceiling of the active one. */
+  _renderFloorControls() {
+    const host = this.container.querySelector('#rbFloorControls');
+    if (!host) return;
+    const floors = this._floors();
+    const active = floors.find((f) => f.level === this._activeFloor) || floors[0];
+    this._activeFloor = active.level;
+
+    const opts = floors
+      .map((f) => {
+        const nodes = this.config.nodes.filter((n) => this._floorOf(n) === f.level).length;
+        const walls = (this.config.walls || []).filter((w) => w.level === f.level).length;
+        const sel = f.level === this._activeFloor ? 'selected' : '';
+        const nm = f.name || `Floor ${f.level}`;
+        return `<option value="${f.level}" ${sel}>${nm} — ${nodes} node(s), ${walls} wall(s)</option>`;
+      })
+      .join('');
+
+    // Floor 1 defines the origin, so its elevation is not editable: if the
+    // ground floor could float, every coordinate in the building would be
+    // silently offset. The server rejects it too.
+    const isGround = this._activeFloor === 1;
+    host.innerHTML = `
+      <div class="rb-room-dims">
+        <label><span>Editing storey</span>
+          <select id="rbFloorSelect">${opts}</select>
+        </label>
+        <label><span>Floor height (<span class="rb-unit-label">${this._unitLabel()}</span>)</span>
+          <input type="number" id="rbFloorElev" step="0.05"
+                 value="${this._toDisplay(active.elevation_m).toFixed(2)}"
+                 ${isGround ? 'disabled title="The ground floor defines the origin"' : ''}></label>
+        <label><span>Ceiling (<span class="rb-unit-label">${this._unitLabel()}</span>)</span>
+          <input type="number" id="rbFloorCeil" step="0.05"
+                 value="${this._toDisplay(active.ceiling_m).toFixed(2)}"></label>
+      </div>`;
+
+    const sel = host.querySelector('#rbFloorSelect');
+    if (sel) sel.addEventListener('change', () => {
+      this._activeFloor = Number(sel.value);
+      this._renderFloorControls();
+      this._renderWallList();
+      this._render();
+    });
+    const elev = host.querySelector('#rbFloorElev');
+    if (elev) elev.addEventListener('change', () => {
+      const f = this._floors().find((x) => x.level === this._activeFloor);
+      if (f && !isGround) {
+        f.elevation_m = this._fromDisplay(parseFloat(elev.value) || 0);
+        this.config.floors = this._floors();
+      }
+    });
+    const ceil = host.querySelector('#rbFloorCeil');
+    if (ceil) ceil.addEventListener('change', () => {
+      const f = this._floors().find((x) => x.level === this._activeFloor);
+      if (f) {
+        f.ceiling_m = this._fromDisplay(parseFloat(ceil.value) || DEFAULT_CEILING_M);
+        this.config.floors = this._floors();
+      }
+    });
+  }
+
+  /** Walls on the active storey, each removable. */
+  _renderWallList() {
+    const host = this.container.querySelector('#rbWallList');
+    if (!host) return;
+    const walls = this.config.walls || [];
+    const mine = walls
+      .map((w, i) => ({ w, i }))
+      .filter(({ w }) => w.level === this._activeFloor);
+
+    if (mine.length === 0) {
+      host.innerHTML = '<p class="rb-hint" style="margin:4px 2px;">No walls on this storey yet.</p>';
+      return;
+    }
+    const u = this._unitLabel();
+    host.innerHTML = mine
+      .map(({ w, i }) => {
+        const len = Math.hypot(w.x2 - w.x1, w.y2 - w.y1);
+        return `<div class="rb-hint" style="display:flex;align-items:center;gap:8px;margin:3px 2px;">
+          <span style="flex:1;font-family:monospace;">
+            (${this._toDisplay(w.x1).toFixed(1)}, ${this._toDisplay(w.y1).toFixed(1)})
+            → (${this._toDisplay(w.x2).toFixed(1)}, ${this._toDisplay(w.y2).toFixed(1)})
+            · ${this._toDisplay(len).toFixed(1)} ${u}
+          </span>
+          <button class="rb-btn secondary" data-wall="${i}" style="padding:2px 8px;">✕</button>
+        </div>`;
+      })
+      .join('');
+
+    host.querySelectorAll('button[data-wall]').forEach((b) => {
+      b.addEventListener('click', () => {
+        const idx = Number(b.getAttribute('data-wall'));
+        this.config.walls.splice(idx, 1);
+        this._renderWallList();
+        this._renderFloorControls();
+        this._render();
+      });
+    });
+  }
+
+  /** Finish the wall being dragged, if it is long enough to be a wall.
+   *
+   * The server rejects zero-length segments (they make any
+   * line-intersection test degenerate rather than merely wrong), so a stray
+   * click is dropped here rather than sent and bounced. 10 cm is below any
+   * real wall and above any accidental twitch.
+   */
+  _commitWall(e) {
+    const start = this._wallStart;
+    this._wallStart = null;
+    this._wallPreview = null;
+    if (!start) return;
+
+    const pos = this._canvasPos(e);
+    const end = this._toRoom(pos.x, pos.y, { clamp: false });
+    const len = Math.hypot(end.x - start.x, end.y - start.y);
+    if (!Number.isFinite(len) || len < 0.1) {
+      this._render();
+      return;
+    }
+
+    const round = (v) => Math.round(v * 100) / 100;
+    if (!Array.isArray(this.config.walls)) this.config.walls = [];
+    this.config.walls.push({
+      level: this._activeFloor,
+      x1: round(start.x), y1: round(start.y),
+      x2: round(end.x), y2: round(end.y),
+    });
+    this._renderWallList();
+    this._render();
+  }
+
+  /** Add a storey above the highest one. */
+  _addFloor() {
+    const floors = this._floors();
+    const top = floors[floors.length - 1];
+    const next = {
+      level: top.level + 1,
+      name: `Floor ${top.level + 1}`,
+      elevation_m: Math.round((top.elevation_m + DEFAULT_STOREY_PITCH_M) * 100) / 100,
+      ceiling_m: DEFAULT_CEILING_M,
+    };
+    // Materialise the implicit ground floor too, otherwise saving a second
+    // storey would leave the first undeclared and the server would reject
+    // every node on it as living on an undefined floor.
+    this.config.floors = [...floors, next];
+    this._activeFloor = next.level;
+    this._renderFloorControls();
+    this._render();
+  }
+
+  /** Remove the top storey, and anything on it.
+   *
+   * Deleting a storey while nodes or walls still reference it would produce a
+   * config the server refuses to save, with an error naming a floor the user
+   * can no longer see. Better to say what will go, and go.
+   */
+  _removeTopFloor() {
+    const floors = this._floors();
+    if (floors.length <= 1) return;
+    const doomed = floors[floors.length - 1].level;
+    const nodes = this.config.nodes.filter((n) => this._floorOf(n) === doomed).length;
+    const walls = (this.config.walls || []).filter((w) => w.level === doomed).length;
+    if (nodes || walls) {
+      const ok = window.confirm(
+        `Remove floor ${doomed}? This also deletes ${nodes} node(s) and ${walls} wall(s) on it.`
+      );
+      if (!ok) return;
+    }
+    this.config.floors = floors.filter((f) => f.level !== doomed);
+    this.config.nodes = this.config.nodes.filter((n) => this._floorOf(n) !== doomed);
+    this.config.walls = (this.config.walls || []).filter((w) => w.level !== doomed);
+    if (this.config.floors.length <= 1) this.config.floors = [];
+    this._activeFloor = 1;
+    this._renderFloorControls();
+    this._renderNodeList();
+    this._renderStoreyPanels();
+    this._renderWallList();
     this._render();
   }
 
@@ -579,6 +889,36 @@ export class RoomBuilderTab {
       ctx.stroke();
     }
 
+    // Walls. Drawn before nodes so a node marker is never hidden behind one.
+    // Other storeys show faintly: alignment between floors is exactly what a
+    // shared origin is for, and hiding them would make it guesswork.
+    (this.config.walls || []).forEach((w) => {
+      const a = this._toPixel(w.x1, w.y1);
+      const b = this._toPixel(w.x2, w.y2);
+      const active = w.level === this._activeFloor;
+      ctx.strokeStyle = active ? '#e6edf3' : 'rgba(230,237,243,0.18)';
+      ctx.lineWidth = active ? 4 : 2;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(a.px, a.py);
+      ctx.lineTo(b.px, b.py);
+      ctx.stroke();
+    });
+    ctx.lineCap = 'butt';
+
+    // Wall being dragged out right now.
+    if (this._wallStart && this._wallPreview) {
+      const a = this._toPixel(this._wallStart.x, this._wallStart.y);
+      ctx.strokeStyle = '#ffd166';
+      ctx.lineWidth = 4;
+      ctx.setLineDash([6, 4]);
+      ctx.beginPath();
+      ctx.moveTo(a.px, a.py);
+      ctx.lineTo(this._wallPreview.x, this._wallPreview.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
     // Nodes.
     this.config.nodes.forEach((node, idx) => {
       const { px, py } = this._toPixel(node.x, node.y);
@@ -586,6 +926,8 @@ export class RoomBuilderTab {
         console.warn('[RoomBuilder] Skipping node with non-finite position:', node);
         return;
       }
+      const onThisFloor = this._floorOf(node) === this._activeFloor;
+      ctx.globalAlpha = onThisFloor ? 1 : 0.28;
       ctx.beginPath();
       ctx.arc(px, py, NODE_RADIUS, 0, Math.PI * 2);
       ctx.fillStyle = idx === this._dragIndex ? '#ffd166' : '#e05561';
@@ -600,6 +942,9 @@ export class RoomBuilderTab {
       const label = node.label ? `${node.id}:${node.label}` : `${node.id}`;
       ctx.fillText(label, px, py - NODE_RADIUS - 6);
     });
+    // Leaving globalAlpha faded would silently dim the AP, the live dot and
+    // the compass drawn below.
+    ctx.globalAlpha = 1;
 
     this._drawAp(ctx);
     this._drawLiveDot(ctx);
