@@ -341,4 +341,15 @@ firmware/esp32-csi-node/board_index.json
 firmware/esp32-csi-node/case/*.stl
 
 # Provisioning config: points at a credential file outside the repo.
-firmware/esp32-csi-node/provision_conf.json
+# Provisioning profiles: hold an SSID and the PATH to a credential file.
+# Globbed because --net <name> reads provision_conf_<name>.json, and a new
+# profile must not become committable just by being created.
+firmware/esp32-csi-node/provision_conf*.json
+
+# Alternate IDF build trees and the derived sdkconfigs that drive them.
+# `build/` alone does not match these. They are reproducible from sdkconfig
+# plus one Kconfig option, and build_* holds ~1 MB of binaries per tree.
+firmware/esp32-csi-node/build_*/
+firmware/esp32-csi-node/sdkconfig.diag
+firmware/esp32-csi-node/sdkconfig.gate
+firmware/esp32-csi-node/release_bins/
