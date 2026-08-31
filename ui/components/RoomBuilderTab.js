@@ -294,16 +294,18 @@ export class RoomBuilderTab {
               with the floor below.
             </p>
             <div class="rb-wall-entry">
-              <label><span>From X</span><input type="number" id="rbWallX1" step="0.25" value="0"></label>
-              <label><span>From Y</span><input type="number" id="rbWallY1" step="0.25" value="0"></label>
-              <label><span>To X</span><input type="number" id="rbWallX2" step="0.25" value="0"></label>
-              <label><span>To Y</span><input type="number" id="rbWallY2" step="0.25" value="0"></label>
+              <label><span>Start &middot; east &rarr;</span><input type="number" id="rbWallX1" step="0.25" value="0" title="Distance east from the north-west corner"></label>
+              <label><span>Start &middot; south &darr;</span><input type="number" id="rbWallY1" step="0.25" value="0" title="Distance south from the north-west corner"></label>
+              <label><span>End &middot; east &rarr;</span><input type="number" id="rbWallX2" step="0.25" placeholder="—" title="Distance east from the north-west corner"></label>
+              <label><span>End &middot; south &darr;</span><input type="number" id="rbWallY2" step="0.25" placeholder="—" title="Distance south from the north-west corner"></label>
               <button class="rb-btn secondary" id="rbAddWall">Add</button>
             </div>
-            <p class="rb-hint" style="margin:4px 2px 8px;">
-              Coordinates in <span class="rb-unit-label">${this._unitLabel()}</span> from the
-              north-west corner. Typing exact numbers beats dragging for a wall you
-              measured; dragging is faster for one you are eyeballing.
+            <p class="rb-hint" id="rbWallEntryHint" style="margin:4px 2px 8px;">
+              Both points are measured from the <strong>north-west corner</strong>, in
+              <span class="rb-unit-label">${this._unitLabel()}</span> — east is right,
+              south is down, matching the <strong>N</strong> arrow on the canvas. A wall
+              along the north edge starting at the corner is
+              start&nbsp;0,&nbsp;0 → end&nbsp;12,&nbsp;0.
             </p>
             <div id="rbWallList"></div>
           </div>
@@ -390,14 +392,46 @@ export class RoomBuilderTab {
       this._renderApFields();
       this._render();
     });
+    // Live preview: typing coordinates is only unclear until you can see what
+    // they produce. The dashed line uses the same path as a dragged wall.
+    const wallInputs = ['rbWallX1', 'rbWallY1', 'rbWallX2', 'rbWallY2'];
+    const previewWall = () => {
+      const raw = wallInputs.map((id) => this.container.querySelector(`#${id}`).value);
+      if (raw.some((v) => v === '' || v === null)) {
+        this._wallStart = null;
+        this._wallPreview = null;
+        this._updateWallEntryHint(null);
+        this._render();
+        return;
+      }
+      const [x1, y1, x2, y2] = raw.map((v) => this._fromDisplay(parseFloat(v) || 0));
+      this._wallStart = { x: x1, y: y1 };
+      const end = this._toPixel(x2, y2);
+      this._wallPreview = { x: end.px, y: end.py };
+      this._updateWallEntryHint(Math.hypot(x2 - x1, y2 - y1));
+      this._render();
+    };
+    wallInputs.forEach((id) => {
+      this.container.querySelector(`#${id}`).addEventListener('input', previewWall);
+    });
+
     this.container.querySelector('#rbAddWall').addEventListener('click', () => {
       const num = (id) => parseFloat(this.container.querySelector(`#${id}`).value);
+      // An empty end box used to fall through `|| 0` and draw a wall to the
+      // north-west corner, which is a real coordinate and so looked deliberate.
+      const missing = ['rbWallX2', 'rbWallY2'].some(
+        (id) => !Number.isFinite(num(id))
+      );
+      if (missing) {
+        toastManager.error('Fill in both end coordinates before adding the wall.');
+        return;
+      }
       const x1 = this._fromDisplay(num('rbWallX1') || 0);
       const y1 = this._fromDisplay(num('rbWallY1') || 0);
-      const x2 = this._fromDisplay(num('rbWallX2') || 0);
-      const y2 = this._fromDisplay(num('rbWallY2') || 0);
+      const x2 = this._fromDisplay(num('rbWallX2'));
+      const y2 = this._fromDisplay(num('rbWallY2'));
       if (Math.hypot(x2 - x1, y2 - y1) < 0.1) {
-        toastManager.error('That wall has no length — give it a different end point.');
+        toastManager.error('Start and end are the same point — a wall needs length.');
         return;
       }
       if (!Array.isArray(this.config.walls)) this.config.walls = [];
@@ -406,10 +440,16 @@ export class RoomBuilderTab {
         level: this._activeFloor,
         x1: r(x1), y1: r(y1), x2: r(x2), y2: r(y2),
       });
-      // Chain from the end point: walls in a room almost always meet, so the
-      // next one usually starts where this one stopped.
+      // Chain from the end point -- walls in a room almost always meet -- but
+      // CLEAR the end. Copying both left all four boxes showing the same
+      // number and staged a zero-length wall, which looked broken.
       this.container.querySelector('#rbWallX1').value = num('rbWallX2');
       this.container.querySelector('#rbWallY1').value = num('rbWallY2');
+      this.container.querySelector('#rbWallX2').value = '';
+      this.container.querySelector('#rbWallY2').value = '';
+      this._wallStart = null;
+      this._wallPreview = null;
+      this._updateWallEntryHint(null);
       this._renderWallList();
       this._renderFloorControls();
       this._render();
@@ -917,6 +957,23 @@ export class RoomBuilderTab {
       const el = host.querySelector(id);
       if (el) el.addEventListener('change', commit);
     });
+  }
+
+  /** Show the length of the wall currently being typed, or the how-to text. */
+  _updateWallEntryHint(lengthMeters) {
+    const el = this.container.querySelector('#rbWallEntryHint');
+    if (!el) return;
+    if (lengthMeters == null) {
+      el.innerHTML = `Both points are measured from the <strong>north-west corner</strong>, in
+        <span class="rb-unit-label">${this._unitLabel()}</span> — east is right, south is
+        down, matching the <strong>N</strong> arrow on the canvas. A wall along the north
+        edge starting at the corner is start&nbsp;0,&nbsp;0 → end&nbsp;12,&nbsp;0.`;
+      return;
+    }
+    const u = this._unitLabel();
+    el.innerHTML = lengthMeters < 0.1
+      ? '<span style="color:#e05561;">Start and end are the same point.</span>'
+      : `This wall is <strong>${this._toDisplay(lengthMeters).toFixed(1)} ${u}</strong> long — shown dashed on the canvas.`;
   }
 
   /** Walls on the active storey, each removable. */
