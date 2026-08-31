@@ -23,8 +23,19 @@ static const char *TAG = "ota_update";
 /** OTA HTTP server port. */
 #define OTA_PORT 8032
 
-/** Maximum firmware size (900 KB — matches CI binary size gate). */
-#define OTA_MAX_SIZE (900 * 1024)
+/* The upload size limit is the partition the image will actually be written
+ * to, read at runtime.
+ *
+ * This used to be `#define OTA_MAX_SIZE (900 * 1024)`, described as matching a
+ * CI binary size gate. It went stale silently and broke OTA outright: each OTA
+ * slot in partitions_4mb.csv is 0x1D0000 (1,900,544 B), and the firmware had
+ * already grown past 900 KB -- the 2026-08-30 build is 1,043,264 B. Every
+ * upload of a current image was rejected with a size error naming a limit the
+ * hardware does not have, and /ota/status advertised that same wrong number.
+ *
+ * Deriving it from the partition cannot go stale again, and it is also the
+ * only bound that is actually true: esp_ota_write() has nowhere to put bytes
+ * past the end of the slot regardless of what any constant claims. */
 
 /** NVS namespace and key for the OTA pre-shared key. */
 #define OTA_NVS_NAMESPACE "security"
@@ -35,6 +46,15 @@ static const char *TAG = "ota_update";
 
 /** Cached PSK loaded from NVS at init time. Empty = auth disabled. */
 static char s_ota_psk[OTA_PSK_MAX_LEN] = {0};
+
+/** Bytes available in the slot the next update would be written to.
+ *  Returns 0 if no OTA partition is available, which fails every size check
+ *  closed rather than open. */
+static size_t ota_max_size(void)
+{
+    const esp_partition_t *p = esp_ota_get_next_update_partition(NULL);
+    return (p != NULL) ? (size_t)p->size : 0;
+}
 
 /**
  * ADR-050: Verify the Authorization header contains the correct PSK.
@@ -99,7 +119,7 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
         app->version, app->date, app->time,
         running ? running->label : "unknown",
         update ? update->label : "none",
-        OTA_MAX_SIZE);
+        (int)ota_max_size());
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, response, len);
@@ -121,9 +141,17 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
 
     ESP_LOGI(TAG, "OTA update started, content_length=%d", req->content_len);
 
-    if (req->content_len <= 0 || req->content_len > OTA_MAX_SIZE) {
+    size_t max_size = ota_max_size();
+    if (max_size == 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "No OTA partition available");
+        return ESP_FAIL;
+    }
+    if (req->content_len <= 0 || (size_t)req->content_len > max_size) {
+        ESP_LOGW(TAG, "OTA rejected: %d bytes offered, slot holds %u",
+                 req->content_len, (unsigned)max_size);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                            "Invalid firmware size (must be 1B - 900KB)");
+                            "Firmware size outside the OTA partition");
         return ESP_FAIL;
     }
 
