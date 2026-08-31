@@ -1625,9 +1625,67 @@ pub(crate) struct RoomNode {
     pub id: u8,
     pub x: f32,
     pub y: f32,
+    /// Height above the FIRST floor's surface, not above this node's own
+    /// floor. A node on the second storey at 1.2 m sits at z = elevation of
+    /// that floor + 1.2, so z stays a single global axis and distances between
+    /// nodes on different floors are just Euclidean.
     pub z: f32,
+    /// Which storey this node is on. `None` means the first floor, so configs
+    /// written before floors existed keep working unchanged.
+    ///
+    /// Redundant with `z` for geometry, and deliberately so: it is what the
+    /// Room Builder groups by and what walls are associated with. Deriving it
+    /// from `z` would guess wrong for a node mounted high on a stairwell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+}
+
+/// One storey of the building.
+///
+/// `level` is the storey number, 1 for the ground floor. `elevation_m` is the
+/// height of that storey's *floor surface* above the origin, so level 1 is
+/// 0.0 by definition and level 2 is roughly first-floor ceiling plus joist
+/// depth.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Floor {
+    pub level: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub elevation_m: f32,
+    /// Ceiling height above this storey's own floor surface (not above the
+    /// origin), because that is the number a person reads off a tape measure.
+    pub ceiling_m: f32,
+}
+
+/// An interior or exterior wall segment, in plan view.
+///
+/// Walls are 2D segments plus a height rather than 3D solids: for RF purposes
+/// what matters is whether the straight line between two nodes crosses one,
+/// and a segment answers that with a cheap intersection test. Modelling
+/// thickness or openings would add cost to every link evaluation for accuracy
+/// the rest of the pipeline cannot yet use.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Wall {
+    /// Storey this wall belongs to. A wall only obstructs links whose
+    /// endpoints are on that storey; a floor slab is a different thing and is
+    /// implied by two nodes having different `floor` values.
+    pub level: i32,
+    pub x1: f32,
+    pub y1: f32,
+    pub x2: f32,
+    pub y2: f32,
+    /// Height above this storey's floor. Defaults to full height when absent —
+    /// a half-wall or a pony wall is the exception, not the rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height_m: Option<f32>,
+    /// Free text: "exterior", "interior", "glass", "brick". Not interpreted
+    /// yet. Recorded now because it is knowledge the person drawing the plan
+    /// has and will not have later, and attenuation per material is the
+    /// obvious next use of this data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 /// Room geometry (a simple rectangle) plus sensor node placements, as
@@ -1651,6 +1709,19 @@ pub(crate) struct RoomConfig {
     /// future scope; this stays "one room, one AP, up to a few nodes."
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ap_position: Option<[f32; 3]>,
+    /// Storeys, ascending. Empty means a single implicit ground floor, which
+    /// is how every config written before this field existed behaves.
+    ///
+    /// ORIGIN: (0, 0, 0) is the north-west corner of the FIRST floor, at floor
+    /// level. x runs east, y runs south, z runs up. Every storey shares that
+    /// origin — the second floor is not re-zeroed — so a node's coordinates
+    /// mean the same thing regardless of which storey it is on, and a
+    /// through-floor distance is just Euclidean.
+    #[serde(default)]
+    pub floors: Vec<Floor>,
+    /// Wall segments in plan view, tagged by storey.
+    #[serde(default)]
+    pub walls: Vec<Wall>,
 }
 
 /// Load persisted room config from `<data_dir>/room_config.json`.
@@ -1680,6 +1751,125 @@ pub(crate) fn save_room_config(data_dir: &std::path::Path, config: &RoomConfig) 
 mod room_config_tests {
     use super::*;
 
+    fn base() -> RoomConfig {
+        RoomConfig {
+            width_m: 13.4,
+            depth_m: 10.4,
+            nodes: Vec::new(),
+            ap_position: None,
+            floors: Vec::new(),
+            walls: Vec::new(),
+        }
+    }
+
+    fn floor(level: i32, elevation_m: f32) -> Floor {
+        Floor { level, name: None, elevation_m, ceiling_m: 2.7 }
+    }
+
+    /// The whole coordinate system hangs off this. If floor 1 is allowed to
+    /// float, every node coordinate in the building is silently offset and
+    /// nothing downstream can detect it.
+    #[test]
+    fn first_floor_must_sit_at_the_origin() {
+        let mut c = base();
+        c.floors = vec![floor(1, 0.3)];
+        let err = validate_room_config(&c).unwrap_err();
+        assert!(err.contains("floor 1"), "{err}");
+
+        c.floors = vec![floor(1, 0.0)];
+        assert!(validate_room_config(&c).is_ok());
+    }
+
+    /// A second storey below the first is a typo every time, and it would
+    /// invert every through-floor distance without erroring anywhere.
+    #[test]
+    fn storeys_must_ascend() {
+        let mut c = base();
+        c.floors = vec![floor(1, 0.0), floor(2, -2.9)];
+        let err = validate_room_config(&c).unwrap_err();
+        assert!(err.contains("floor 2"), "{err}");
+
+        c.floors = vec![floor(1, 0.0), floor(2, 2.9)];
+        assert!(validate_room_config(&c).is_ok());
+    }
+
+    #[test]
+    fn duplicate_floor_levels_are_rejected() {
+        let mut c = base();
+        c.floors = vec![floor(1, 0.0), floor(1, 2.9)];
+        assert!(validate_room_config(&c).unwrap_err().contains("duplicate floor"));
+    }
+
+    #[test]
+    fn a_node_cannot_live_on_a_storey_that_does_not_exist() {
+        let mut c = base();
+        c.floors = vec![floor(1, 0.0)];
+        c.nodes = vec![RoomNode {
+            id: 3, x: 1.0, y: 1.0, z: 3.5, floor: Some(2), label: None,
+        }];
+        assert!(validate_room_config(&c).unwrap_err().contains("undefined floor"));
+    }
+
+    /// Configs written before floors existed must keep loading and validating
+    /// unchanged — the fleet's own room_config.json is one of them.
+    #[test]
+    fn pre_floors_configs_remain_valid() {
+        let mut c = base();
+        c.nodes = vec![RoomNode {
+            id: 0, x: 1.2, y: 0.0, z: 0.56, floor: None, label: Some("front right".into()),
+        }];
+        assert!(c.floors.is_empty());
+        assert!(validate_room_config(&c).is_ok(), "no floors declared is still a valid room");
+    }
+
+    /// Zero-length walls make any segment-intersection test degenerate rather
+    /// than merely wrong, so they are rejected at the door.
+    #[test]
+    fn zero_length_walls_are_rejected() {
+        let mut c = base();
+        c.walls = vec![Wall {
+            level: 1, x1: 2.0, y1: 2.0, x2: 2.0, y2: 2.0,
+            height_m: None, kind: None,
+        }];
+        assert!(validate_room_config(&c).unwrap_err().contains("zero length"));
+    }
+
+    #[test]
+    fn walls_round_trip_with_their_storey_and_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = base();
+        c.floors = vec![floor(1, 0.0), floor(2, 2.9)];
+        c.walls = vec![
+            Wall { level: 1, x1: 0.0, y1: 0.0, x2: 5.0, y2: 0.0,
+                   height_m: None, kind: Some("exterior".into()) },
+            Wall { level: 2, x1: 0.0, y1: 3.0, x2: 4.0, y2: 3.0,
+                   height_m: Some(1.1), kind: Some("pony".into()) },
+        ];
+        save_room_config(dir.path(), &c);
+        let loaded = load_room_config(dir.path());
+        assert_eq!(loaded.walls.len(), 2);
+        assert_eq!(loaded.walls[1].level, 2, "storey survives the round trip");
+        assert_eq!(loaded.walls[1].height_m, Some(1.1));
+        assert_eq!(loaded.walls[0].kind.as_deref(), Some("exterior"));
+        assert_eq!(loaded.floors[1].elevation_m, 2.9);
+    }
+
+    #[test]
+    fn node_storey_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = base();
+        c.floors = vec![floor(1, 0.0), floor(2, 2.9)];
+        c.nodes = vec![RoomNode {
+            id: 7, x: 2.0, y: 3.0, z: 4.1, floor: Some(2), label: Some("landing".into()),
+        }];
+        save_room_config(dir.path(), &c);
+        let loaded = load_room_config(dir.path());
+        assert_eq!(loaded.nodes[0].floor, Some(2));
+        // z stays a single global axis: a second-floor node is above the
+        // storey's own elevation, not re-zeroed to it.
+        assert!(loaded.nodes[0].z > loaded.floors[1].elevation_m);
+    }
+
     #[test]
     fn load_missing_file_returns_default() {
         let dir = tempfile::tempdir().unwrap();
@@ -1705,10 +1895,12 @@ mod room_config_tests {
             width_m: 5.0,
             depth_m: 4.0,
             nodes: vec![
-                RoomNode { id: 0, x: 0.0, y: 0.0, z: 0.4, label: Some("front-right".into()) },
-                RoomNode { id: 1, x: 3.66, y: 0.0, z: 0.4, label: None },
+                RoomNode { id: 0, x: 0.0, y: 0.0, z: 0.4, floor: None, label: Some("front-right".into()) },
+                RoomNode { id: 1, x: 3.66, y: 0.0, z: 0.4, floor: None, label: None },
             ],
             ap_position: Some([2.5, -1.0, 2.2]),
+        floors: Vec::new(),
+        walls: Vec::new(),
         };
         save_room_config(dir.path(), &saved);
         let loaded = load_room_config(dir.path());
@@ -1740,10 +1932,12 @@ mod room_config_tests {
             width_m: 5.0,
             depth_m: 4.0,
             nodes: vec![
-                RoomNode { id: 0, x: 0.0, y: 0.0, z: 0.4, label: None },
-                RoomNode { id: 1, x: 3.66, y: 0.0, z: 0.4, label: None },
+                RoomNode { id: 0, x: 0.0, y: 0.0, z: 0.4, floor: None, label: None },
+                RoomNode { id: 1, x: 3.66, y: 0.0, z: 0.4, floor: None, label: None },
             ],
             ap_position: None,
+        floors: Vec::new(),
+        walls: Vec::new(),
         }
     }
 
@@ -12885,17 +13079,16 @@ async fn config_get_room(State(state): State<SharedState>) -> Json<serde_json::V
         .node_positions_config
         .iter()
         .map(|(&id, p)| {
-            let label = saved
-                .nodes
-                .iter()
-                .find(|n| n.id == id)
-                .and_then(|n| n.label.clone());
+            // Live positions come from memory; label and storey are editorial
+            // and only exist in the persisted config, so carry them across.
+            let saved_node = saved.nodes.iter().find(|n| n.id == id);
             RoomNode {
                 id,
                 x: p[0],
                 y: p[1],
                 z: p[2],
-                label,
+                floor: saved_node.and_then(|n| n.floor),
+                label: saved_node.and_then(|n| n.label.clone()),
             }
         })
         .collect();
@@ -12904,6 +13097,10 @@ async fn config_get_room(State(state): State<SharedState>) -> Json<serde_json::V
         "depth_m": saved.depth_m,
         "nodes": nodes,
         "ap_position": s.ap_position,
+        // Storeys and walls are pure geometry with no live counterpart in
+        // memory, so they are served straight from the persisted config.
+        "floors": saved.floors,
+        "walls": saved.walls,
     }))
 }
 
@@ -12942,6 +13139,78 @@ pub(crate) fn validate_room_config(config: &RoomConfig) -> Result<(), String> {
         // closet), and that's fine — ap_position only needs to be a real,
         // finite point in the same coordinate frame, not inside width_m/depth_m.
     }
+
+    // ── Storeys ──────────────────────────────────────────────────────────
+    let mut levels = std::collections::HashSet::new();
+    for f in &config.floors {
+        if !levels.insert(f.level) {
+            return Err(format!("duplicate floor level {}", f.level));
+        }
+        if !f.elevation_m.is_finite() || !f.ceiling_m.is_finite() {
+            return Err(format!("floor {} has a non-finite height", f.level));
+        }
+        if f.ceiling_m <= 0.0 {
+            return Err(format!("floor {} ceiling_m must be positive", f.level));
+        }
+        // Level 1 defines the origin, so it cannot float. Catching this here
+        // stops a plan whose every coordinate is silently offset.
+        if f.level == 1 && f.elevation_m != 0.0 {
+            return Err(
+                "floor 1 must have elevation_m = 0: the origin is the \
+                 north-west corner of the first floor, at floor level"
+                    .to_string(),
+            );
+        }
+    }
+    // Ascending storeys must ascend. A second floor below a first is a typo
+    // every time, and it would silently invert every through-floor distance.
+    let mut sorted: Vec<&Floor> = config.floors.iter().collect();
+    sorted.sort_by_key(|f| f.level);
+    for w in sorted.windows(2) {
+        if w[1].elevation_m <= w[0].elevation_m {
+            return Err(format!(
+                "floor {} is at or below floor {} ({} m vs {} m)",
+                w[1].level, w[0].level, w[1].elevation_m, w[0].elevation_m
+            ));
+        }
+    }
+
+    // A node may only sit on a storey that exists — but only once storeys are
+    // being used at all, so pre-floors configs stay valid.
+    if !config.floors.is_empty() {
+        for n in &config.nodes {
+            let lvl = n.floor.unwrap_or(1);
+            if !levels.contains(&lvl) {
+                return Err(format!("node {} is on undefined floor {}", n.id, lvl));
+            }
+        }
+    }
+
+    // ── Walls ────────────────────────────────────────────────────────────
+    for (i, wall) in config.walls.iter().enumerate() {
+        if ![wall.x1, wall.y1, wall.x2, wall.y2]
+            .iter()
+            .all(|v| v.is_finite())
+        {
+            return Err(format!("wall {i} has a non-finite endpoint"));
+        }
+        // A zero-length wall is not a wall. It would also make any
+        // segment-intersection test degenerate rather than merely wrong.
+        let dx = wall.x2 - wall.x1;
+        let dy = wall.y2 - wall.y1;
+        if (dx * dx + dy * dy).sqrt() < 1e-3 {
+            return Err(format!("wall {i} has zero length"));
+        }
+        if let Some(h) = wall.height_m {
+            if !h.is_finite() || h <= 0.0 {
+                return Err(format!("wall {i} height_m must be positive"));
+            }
+        }
+        if !config.floors.is_empty() && !levels.contains(&wall.level) {
+            return Err(format!("wall {i} is on undefined floor {}", wall.level));
+        }
+    }
+
     Ok(())
 }
 
@@ -12973,6 +13242,8 @@ async fn config_set_room(
         "depth_m": config.depth_m,
         "nodes": config.nodes,
         "ap_position": config.ap_position,
+        "floors": config.floors,
+        "walls": config.walls,
     }))
 }
 
