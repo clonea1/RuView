@@ -9457,7 +9457,11 @@ fn rti_from_links(
         ..Default::default()
     };
 
-    match rti::estimate(&observations, &cfg) {
+    // No footprint yet: RoomConfig still describes the building as a bare
+    // width x depth rectangle, so there are no rings to mask against and the
+    // search covers the whole box exactly as before. Passing the real outline
+    // here is the remaining half of the L-shaped-plan work.
+    match rti::estimate(&observations, &cfg, &[]) {
         Some(e) => serde_json::json!({
             "x": e.x,
             "y": e.y,

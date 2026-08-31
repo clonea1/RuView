@@ -202,10 +202,54 @@ fn correlation(a: &[f64], b: &[f64]) -> Option<f64> {
 /// Search the room for the cell whose predicted link weights best explain the
 /// observed responses.
 ///
+/// Whether a point lies inside a closed ring, by the even-odd rule.
+///
+/// The ring is implicitly closed: the last vertex connects back to the first,
+/// so callers pass vertices only. Points exactly on an edge are not guaranteed
+/// either way, which is fine here — a grid cell centre landing precisely on a
+/// wall line is both arbitrary and half a cell from being clearly inside.
+///
+/// Exists because a bounding rectangle is a poor description of a real house.
+/// An L-shaped plan leaves a notch inside `width_m x depth_m` that is not part
+/// of the building at all, and `estimate` will happily score those cells and
+/// return a peak standing in the garden.
+pub fn point_in_polygon(pt: [f64; 2], ring: &[[f64; 2]]) -> bool {
+    if ring.len() < 3 {
+        return false;
+    }
+    let (x, y) = (pt[0], pt[1]);
+    let mut inside = false;
+    let mut j = ring.len() - 1;
+    for i in 0..ring.len() {
+        let (xi, yi) = (ring[i][0], ring[i][1]);
+        let (xj, yj) = (ring[j][0], ring[j][1]);
+        // Half-open in y so a vertex is counted by exactly one of its edges.
+        if (yi > y) != (yj > y) {
+            let t = (y - yi) / (yj - yi);
+            if x < xi + t * (xj - xi) {
+                inside = !inside;
+            }
+        }
+        j = i;
+    }
+    inside
+}
+
 /// `None` when there are too few links, when no link shows any response, or
 /// when no observed cell produces a positive correlation — all cases where a
 /// returned point would be an invention rather than an estimate.
-pub fn estimate(observations: &[LinkObservation], cfg: &RtiConfig) -> Option<RtiEstimate> {
+///
+/// `rings` optionally restricts the search to the building's real footprint.
+/// Each ring is a closed outline in room coordinates; a cell counts as
+/// searchable if it falls inside ANY of them, so an L-shaped house, a wing, or
+/// a detached structure are all expressible as a union. Empty means "search the
+/// whole rectangle", which is the behaviour every caller had before footprints
+/// existed.
+pub fn estimate(
+    observations: &[LinkObservation],
+    cfg: &RtiConfig,
+    rings: &[Vec<[f64; 2]>],
+) -> Option<RtiEstimate> {
     if observations.len() < MIN_LINKS {
         return None;
     }
@@ -242,6 +286,13 @@ pub fn estimate(observations: &[LinkObservation], cfg: &RtiConfig) -> Option<Rti
                 (ix as f64 + 0.5) * cfg.cell_m,
                 (iy as f64 + 0.5) * cfg.cell_m,
             ];
+            // Outside the building is not a place a person can be. Skipping
+            // these cells is not cosmetic: they are scored against the same
+            // link kernels as real ones and can win outright, which puts the
+            // estimate in a part of the bounding box the house does not occupy.
+            if !rings.is_empty() && !rings.iter().any(|r| point_in_polygon(cell, r)) {
+                continue;
+            }
             let mut mass = 0.0;
             for (i, o) in observations.iter().enumerate() {
                 let w = link_weight(o.rx, o.tx, cell, cfg.ellipse_width_m);
@@ -377,7 +428,7 @@ mod tests {
     fn a_target_inside_the_node_triangle_is_recovered() {
         let cfg = room();
         let truth = [2.4, 1.4];
-        let est = estimate(&observations_for(truth, &cfg), &cfg).expect("should solve");
+        let est = estimate(&observations_for(truth, &cfg), &cfg, &[]).expect("should solve");
         let err = ((est.x - truth[0]).powi(2) + (est.y - truth[1]).powi(2)).sqrt();
         assert!(err < 1.0, "error {err:.2} m at {:?}", (est.x, est.y));
     }
@@ -390,7 +441,7 @@ mod tests {
         let cfg = room();
         // On the AP-to-node2 line, well beyond the triangle's far edge.
         let truth = [4.5, 4.6];
-        let est = estimate(&observations_for(truth, &cfg), &cfg).expect("should solve");
+        let est = estimate(&observations_for(truth, &cfg), &cfg, &[]).expect("should solve");
 
         // Inside-triangle test by sign-of-cross-product against each edge.
         let inside = {
@@ -412,7 +463,7 @@ mod tests {
     fn fewer_than_three_links_is_refused() {
         let cfg = room();
         let obs = observations_for([2.4, 1.4], &cfg);
-        assert!(estimate(&obs[..2], &cfg).is_none());
+        assert!(estimate(&obs[..2], &cfg, &[]).is_none());
     }
 
     #[test]
@@ -424,7 +475,7 @@ mod tests {
             .into_iter()
             .map(|o| LinkObservation { response: 1.0, ..o })
             .collect();
-        assert!(estimate(&obs, &cfg).is_none());
+        assert!(estimate(&obs, &cfg, &[]).is_none());
     }
 
     #[test]
@@ -432,7 +483,7 @@ mod tests {
         // Truth placed where no link passes. The solver must not report that
         // corner confidently; the links carry no evidence about it.
         let cfg = room();
-        let est = estimate(&observations_for([12.8, 9.8], &cfg), &cfg);
+        let est = estimate(&observations_for([12.8, 9.8], &cfg), &cfg, &[]);
         if let Some(e) = est {
             let d = ((e.x - 12.8f64).powi(2) + (e.y - 9.8f64).powi(2)).sqrt();
             assert!(
@@ -446,7 +497,7 @@ mod tests {
     #[test]
     fn ambiguity_is_reported_as_spread_rather_than_hidden() {
         let cfg = room();
-        let sharp = estimate(&observations_for([2.4, 1.4], &cfg), &cfg).expect("solves");
+        let sharp = estimate(&observations_for([2.4, 1.4], &cfg), &cfg, &[]).expect("solves");
 
         // Three collinear links along one wall: many cells explain the same
         // pattern, so the near-peak set must be visibly spread out.
@@ -455,7 +506,7 @@ mod tests {
             LinkObservation { rx: [0.0, 0.1], tx: [10.0, 0.1], response: 3.0 },
             LinkObservation { rx: [0.0, 0.2], tx: [10.0, 0.2], response: 1.0 },
         ];
-        if let Some(amb) = estimate(&flat, &cfg) {
+        if let Some(amb) = estimate(&flat, &cfg, &[]) {
             assert!(
                 amb.spread_m > sharp.spread_m,
                 "ambiguous geometry {:.2} m must spread wider than sharp {:.2} m",
