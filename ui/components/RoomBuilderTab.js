@@ -262,6 +262,18 @@ export class RoomBuilderTab {
         .rb-actions { display: flex; gap: 10px; margin-top: 8px; }
         .rb-hint { color: #6b7280; font-size: 12px; margin-top: 8px; line-height: 1.5; }
         .rb-col-headers { display: grid; grid-template-columns: 42px 1fr 60px 60px 60px 52px 24px; gap: 6px; font-size: 11px; color: #6b7280; margin-bottom: 6px; }
+        /* Illuminators. One template used by BOTH the header and every row, so
+         * they cannot drift apart. min-width:0 on the children is load-bearing:
+         * grid items default to min-width:auto, so inputs refuse to shrink below
+         * their intrinsic width and shove the row out of line with the header. */
+        .rb-emit-grid { display: grid; grid-template-columns: 86px minmax(118px,1.5fr) 54px 54px 54px 46px minmax(88px,1fr); gap: 6px; align-items: center; }
+        .rb-emit-grid > * { min-width: 0; }
+        .rb-emit-head { font-size: 10.5px; color: #6b7280; margin-bottom: 6px; }
+        .rb-emit-head > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .rb-emit-row { margin-top: 5px; }
+        .rb-emit-row input, .rb-emit-row select { width: 100%; box-sizing: border-box; }
+        .rb-emit-mac { display: block; font-size: 10px; color: #6b7280; font-family: ui-monospace, monospace; }
+        .rb-emit-live { font-size: 10.5px; color: #8b949e; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       </style>
       <h2>Room Builder</h2>
       <p class="rb-hint" style="margin-bottom:16px;">
@@ -393,12 +405,25 @@ export class RoomBuilderTab {
               pattern-matching work, which never needs coordinates.
             </p>
             <p class="rb-hint" style="margin-top:0;">
-              <strong>approved</strong> means "trusted as a fixed focus" and needs a
-              position — it is a claim that the thing does not move.
-              <strong>pending</strong> is the default: heard, not yet judged.
-              <strong>excluded</strong> is for anything that moves; a mobile emitter
-              is worse than none, because what it teaches is only true while it
-              stands still.
+              Work down the list in four passes:
+            </p>
+            <p class="rb-hint" style="margin-top:0;">
+              <strong>1. excluded</strong> — it moves. Refused at ingestion, so it
+              leaves the link table entirely. A mobile emitter is worse than none:
+              what it teaches is only true while it stands still.<br>
+              <strong>2. pending</strong> (default) — heard, shortlisted, not judged
+              yet. Still feeds pattern-matching work, which never needs coordinates,
+              but is never used as a geometric focus.<br>
+              <strong>3. approved</strong> — it doesn't move, but it isn't yours and
+              you can't measure it. Give it a position and say how far out you could
+              be in the &plusmn; column.<br>
+              <strong>4. surveyed</strong> — you put a tape on it. Position only; the
+              &plusmn; box locks, because a measurement has no radius of doubt.
+            </p>
+            <p class="rb-hint" style="margin-top:0;">
+              Both <strong>approved</strong> and <strong>surveyed</strong> become
+              solver foci — the difference is only how much the solver should trust
+              the coordinates.
             </p>
             <div class="rb-actions" style="margin-bottom:8px;">
               <button class="rb-btn secondary" id="rbEmitRefresh">Refresh from fleet</button>
@@ -859,11 +884,9 @@ export class RoomBuilderTab {
     }
     const u = this._unitLabel();
     const hu = this._heightLabel();
-    const GRID = 'grid-template-columns:92px 1fr 62px 62px 62px 58px 148px;';
-
-    let html = '<div class="rb-col-headers" style="' + GRID + '">'
-      + '<span>status</span><span>label / MAC</span>'
-      + '<span>X (' + u + ')</span><span>Y (' + u + ')</span><span>Z (' + hu + ')</span>'
+    let html = '<div class="rb-emit-grid rb-emit-head">'
+      + '<span>status</span><span>label</span>'
+      + '<span>X ' + u + '</span><span>Y ' + u + '</span><span>Z ' + hu + '</span>'
       + '<span>&plusmn;' + u + '</span><span>heard now</span></div>';
 
     rows.forEach((e) => {
@@ -882,23 +905,45 @@ export class RoomBuilderTab {
         + (e.status === v ? ' selected' : '') + '>' + v + '</option>';
       const label = (e.label || '').split('"').join('&quot;');
 
-      html += '<div class="rb-emit-row" data-index="' + idx + '" style="display:grid; '
-        + GRID + ' gap:6px; align-items:center; margin-top:5px;">'
-        + '<select class="rb-em-status">' + opt('pending') + opt('approved') + opt('excluded') + '</select>'
-        + '<span><input class="rb-em-label" type="text" placeholder="unnamed" value="' + label + '" style="width:100%">'
-        + '<br><span style="font-size:10.5px; color:#6b7280">' + e.mac + '</span></span>'
+      html += '<div class="rb-emit-grid rb-emit-row" data-index="' + idx + '">'
+        + '<select class="rb-em-status">' + opt('excluded') + opt('pending')
+        + opt('approved') + opt('surveyed') + '</select>'
+        + '<span><input class="rb-em-label" type="text" placeholder="unnamed" value="' + label
+        + '" title="' + e.mac + '">'
+        + '<span class="rb-emit-mac">' + e.mac + '</span></span>'
         + '<input class="rb-em-x" type="number" step="0.5" placeholder="&mdash;" value="' + xv + '">'
         + '<input class="rb-em-y" type="number" step="0.5" placeholder="&mdash;" value="' + yv + '">'
         + '<input class="rb-em-z" type="number" step="0.5" placeholder="&mdash;" value="' + zv + '">'
         + '<input class="rb-em-u" type="number" step="1" min="0" placeholder="&mdash;"'
         + ' title="How well the position is known. A neighbour&#39;s house might be 15;'
         + ' something you measured, 0 or blank." value="' + uv + '">'
-        + '<span style="font-size:11px; color:#8b949e">' + live + '</span>'
+        + '<span class="rb-emit-live" title="' + live.replace(/<[^>]*>/g, '') + '">' + live + '</span>'
         + '</div>';
     });
     host.innerHTML = html;
 
     host.querySelectorAll('.rb-emit-row').forEach((row) => {
+      const applyStatus = () => {
+        // `surveyed` asserts the position was measured, so a radius of doubt
+        // beside it means one of the two is wrong. Lock the field rather than
+        // let the pair be entered and rejected at save.
+        const st = row.querySelector('.rb-em-status').value;
+        const unc = row.querySelector('.rb-em-u');
+        if (st === 'surveyed') {
+          unc.value = '';
+          unc.disabled = true;
+          unc.placeholder = 'measured';
+          unc.title = 'A surveyed position is measured — it carries no uncertainty.';
+        } else {
+          unc.disabled = false;
+          unc.placeholder = '—';
+          unc.title = st === 'approved'
+            ? 'Approved means estimated, so this is required. How far out could it be?'
+            : 'Precision, not trust. A neighbour’s house might be 15; something you taped, 0 or blank.';
+        }
+      };
+      applyStatus();
+      row.querySelector('.rb-em-status').addEventListener('change', applyStatus);
       row.querySelectorAll('input, select').forEach((el) => {
         el.addEventListener('change', () => this._syncEmittersFromInputs());
       });
@@ -940,7 +985,7 @@ export class RoomBuilderTab {
         r(this._fromHeight(z || 0)),
       ];
       const unc = num('.rb-em-u');
-      if (unc === null) delete e.uncertainty_m;
+      if (e.status === 'surveyed' || unc === null) delete e.uncertainty_m;
       else e.uncertainty_m = r(this._fromDisplay(unc));
     });
   }

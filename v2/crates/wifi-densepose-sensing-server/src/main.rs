@@ -48,7 +48,7 @@ use wifi_densepose_sensing_server::inference::{fuse_room, NodeInference, RoomInf
 use wifi_densepose_sensing_server::provenance::SourceState;
 
 use ruvector_mincut::{DynamicMinCut, MinCutBuilder};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1885,12 +1885,27 @@ pub(crate) fn load_room_config(data_dir: &std::path::Path) -> RoomConfig {
 /// judged stationary", and a transmitter that moves teaches an association that
 /// is only true while it stands still — worse than having no illuminator at
 /// all. Promotion to `approved` is a decision, not a consequence of being loud.
+/// MACs marked `excluded`: known to move, or otherwise unwanted.
+///
+/// Enforced by refusing them at ingestion, so an excluded emitter leaves the
+/// link table, the fusion index and every consumer at once — and frees its
+/// slot. Without this, `excluded` only meant "not approved", which is
+/// indistinguishable from `pending` and quietly does nothing.
+pub(crate) fn excluded_emitter_macs(config: &RoomConfig) -> HashSet<[u8; 6]> {
+    config
+        .emitters
+        .iter()
+        .filter(|e| e.status == "excluded")
+        .filter_map(|e| parse_mac_str(&e.mac.to_ascii_lowercase()))
+        .collect()
+}
+
 pub(crate) fn approved_emitter_positions(
     config: &RoomConfig,
 ) -> HashMap<[u8; 6], [f32; 3]> {
     let mut out = HashMap::new();
     for e in &config.emitters {
-        if e.status != "approved" {
+        if !EMITTER_FOCUS_STATUSES.contains(&e.status.as_str()) {
             continue;
         }
         if let (Some(mac), Some(pos)) = (parse_mac_str(&e.mac.to_ascii_lowercase()), e.position) {
@@ -2258,6 +2273,7 @@ mod room_config_tests {
         assert!(validate_room_config(&c).unwrap_err().contains("no position"));
 
         e.position = Some([2.0, 3.0, 1.0]);
+        e.uncertainty_m = Some(2.0);   // approved == estimated, so it needs one
         c.emitters = vec![e];
         assert!(validate_room_config(&c).is_ok());
     }
@@ -2302,6 +2318,7 @@ mod room_config_tests {
         pending.position = Some([3.0, 4.0, 2.4]);           // positioned but unjudged
         let mut approved = emitter("00:23:a7:af:af:85");
         approved.position = Some([0.0, 7.92, -1.22]);
+        approved.uncertainty_m = Some(1.5);
         approved.status = "approved".into();
         let mut excluded = emitter("18:b4:30:b4:be:b7");
         excluded.position = Some([1.0, 1.0, 1.0]);
@@ -2324,6 +2341,97 @@ mod room_config_tests {
         e.status = "approved".into();          // deliberately no position
         c.emitters = vec![e];
         assert!(approved_emitter_positions(&c).is_empty());
+    }
+
+
+    /// `excluded` must actually exclude. Before this it only meant "not
+    /// approved", which is indistinguishable from `pending` and did nothing.
+    #[test]
+    fn excluded_emitters_are_collected_for_refusal() {
+        let mut c = base();
+        let mut moving = emitter("aa:bb:cc:dd:ee:ff");
+        moving.status = "excluded".into();
+        let mut fixed = emitter("00:23:a7:af:af:85");
+        fixed.position = Some([0.0, 7.92, -1.22]);
+        fixed.uncertainty_m = Some(1.5);
+        fixed.status = "approved".into();
+        c.emitters = vec![moving, fixed, emitter("64:16:66:c7:8c:51")];
+
+        let ex = excluded_emitter_macs(&c);
+        assert_eq!(ex.len(), 1, "only the excluded one");
+        assert!(ex.contains(&parse_mac_str("aa:bb:cc:dd:ee:ff").unwrap()));
+        // and the other two are untouched by exclusion
+        assert!(!ex.contains(&parse_mac_str("00:23:a7:af:af:85").unwrap()));
+        assert!(!ex.contains(&parse_mac_str("64:16:66:c7:8c:51").unwrap()));
+    }
+
+    /// Trust and precision are ORTHOGONAL. An emitter can be trusted as fixed
+    /// while its position is only known to within a house — that is `approved`
+    /// with a large uncertainty, NOT `pending`. Pending is a queue state.
+    #[test]
+    fn an_approximate_position_can_still_be_approved() {
+        let mut c = base();
+        let mut sues = emitter("e0:d3:62:d0:f1:5c");
+        sues.label = Some("Sue's house".into());
+        sues.position = Some([-30.0, 12.0, 3.0]);
+        sues.uncertainty_m = Some(15.0);   // vague, but it is a house: it does not move
+        sues.status = "approved".into();
+        c.emitters = vec![sues];
+        assert!(validate_room_config(&c).is_ok());
+        assert_eq!(approved_emitter_positions(&c).len(), 1,
+                   "a vaguely-located but stationary emitter is still a focus");
+    }
+
+
+    /// The four states in triage order, and what separates the last two:
+    /// `approved` is an ESTIMATE and must say how rough, `surveyed` is a
+    /// MEASUREMENT and must not.
+    #[test]
+    fn surveyed_and_approved_cannot_contradict_their_uncertainty() {
+        let mut c = base();
+        let mut e = emitter("8c:30:66:86:ac:81");
+        e.position = Some([1.0, 2.0, 3.0]);
+
+        e.status = "surveyed".into();
+        e.uncertainty_m = Some(15.0);
+        c.emitters = vec![e.clone()];
+        assert!(validate_room_config(&c).unwrap_err().contains("no radius of doubt"));
+
+        e.uncertainty_m = None;                     // measured: no doubt
+        c.emitters = vec![e.clone()];
+        assert!(validate_room_config(&c).is_ok());
+
+        e.status = "approved".into();               // estimated: must state doubt
+        c.emitters = vec![e.clone()];
+        assert!(validate_room_config(&c).unwrap_err().contains("no uncertainty_m"));
+
+        e.uncertainty_m = Some(15.0);
+        c.emitters = vec![e];
+        assert!(validate_room_config(&c).is_ok());
+    }
+
+    /// Both trusted states become foci; the two untrusted ones never do.
+    #[test]
+    fn surveyed_and_approved_are_both_foci() {
+        let mut c = base();
+        let mut surveyed = emitter("8c:30:66:86:ac:81");
+        surveyed.position = Some([1.0, 2.0, 3.0]);
+        surveyed.status = "surveyed".into();
+        let mut approx = emitter("e0:d3:62:d0:f1:5c");
+        approx.position = Some([-30.0, 12.0, 3.0]);
+        approx.uncertainty_m = Some(15.0);
+        approx.status = "approved".into();
+        let mut shortlisted = emitter("64:16:66:c7:8c:51");
+        shortlisted.position = Some([4.0, 4.0, 2.4]);
+        let mut moving = emitter("aa:bb:cc:dd:ee:ff");
+        moving.status = "excluded".into();
+        c.emitters = vec![surveyed, approx, shortlisted, moving];
+
+        assert!(validate_room_config(&c).is_ok());
+        let foci = approved_emitter_positions(&c);
+        assert_eq!(foci.len(), 2, "surveyed + approved are foci; pending/excluded are not");
+        assert!(foci.contains_key(&parse_mac_str("8c:30:66:86:ac:81").unwrap()));
+        assert!(foci.contains_key(&parse_mac_str("e0:d3:62:d0:f1:5c").unwrap()));
     }
 
     #[test]
@@ -2871,6 +2979,8 @@ struct AppStateInner {
     /// entries land here: `pending` means "not yet judged stationary", and an
     /// unproven position must not become a solver focus.
     emitter_positions: HashMap<[u8; 6], [f32; 3]>,
+    /// Emitters the operator has marked as moving. Refused at ingestion.
+    excluded_emitters: HashSet<[u8; 6]>,
     /// Room bounds `(width_m, depth_m)` from Room Builder — `(0.0, 0.0)`
     /// when never configured. Used only by `step_bistatic_filter` to clamp
     /// its dead-reckoned position to "inside the room"; every other tier is
@@ -3181,6 +3291,7 @@ impl AppStateInner {
             ap_position: None,
             ap_mac: None,
             emitter_positions: HashMap::new(),
+            excluded_emitters: HashSet::new(),
             room_bounds: (0.0, 0.0),
             room_footprint: Vec::new(),
             room_debounced_level: "absent".to_string(),
@@ -10835,6 +10946,13 @@ async fn udp_receiver_task(
                     // the node-level feature path cannot use is still available
                     // to the link and fusion paths, which can.
                     if let Some(tx) = frame.source_mac {
+                        // An emitter marked as moving is refused here rather
+                        // than filtered downstream, so it leaves the link
+                        // table, the fusion index and every consumer at once
+                        // and stops occupying a slot.
+                        if s.excluded_emitters.contains(&tx) {
+                            continue;
+                        }
                         let now = std::time::Instant::now();
                         s.link_table
                             .observe(frame.node_id, tx, &frame.amplitudes, frame.rssi, now);
@@ -12851,6 +12969,7 @@ async fn main() {
     let room_footprint: Vec<Vec<[f64; 2]>>;
     let ap_mac: Option<[u8; 6]>;
     let mut emitter_positions: HashMap<[u8; 6], [f32; 3]> = HashMap::new();
+    let mut excluded_emitters: HashSet<[u8; 6]> = HashSet::new();
     let state: SharedState = Arc::new(RwLock::new(AppStateInner {
         link_table: links::LinkTable::new(),
         node_macs: HashMap::new(),
@@ -13002,6 +13121,7 @@ async fn main() {
                 );
             }
             emitter_positions = approved_emitter_positions(&room_config);
+            excluded_emitters = excluded_emitter_macs(&room_config);
             if !emitter_positions.is_empty() {
                 info!(
                     "Loaded {} approved emitter position(s) usable as illumination foci",
@@ -13018,6 +13138,7 @@ async fn main() {
         ap_position,
         ap_mac,
         emitter_positions,
+        excluded_emitters,
         room_bounds,
         room_footprint,
         room_debounced_level: "absent".to_string(),
@@ -14277,9 +14398,28 @@ pub(crate) fn validate_room_config(config: &RoomConfig) -> Result<(), String> {
         // Approval asserts "this thing does not move", which is a claim about a
         // place. Approving an emitter whose position is unknown would put an
         // unlocated focus into the geometric path.
-        if e.status == "approved" && e.position.is_none() {
+        if EMITTER_FOCUS_STATUSES.contains(&e.status.as_str()) && e.position.is_none() {
             return Err(format!(
-                "emitter {i} is approved but has no position; approval means                  it is trusted as a fixed focus, which requires one"
+                "emitter {i} is `{}` but has no position; that status means it is                  trusted as a fixed focus, which requires one",
+                e.status
+            ));
+        }
+        // `surveyed` claims the position was measured. Carrying a radius of
+        // doubt alongside that claim means one of the two is wrong, and a
+        // solver has no way to tell which — so the pair is refused rather than
+        // silently preferring one.
+        if e.status == "surveyed" && e.uncertainty_m.is_some_and(|u| u > 0.0) {
+            return Err(format!(
+                "emitter {i} is surveyed but carries uncertainty_m {}; a measured                  position has no radius of doubt — use `approved` for an estimate",
+                e.uncertainty_m.unwrap_or(0.0)
+            ));
+        }
+        // Conversely an approved (estimated) position without a stated doubt is
+        // indistinguishable from a surveyed one, and would be trusted as if
+        // measured.
+        if e.status == "approved" && !e.uncertainty_m.is_some_and(|u| u > 0.0) {
+            return Err(format!(
+                "emitter {i} is approved but states no uncertainty_m; an estimated                  position needs one — use `surveyed` if you measured it"
             ));
         }
         if !config.floors.is_empty() {
@@ -14301,8 +14441,27 @@ pub(crate) fn emitter_status_default() -> String {
     "pending".to_string()
 }
 
-/// The admission states an emitter may hold.
-pub(crate) const EMITTER_STATUSES: [&str; 3] = ["pending", "approved", "excluded"];
+/// The admission states an emitter may hold, in triage order.
+///
+/// Status answers "do I trust this thing to stay put"; `uncertainty_m` answers
+/// "how well do I know where it is". They are orthogonal everywhere except at
+/// the ends of the scale, which is why `surveyed` exists as its own state
+/// rather than being inferred from a zero uncertainty: it is the difference
+/// between "I measured this" and "I left the box empty".
+///
+/// - `excluded` — it moves. Refused at ingestion; leaves every consumer.
+/// - `pending`  — heard, shortlisted, not yet judged. Feeds position-free
+///   pattern-matching work but is never a geometric focus.
+/// - `approved` — trusted as fixed, position ESTIMATED. Needs a position and a
+///   non-zero `uncertainty_m`: a neighbour's router does not move, but you only
+///   know which house.
+/// - `surveyed` — trusted as fixed, position MEASURED. Needs a position and no
+///   uncertainty. Your own access point, a gateway you can put a tape on.
+pub(crate) const EMITTER_STATUSES: [&str; 4] =
+    ["excluded", "pending", "approved", "surveyed"];
+
+/// Statuses whose position may be used as a solver focus.
+pub(crate) const EMITTER_FOCUS_STATUSES: [&str; 2] = ["approved", "surveyed"];
 
 /// Parse `aa:bb:cc:dd:ee:ff` into six octets. `None` for anything else.
 pub(crate) fn parse_mac_str(s: &str) -> Option<[u8; 6]> {
@@ -14514,6 +14673,7 @@ async fn config_set_room(
         .as_ref()
         .and_then(|m| parse_mac_str(&m.to_ascii_lowercase()));
     s.emitter_positions = approved_emitter_positions(&config);
+    s.excluded_emitters = excluded_emitter_macs(&config);
     s.room_bounds = (config.width_m, config.depth_m);
     s.room_footprint = footprint_rings(&config);
     let data_dir = s.data_dir.clone();
