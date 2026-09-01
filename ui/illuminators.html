@@ -76,6 +76,9 @@
   .pill{display:inline-block; padding:0 5px; border-radius:3px; font-size:10.5px;
         border:1px solid var(--line); color:var(--dim);}
   .assigned{color:var(--violet);}
+  .dev{color:var(--fg); font-weight:600;}
+  .unnamed{color:var(--dim); font-weight:400; font-style:italic;}
+  .macsub{color:var(--dim); font-size:10px;}
   .note{color:var(--dim); font-size:11.5px; margin:10px 0 0; max-width:78ch;}
 </style>
 </head>
@@ -108,7 +111,7 @@ var assigned = {};   /* tx_mac -> emitter row from room config */
 
 var COLS = [
   ['verdict',    'verdict',   false],
-  ['tx_mac',     'mac',       false],
+  ['tx_mac',     'device',    false],
   ['kind',       'kind',      false],
   ['receivers',  'rx',        true],
   ['bestRssi',   'best dBm',  true],
@@ -132,6 +135,16 @@ function kindOf(m, row){
 }
 
 var apMac = null;
+
+/** Human name from the room-config roster, if the device has been named.
+ *  The MAC stays visible underneath — it is the identity everything else keys
+ *  on, and a label is a convenience that can be wrong or missing. */
+function labelOf(t){
+  var a = assigned[t.mac];
+  if (a && a.label) return a.label;
+  if (apMac && t.mac === apMac) return 'AP (associated)';
+  return '';
+}
 
 function verdict(t){
   /* Mobility overrides everything: a moving emitter teaches an association
@@ -167,8 +180,10 @@ function refresh(){
     fetchJSON('/api/v1/config/room')
   ]).then(function(res){
     var inv = res[0], room = res[1];
-    apMac = null;
-    if (room && room.ap_position) { /* label only; MAC comes from the roster */ }
+    /* The associated AP is identified by ap_mac in the room config rather
+     * than by an emitter row, so it needs naming here or the loudest
+     * transmitter in the house reads as "unnamed". */
+    apMac = (room && room.ap_mac) ? room.ap_mac : null;
     assigned = {};
     (room.emitters || []).forEach(function(e){ assigned[e.mac] = e; });
 
@@ -227,7 +242,8 @@ function render(inv, list){
     if (sortKey === 'verdict') { x = order[a.verdict]; y = order[b.verdict]; }
     else if (sortKey === 'grids') { x = Object.keys(a.grids)[0]; y = Object.keys(b.grids)[0]; }
     else if (sortKey === 'assigned') { x = assigned[a.mac] ? 1 : 0; y = assigned[b.mac] ? 1 : 0; }
-    else if (sortKey === 'tx_mac' || sortKey === 'kind') { x = a[sortKey === 'tx_mac' ? 'mac' : 'kind']; y = b[sortKey === 'tx_mac' ? 'mac' : 'kind']; }
+    else if (sortKey === 'tx_mac') { x = labelOf(a) || ('zzz' + a.mac); y = labelOf(b) || ('zzz' + b.mac); }
+    else if (sortKey === 'kind') { x = a.kind; y = b.kind; }
     else { x = a[sortKey]; y = b[sortKey]; }
     if (x < y) return sortDir; if (x > y) return -sortDir; return 0;
   });
@@ -265,7 +281,8 @@ function render(inv, list){
       : '<span class="pill">watching</span>';
     return '<tr title="' + reasonFor(t, t.verdict) + '">' +
       '<td class="v-' + t.verdict + '">' + t.verdict + '</td>' +
-      '<td class="mac">' + t.mac + '</td>' +
+      '<td><span class="dev">' + (labelOf(t) || '<span class="unnamed">unnamed</span>') + '</span>'
+        + '<br><span class="macsub">' + t.mac + '</span></td>' +
       '<td>' + t.kind + '</td>' +
       '<td class="n">' + t.receivers + '</td>' +
       '<td class="n">' + t.bestRssi.toFixed(0) + '</td>' +
