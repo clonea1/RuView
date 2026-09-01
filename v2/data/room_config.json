@@ -282,8 +282,14 @@
     },
     {
       "mac": "fc:b4:67:ab:94:6c",
-      "label": "Hatch Rest 2nd Gen",
-      "status": "pending"
+      "label": "Hatch Rest 2nd Gen (kids)",
+      "position": [
+        13.1064,
+        8.2906,
+        3.4442
+      ],
+      "uncertainty_m": 0.9144,
+      "status": "approved"
     },
     {
       "mac": "48:70:1e:29:ff:a2",
@@ -399,8 +405,14 @@
     },
     {
       "mac": "80:64:6f:ac:d7:ad",
-      "label": "Rachio Valve hub",
-      "status": "pending"
+      "label": "Rachio Valve hub (basement)",
+      "position": [
+        4.2672,
+        10.3632,
+        -1.3716
+      ],
+      "uncertainty_m": 1.8288,
+      "status": "approved"
     },
     {
       "mac": "cc:c0:79:b2:ef:cc",
@@ -409,8 +421,14 @@
     },
     {
       "mac": "10:a5:62:24:bb:30",
-      "label": "Skylight",
-      "status": "pending"
+      "label": "Skylight (kitchen)",
+      "position": [
+        4.5415,
+        2.987,
+        1.6764
+      ],
+      "uncertainty_m": 0.9144,
+      "status": "approved"
     },
     {
       "mac": "8c:30:66:86:ac:81",
