@@ -62,6 +62,25 @@ pub struct LinkObservation {
     /// node-to-node links run 0.02-0.55, so raw values let three links decide
     /// everything and silence the three with the useful parallax.
     pub response: f64,
+    /// How much this link's vote counts, in `(0, 1]`. See
+    /// [`temporal_authority`].
+    ///
+    /// Exists because `response` alone hides *when* it was measured. Every
+    /// link's motion figure is a statistic over that link's own window, and
+    /// MEASURED 2026-09-01 those windows span 1.2 s to 4695 s (median 166 s).
+    /// Pooling them unweighted tells the solver that what one link saw over
+    /// the last 78 minutes and what another saw over the last two seconds are
+    /// equally about *now*.
+    ///
+    /// Deliberately a weight and never a filter. Window length is really
+    /// reception rate, so discarding slow links would delete the weak, long,
+    /// cross-house and cross-floor links — exactly the ones carrying the
+    /// parallax — and MEASURED on this fleet would strip every link from 11 of
+    /// 20 illuminators and 6 of 9 of our own boards, leaving 30% of the solve
+    /// on the access point and 22% on a 3D printer that is only powered on
+    /// while something is being printed. A stale link keeps its geometry and
+    /// simply stops outvoting a live one.
+    pub authority: f64,
 }
 
 /// Search-grid and kernel parameters.
@@ -179,6 +198,29 @@ pub fn normalise_response(raw_motion: f64, scale: f64) -> f64 {
     (raw_motion / scale).max(0.0)
 }
 
+/// Timescale, in seconds, that a position estimate is trying to describe.
+/// Roughly how long a person spends perturbing one link while walking past it.
+const AUTHORITY_TAU_S: f64 = 10.0;
+
+/// How much a link's vote counts, given the wall-clock span its motion figure
+/// was computed over.
+///
+/// `1 / (1 + span/tau)` — hyperbolic, and that choice is the point. An
+/// exponential would put a 236 s link at `e^-23`, which is a filter wearing a
+/// weight's clothing; the hyperbolic form leaves it at 0.04, so it still
+/// contributes its geometry and still cannot outvote a live link. Nothing is
+/// ever driven to zero, so no link is silently dropped.
+///
+/// A non-finite or non-positive span means the span is unknown rather than
+/// long, and returns full authority — the behaviour every caller had before
+/// this existed.
+pub fn temporal_authority(window_span_s: f64) -> f64 {
+    if !window_span_s.is_finite() || window_span_s <= 0.0 {
+        return 1.0;
+    }
+    1.0 / (1.0 + window_span_s / AUTHORITY_TAU_S)
+}
+
 fn dist(a: [f64; 2], b: [f64; 2]) -> f64 {
     let dx = a[0] - b[0];
     let dy = a[1] - b[1];
@@ -188,21 +230,31 @@ fn dist(a: [f64; 2], b: [f64; 2]) -> f64 {
 /// Pearson correlation. `None` when either input has no variance — for a cell
 /// that means every link predicts the same weight, so it explains no pattern
 /// and must not score as a perfect match.
-fn correlation(a: &[f64], b: &[f64]) -> Option<f64> {
+/// Pearson correlation with a per-sample weight.
+///
+/// `w` scales each link's influence on the means, the covariance and both
+/// variances, so a low-authority link shifts the answer less without being
+/// removed from it. With every weight equal this is the unweighted Pearson
+/// coefficient exactly, which is what keeps the pre-authority behaviour
+/// recoverable.
+fn correlation(a: &[f64], b: &[f64], w: &[f64]) -> Option<f64> {
     let n = a.len();
-    if n < 2 || b.len() != n {
+    if n < 2 || b.len() != n || w.len() != n {
         return None;
     }
-    let inv = 1.0 / n as f64;
-    let ma = a.iter().sum::<f64>() * inv;
-    let mb = b.iter().sum::<f64>() * inv;
+    let tw: f64 = w.iter().sum();
+    if !(tw > f64::EPSILON) {
+        return None;
+    }
+    let ma = a.iter().zip(w).map(|(x, wi)| x * wi).sum::<f64>() / tw;
+    let mb = b.iter().zip(w).map(|(x, wi)| x * wi).sum::<f64>() / tw;
     let (mut num, mut va, mut vb) = (0.0, 0.0, 0.0);
     for i in 0..n {
         let da = a[i] - ma;
         let db = b[i] - mb;
-        num += da * db;
-        va += da * da;
-        vb += db * db;
+        num += w[i] * da * db;
+        va += w[i] * da * da;
+        vb += w[i] * db * db;
     }
     if va <= f64::EPSILON || vb <= f64::EPSILON {
         return None;
@@ -285,6 +337,14 @@ pub fn estimate(
         return None;
     }
 
+    let authority: Vec<f64> = observations
+        .iter()
+        .map(|o| if o.authority.is_finite() { o.authority.clamp(0.0, 1.0) } else { 1.0 })
+        .collect();
+    if !authority.iter().any(|w| *w > f64::EPSILON) {
+        return None;
+    }
+
     let mut weights = vec![0.0_f64; observations.len()];
     let mut best = f64::NEG_INFINITY;
     // Two passes over the grid: one to find the peak, one to collect the cells
@@ -308,12 +368,18 @@ pub fn estimate(
             for (i, o) in observations.iter().enumerate() {
                 let w = link_weight(o.rx, o.tx, cell, cfg.ellipse_width_m);
                 weights[i] = w;
+                // Deliberately NOT scaled by authority. This gate asks whether
+                // any link illuminates the cell at all -- a geometric question
+                // -- and scaling it by staleness made the whole grid fail the
+                // gate whenever the fleet was quiet, so the solver went blind
+                // exactly when the house was still. Authority decides whose
+                // vote counts, not whether a place exists.
                 mass += w;
             }
             if mass < MIN_CELL_OBSERVABILITY {
                 continue;
             }
-            let Some(score) = correlation(&observed, &weights) else {
+            let Some(score) = correlation(&observed, &weights, &authority) else {
                 continue;
             };
             if score > best {
@@ -400,8 +466,110 @@ mod tests {
                 rx,
                 tx,
                 response: 1.0 + 4.0 * link_weight(rx, tx, truth, cfg.ellipse_width_m),
+                authority: 1.0,
             })
             .collect()
+    }
+
+    #[test]
+    fn authority_falls_with_the_window_span_but_never_reaches_zero() {
+        // The measured spread on this fleet, 2026-09-01.
+        let live = temporal_authority(1.9);
+        let median_fast = temporal_authority(10.4);
+        let median_slow = temporal_authority(236.3);
+        let worst = temporal_authority(4695.3);
+
+        assert!(live > median_fast && median_fast > median_slow && median_slow > worst,
+                "authority must fall monotonically with span");
+        assert!(live > 0.8, "a 1.9 s window is about now: {live}");
+        assert!(worst > 0.0,
+                "nothing may be driven to zero -- that is a filter, and filtering \
+                 deletes the weak cross-house links this exists to preserve");
+        // The 78-minute link still speaks, at roughly a 400th of a live link's
+        // volume. Present, and unable to outvote.
+        assert!(worst < live / 100.0, "{worst} vs {live}");
+    }
+
+    #[test]
+    fn authority_treats_an_unknown_span_as_full_not_stale() {
+        // Every caller before authority existed behaved as weight 1.
+        assert_eq!(temporal_authority(0.0), 1.0);
+        assert_eq!(temporal_authority(-1.0), 1.0);
+        assert_eq!(temporal_authority(f64::NAN), 1.0);
+        assert_eq!(temporal_authority(f64::INFINITY), 1.0);
+    }
+
+    #[test]
+    fn equal_authority_reproduces_the_unweighted_estimate_exactly() {
+        // The doc comment on `correlation` claims equal weights give the plain
+        // Pearson coefficient. If that ever stops holding, every pre-authority
+        // result silently moves.
+        let cfg = room();
+        let truth = [6.0, 5.0];
+        let a = estimate(&observations_for(truth, &cfg), &cfg, &[]).unwrap();
+
+        let half: Vec<LinkObservation> = observations_for(truth, &cfg)
+            .into_iter()
+            .map(|o| LinkObservation { authority: 0.5, ..o })
+            .collect();
+        let b = estimate(&half, &cfg, &[]).unwrap();
+
+        assert_eq!((a.x, a.y), (b.x, b.y),
+                   "a uniform authority scale must not move the answer");
+    }
+
+    #[test]
+    fn a_stale_link_cannot_outvote_the_live_ones() {
+        // THE POINT OF THE WHOLE MECHANISM, stated as the property that
+        // actually defines a weight: driving a link's authority toward zero
+        // must approach OMITTING it, without ever removing it. Comparing error
+        // against truth was the wrong assertion -- with one bad link among six
+        // both answers land within a couple of cells and the comparison is
+        // decided by rounding.
+        let cfg = room();
+        let truth = [3.0, 3.0];
+        let elsewhere = [11.0, 8.0];
+
+        // One link reports a response synthesised from the far side of the
+        // room: the shape of a metric averaged over a window long enough to
+        // describe somewhere the subject used to be.
+        let mut obs = observations_for(truth, &cfg);
+        obs[0].response = observations_for(elsewhere, &cfg)[0].response;
+
+        let full = estimate(&obs, &cfg, &[]).unwrap();
+        let full = [full.x, full.y];
+
+        let mut down = obs.clone();
+        down[0].authority = temporal_authority(4695.3);
+        let down = estimate(&down, &cfg, &[]).unwrap();
+        let down = [down.x, down.y];
+
+        let omitted = estimate(&obs[1..], &cfg, &[]).unwrap();
+        let omitted = [omitted.x, omitted.y];
+
+        let d = |a: [f64; 2], b: [f64; 2]| ((a[0]-b[0]).powi(2) + (a[1]-b[1]).powi(2)).sqrt();
+
+        // Non-vacuous: the corrupted link must actually matter at full weight.
+        assert!(d(full, omitted) > 1e-9,
+                "the stale link changes nothing even unweighted -- test proves nothing");
+        // And the mechanism: down-weighting moves the answer toward omission.
+        assert!(d(down, omitted) < d(full, omitted),
+                "low authority must approach omission: down {:?} is {:.3} from                  omitted {:?}, but full-weight {:?} is {:.3}",
+                down, d(down, omitted), omitted, full, d(full, omitted));
+    }
+
+    #[test]
+    fn a_wholly_stale_fleet_still_produces_an_estimate() {
+        // Weighting, not filtering: if EVERY link is slow there is still an
+        // answer, because the alternative is a system that goes blind exactly
+        // when the house is quiet -- which is most of the time.
+        let cfg = room();
+        let obs: Vec<LinkObservation> = observations_for([7.0, 4.0], &cfg)
+            .into_iter()
+            .map(|o| LinkObservation { authority: temporal_authority(3000.0), ..o })
+            .collect();
+        assert!(estimate(&obs, &cfg, &[]).is_some(),
+                "an all-slow fleet must still be solvable");
     }
 
     #[test]
@@ -514,9 +682,9 @@ mod tests {
         // Three collinear links along one wall: many cells explain the same
         // pattern, so the near-peak set must be visibly spread out.
         let flat = vec![
-            LinkObservation { rx: [0.0, 0.0], tx: [10.0, 0.0], response: 3.0 },
-            LinkObservation { rx: [0.0, 0.1], tx: [10.0, 0.1], response: 3.0 },
-            LinkObservation { rx: [0.0, 0.2], tx: [10.0, 0.2], response: 1.0 },
+            LinkObservation { rx: [0.0, 0.0], tx: [10.0, 0.0], response: 3.0, authority: 1.0 },
+            LinkObservation { rx: [0.0, 0.1], tx: [10.0, 0.1], response: 3.0, authority: 1.0 },
+            LinkObservation { rx: [0.0, 0.2], tx: [10.0, 0.2], response: 1.0, authority: 1.0 },
         ];
         if let Some(amb) = estimate(&flat, &cfg, &[]) {
             assert!(
@@ -622,6 +790,7 @@ mod tests {
                 rx,
                 tx,
                 response: 1.0 + 4.0 * link_weight(rx, tx, truth, ellipse),
+                authority: 1.0,
             })
             .collect();
 

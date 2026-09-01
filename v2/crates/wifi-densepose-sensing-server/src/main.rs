@@ -10262,6 +10262,9 @@ fn rti_from_links(
             rx: [rx[0] as f64, rx[1] as f64],
             tx,
             response,
+            // Not every link is talking about the same instant. See
+            // `rti::temporal_authority`.
+            authority: rti::temporal_authority(m.window_span_s),
         });
     }
 
