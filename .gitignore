@@ -353,3 +353,11 @@ firmware/esp32-csi-node/build_*/
 firmware/esp32-csi-node/sdkconfig.diag
 firmware/esp32-csi-node/sdkconfig.gate
 firmware/esp32-csi-node/release_bins/
+
+# Device flash images captured before a diagnostic firmware flash.
+# Binary board images (bootloader/app/otadata) — never belong in the repo.
+firmware/esp32-csi-node/_revert_backup/
+
+# Server stderr sidecars, same rationale as the .log files above — runtime
+# output, may carry telemetry, never part of the source tree.
+v2/data/*.err
