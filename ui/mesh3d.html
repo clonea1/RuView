@@ -160,7 +160,12 @@ function truthPos(id){
     return a ? toView(a[0]*M2F, a[1]*M2F, a[2]*M2F) : null;
   }
   var n = (truth.nodes || []).filter(function(x){ return String(x.id) === String(id); })[0];
-  return n ? toView(n.x*M2F, n.y*M2F, n.z*M2F) : null;
+  if (n) return toView(n.x*M2F, n.y*M2F, n.z*M2F);
+  // A trusted illuminator has a real position too, so it anchors the layout the
+  // same way a surveyed node does. An `approved` one is an estimate, but it is
+  // still a far better constraint than solving its position from RSSI alone.
+  var e = emitterById(id);
+  return e ? toView(e.position[0]*M2F, e.position[1]*M2F, e.position[2]*M2F) : null;
 }
 function trueFeet(a, b){
   var A = truthPos(a), B = truthPos(b);
@@ -269,22 +274,76 @@ function draw(){
   ids.map(function(id){ return {id:id, p:project(pos[id], w, h)}; })
      .sort(function(a,b){ return a.p.d - b.p.d; })
      .forEach(function(o){
-       var r = 9 + o.p.d * 0.02;
-       ctx.beginPath(); ctx.arc(o.p.x, o.p.y, Math.max(5,r), 0, Math.PI*2);
-       ctx.fillStyle = o.id === 'AP' ? '#388bfd' : '#e6edf3';
+       var r = Math.max(5, 9 + o.p.d * 0.02);
+       var em = emitterById(o.id);
+       var isNode = /^[0-9]+$/.test(o.id);
+       // Illuminators are squares, our boards circles, the AP a blue circle —
+       // the same shape language as world3d and the Room Builder plan, so the
+       // three views can be read against each other without a key.
+       if (em) {
+         ctx.beginPath();
+         ctx.rect(o.p.x - r, o.p.y - r, r * 2, r * 2);
+         ctx.fillStyle = '#2ea043';
+       } else {
+         ctx.beginPath();
+         ctx.arc(o.p.x, o.p.y, r, 0, Math.PI * 2);
+         ctx.fillStyle = o.id === 'AP' ? '#388bfd' : '#e6edf3';
+       }
        ctx.fill();
        ctx.fillStyle = '#0d1117'; ctx.font = 'bold 10px ui-monospace';
        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-       ctx.fillText(o.id === 'AP' ? 'AP' : o.id, o.p.x, o.p.y);
+       // Inside the marker only for short identities; a named illuminator gets
+       // its label underneath, where it has room.
+       ctx.fillText(isNode ? o.id : (o.id === 'AP' ? 'AP' : ''), o.p.x, o.p.y);
+       if (em) {
+         ctx.fillStyle = '#2ea043'; ctx.font = '10px ui-monospace';
+         ctx.fillText(em.label || o.id.slice(-8), o.p.x, o.p.y + r + 9);
+       }
        ctx.textAlign = 'start'; ctx.textBaseline = 'alphabetic';
      });
+}
+
+/** Stable identity for a link's transmitter.
+ *
+ * `tx_node_inferred` is only populated for our own boards. Everything else —
+ * the AP, a second access point, a Powerwall gateway, nine Nest Protects —
+ * arrives as null, so keying on it merged them all into one "AP" point and
+ * averaged their RSSI together. Since the per-link grid fix admitted 30+
+ * transmitters, that stopped being a rounding error and became a fiction.
+ *
+ * The MAC is the only identity that is always right, so it is the fallback.
+ */
+function txIdentity(l){
+  if (l.tx_node_inferred !== null && l.tx_node_inferred !== undefined) {
+    return String(l.tx_node_inferred);
+  }
+  if (truth && truth.ap_mac && l.tx_mac === truth.ap_mac) return 'AP';
+  return l.tx_mac;
+}
+
+/** Human label for an identity: a node number, the AP, or an emitter's name. */
+function idLabel(id){
+  if (id === 'AP') return 'AP';
+  if (/^[0-9]+$/.test(id)) return 'n' + id;
+  var e = emitterById(id);
+  return e && e.label ? e.label : id.slice(-8);
+}
+
+/** The room-config emitter for a MAC identity, if it is one we trust. */
+function emitterById(id){
+  if (!truth || !truth.emitters) return null;
+  for (var i = 0; i < truth.emitters.length; i++) {
+    var e = truth.emitters[i];
+    if (e.mac === id && Array.isArray(e.position) &&
+        (e.status === 'approved' || e.status === 'surveyed')) return e;
+  }
+  return null;
 }
 
 function buildPairs(){
   var best = {};
   links.forEach(function(l){
-    var tx = (l.tx_node_inferred === null || l.tx_node_inferred === undefined)
-             ? 'AP' : String(l.tx_node_inferred);
+    var tx = txIdentity(l);
     var rx = String(l.rx_node);
     if (tx === rx) return;
     var k = [rx,tx].sort().join('|');
@@ -296,7 +355,11 @@ function buildPairs(){
   return Object.keys(best).map(function(k){
     var e = best[k];
     var mean = e.v.reduce(function(s,x){return s+x;},0) / e.v.length;
-    var isAp = (e.a === 'AP' || e.b === 'AP');
+    // Reference power is a property of the transmitter CLASS, not of one
+    // device: an access point, a gateway and a mains smoke detector all
+    // transmit harder than a bare ESP32, so any non-node endpoint takes the
+    // stronger reference.
+    var isAp = !/^[0-9]+$/.test(e.a) || !/^[0-9]+$/.test(e.b);
     var rf = rssiToFeet(mean, isAp), tf = trueFeet(e.a, e.b);
     return {a:e.a, b:e.b, d:rf, rssi:mean, ap:isAp,
             truth:tf, excess:(tf ? rf - tf : null), ratio:(tf ? rf / tf : null)};
@@ -352,7 +415,7 @@ function recompute(){
   }).forEach(function(p){
     var col = p.ratio === null ? '#8b949e'
             : p.ratio > 1.8 ? '#f85149' : p.ratio > 1.25 ? '#d29922' : '#2ea043';
-    rows += '<tr><td>' + p.a + ' &harr; ' + p.b + '</td>' +
+    rows += '<tr><td>' + idLabel(p.a) + ' &harr; ' + idLabel(p.b) + '</td>' +
             '<td class="n">' + (p.truth === null ? '&mdash;' : p.truth.toFixed(0)) + '</td>' +
             '<td class="n">' + p.d.toFixed(0) + '</td>' +
             '<td class="n" style="color:' + col + '">' +
@@ -491,7 +554,7 @@ document.getElementById('auto').onclick = function(){
             f.n.toFixed(2) + ', AP gain ' + AP_GAIN + ' dB.';
   if (dropped.length) {
     msg += '<br><b>Excluded as obstructed:</b> ' + dropped.map(function(d){
-      return d.pair.a + '&harr;' + d.pair.b + ' (' + d.dB.toFixed(0) + ' dB off)';
+      return idLabel(d.pair.a) + '&harr;' + idLabel(d.pair.b) + ' (' + d.dB.toFixed(0) + ' dB off)';
     }).join(', ') + '. Those are the blocked paths &mdash; the model is now ' +
     'calibrated on the clear ones, so the excess column reads the room.';
   }

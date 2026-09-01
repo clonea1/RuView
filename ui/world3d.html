@@ -89,6 +89,7 @@
       <label class="tg"><input type="checkbox" id="tShell" checked> shell</label>
       <label class="tg"><input type="checkbox" id="tPeer" checked> node links</label>
       <label class="tg"><input type="checkbox" id="tAp" checked> AP links</label>
+      <label class="tg"><input type="checkbox" id="tEmit" checked> illuminators</label>
       <label class="tg"><input type="checkbox" id="tLabels" checked> labels</label>
       <label class="tg"><input type="checkbox" id="tSlabOnly"> through-slab only</label>
     </div>
@@ -97,6 +98,7 @@
     <div class="key"><span class="sw" style="background:#2ea043"></span> same storey</div>
     <div class="key"><span class="sw" style="background:#d29922"></span> crosses a floor slab</div>
     <div class="key"><span class="sw" style="background:#a371f7"></span> node &rarr; access point</div>
+    <div class="key"><span class="sw" style="background:#2ea043"></span> node &rarr; trusted illuminator</div>
     <div class="sub" style="margin-top:6px;">
       Thickness is measured co-reception: how many transmissions both boards
       captured, from the <code>(tx_mac, rx_seq)</code> pairing index. Note what
@@ -142,6 +144,11 @@ var apLinks = [];    // [{rx_node, rssi_dbm, fps}] infrastructure links
 // distance — which is what the slab comparison needs and the AP links, whose
 // far end is a single fixed point, cannot supply.
 var peerLinks = [];
+/* Trusted illuminators from the room config, plus which nodes currently hear
+ * each one. Only `approved` and `surveyed` appear: those are the transmitters
+ * whose coordinates the solver may actually use, so they are the only ones
+ * whose geometry it is honest to draw. */
+var emitters = [];
 var nodeState = {};  // node_id -> {status, rssi_dbm}
 var lastErr = null;
 
@@ -213,6 +220,14 @@ function recentre(){
   });
   (cfg.nodes || []).forEach(function(n){ add(n.x, n.y, n.z); });
   if (cfg.ap_position) add(cfg.ap_position[0], cfg.ap_position[1], cfg.ap_position[2]);
+  /* Sub-floor emitters are the reason this matters: a basement gateway sits
+   * below every other point in the model, and leaving it out of the centring
+   * pushes it off the bottom of the view. */
+  ((cfg.emitters) || []).forEach(function(e){
+    if (Array.isArray(e.position) && (e.status === 'approved' || e.status === 'surveyed')) {
+      add(e.position[0], e.position[1], e.position[2]);
+    }
+  });
   if (!xs.length) return;
   function mid(a){ return (Math.min.apply(null,a) + Math.max.apply(null,a)) / 2; }
   centre = {x: mid(xs), y: mid(ys), z: mid(zs)};
@@ -372,6 +387,83 @@ function drawApLinks(w, h){
   });
 }
 
+/** Trusted illuminators, and a chord to each node that currently hears one.
+ *
+ * These are what the whole illuminator effort is for: a second access point, a
+ * basement gateway, a ceiling smoke detector. Each is a bistatic source with a
+ * known position, and the chords are the geometry it contributes.
+ *
+ * A surveyed emitter draws solid; an estimated one draws hollow with a ring
+ * whose radius IS its stated uncertainty, in metres, at the same scale as
+ * everything else. That is deliberately not a label — a 15 m ring around a
+ * neighbour's router visibly constrains far less than a taped-in gateway, and
+ * seeing that is the point.
+ */
+function drawEmitters(w, h){
+  emitters.forEach(function(e){
+    var p = project(pt(e.pos[0], e.pos[1], e.pos[2]), w, h);
+
+    /* Chords to the nodes hearing it right now. Same weighting rule as the AP
+     * links so the two are comparable by eye. */
+    e.rx.forEach(function(r){
+      var N = nodeById(r.rx_node);
+      if (!N) return;
+      var pn = project(pt(N.x, N.y, N.z), w, h);
+      var q = Math.max(0, Math.min(1, (r.rssi_dbm + 95) / 40));
+      push((p.d + pn.d) / 2, function(){
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y); ctx.lineTo(pn.x, pn.y);
+        ctx.strokeStyle = 'rgba(46,160,67,' + (0.16 + 0.5 * q) + ')';
+        ctx.lineWidth = 0.5 + 2.0 * q;
+        ctx.stroke();
+      });
+    });
+
+    push(p.d, function(){
+      /* Drop line to the ground plane. Without it a sub-floor emitter is
+       * indistinguishable from one at head height under this projection. */
+      var foot = project(pt(e.pos[0], e.pos[1], 0), w, h);
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y); ctx.lineTo(foot.x, foot.y);
+      ctx.strokeStyle = 'rgba(46,160,67,0.35)';
+      ctx.setLineDash([3, 3]); ctx.lineWidth = 1; ctx.stroke();
+      ctx.setLineDash([]);
+
+      if (e.uncertainty > 0) {
+        /* Horizontal ring at the emitter's own height. */
+        var s0 = project(pt(e.pos[0], e.pos[1], e.pos[2]), w, h);
+        var s1 = project(pt(e.pos[0] + e.uncertainty, e.pos[1], e.pos[2]), w, h);
+        var rpx = Math.hypot(s1.x - s0.x, s1.y - s0.y);
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, rpx, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(46,160,67,0.40)';
+        ctx.setLineDash([4, 4]); ctx.lineWidth = 1; ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      var half = 6;
+      ctx.beginPath();
+      ctx.rect(p.x - half, p.y - half, half * 2, half * 2);
+      ctx.fillStyle = '#2ea043';
+      ctx.fill();
+      ctx.strokeStyle = '#0d1117'; ctx.lineWidth = 2; ctx.stroke();
+      if (!e.surveyed) {                       /* estimated: hollow centre */
+        ctx.beginPath();
+        ctx.rect(p.x - 2, p.y - 2, 4, 4);
+        ctx.fillStyle = '#0d1117'; ctx.fill();
+      }
+
+      if (on('tLabels')) {
+        ctx.fillStyle = '#2ea043';
+        ctx.font = '11px ui-monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(e.label, p.x, p.y - 11);
+        ctx.textAlign = 'left';
+      }
+    });
+  });
+}
+
 function drawMarkers(w, h){
   ((cfg && cfg.nodes) || []).forEach(function(n){
     var p = project(pt(n.x, n.y, n.z), w, h);
@@ -445,6 +537,7 @@ function draw(){
   if (on('tShell')) drawShell(w, h);
   if (on('tPeer')) drawPeerLinks(w, h);
   if (on('tAp')) drawApLinks(w, h);
+  if (on('tEmit')) drawEmitters(w, h);
   drawMarkers(w, h);
 
   prims.sort(function(a,b){ return a.d - b.d; });
@@ -576,7 +669,7 @@ function renderPanel(){
 
   document.getElementById('stamp').textContent =
     ((cfg && cfg.nodes) || []).length + ' nodes · ' + pairs.length + ' peer links · ' +
-    apLinks.length + ' AP links' + (lastErr ? ' · ' + lastErr : '');
+    apLinks.length + ' AP links · ' + emitters.length + ' illuminators' + (lastErr ? ' · ' + lastErr : '');
 }
 
 // ---- data ---------------------------------------------------------------
@@ -593,7 +686,8 @@ function refresh(){
     getJSON('/api/v1/config/room'),
     getJSON('/api/v1/fusion'),
     getJSON('/api/v1/links'),
-    getJSON('/api/v1/nodes')
+    getJSON('/api/v1/nodes'),
+    getJSON('/api/v1/links/inventory')
   ]).then(function(res){
     cfg = res[0];
     pairs = (res[1] && res[1].pairs) || [];
@@ -605,6 +699,29 @@ function refresh(){
     });
     nodeState = {};
     (((res[3] && res[3].nodes) || [])).forEach(function(n){ nodeState[n.node_id] = n; });
+
+    /* Which receivers currently hear each transmitter. Taken from the inventory
+     * rather than /api/v1/links because a transmitter with no computable motion
+     * metric is absent from the latter — and a silent illuminator is exactly
+     * the case worth drawing, since its geometry has not changed just because
+     * it stopped talking for a minute. */
+    var heard = {};
+    (((res[4] && res[4].links) || [])).forEach(function(r){
+      (heard[r.tx_mac] || (heard[r.tx_mac] = [])).push(r);
+    });
+    emitters = ((cfg && cfg.emitters) || []).filter(function(e){
+      return Array.isArray(e.position) &&
+             (e.status === 'approved' || e.status === 'surveyed');
+    }).map(function(e){
+      return {
+        mac: e.mac,
+        label: e.label || e.mac.slice(-8),
+        pos: e.position,
+        surveyed: e.status === 'surveyed',
+        uncertainty: e.uncertainty_m || 0,
+        rx: heard[e.mac] || []
+      };
+    });
     lastErr = null;
     recentre();
     renderPanel();
@@ -638,7 +755,7 @@ cv.addEventListener('wheel', function(e){
   draw();
 }, {passive:false});
 window.addEventListener('resize', draw);
-['tShell','tPeer','tAp','tLabels','tSlabOnly'].forEach(function(id){
+['tShell','tPeer','tAp','tEmit','tLabels','tSlabOnly'].forEach(function(id){
   document.getElementById(id).addEventListener('change', draw);
 });
 

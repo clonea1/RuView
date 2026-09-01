@@ -18,6 +18,11 @@ const CANVAS_H = 480;
 const MARGIN = 32;
 const NODE_RADIUS = 9;
 const AP_RADIUS = 8;
+// Illuminators are drawn as squares: distinct from the round sensor nodes
+// and the AP's diamond at a glance, which matters once a dozen of them are
+// on the plan at once.
+const EMITTER_HALF = 6;
+const EMITTER_COLOR = '#2ea043';
 const LIVE_DOT_RADIUS = 8;
 const METERS_PER_FOOT = 0.3048;
 const METERS_PER_INCH = 0.0254;
@@ -459,6 +464,13 @@ export class RoomBuilderTab {
             <button class="rb-btn" id="rbSave">Save</button>
             <button class="rb-btn secondary" id="rbReload" title="Discard unsaved changes and reload the last saved config">Reload from Saved</button>
           </div>
+          <p class="rb-hint">
+            Markers: sensor nodes are <span style="color:#e05561">red circles</span>,
+            the AP is a <span style="color:#a371f7">violet diamond</span>, and trusted
+            illuminators are <span style="color:#2ea043">green squares</span> — solid
+            when surveyed, hollow-centred when the position is an estimate, with a
+            dashed ring showing how far out it could be.
+          </p>
           <p class="rb-hint">
             Drag a node — or the AP marker (violet diamond), once set — on the
             canvas to reposition it (X/Y only — set height with the Z field).
@@ -945,7 +957,10 @@ export class RoomBuilderTab {
       applyStatus();
       row.querySelector('.rb-em-status').addEventListener('change', applyStatus);
       row.querySelectorAll('input, select').forEach((el) => {
-        el.addEventListener('change', () => this._syncEmittersFromInputs());
+        el.addEventListener('change', () => {
+          this._syncEmittersFromInputs();
+          this._render();
+        });
       });
     });
   }
@@ -1862,9 +1877,74 @@ export class RoomBuilderTab {
     // the compass drawn below.
     ctx.globalAlpha = 1;
 
+    this._drawEmitters(ctx);
     this._drawAp(ctx);
     this._drawLiveDot(ctx);
     this._drawCompass(ctx);
+  }
+
+  /** Draw trusted illuminators — `approved` and `surveyed` only.
+   *
+   * These are the transmitters the solver may actually use as foci, so they
+   * belong on the plan next to the nodes. `pending` is deliberately absent: it
+   * means "heard, not judged", and drawing it identically would imply the
+   * geometry is in play when it is not.
+   *
+   * The dashed ring is `uncertainty_m`. It is drawn to scale rather than
+   * summarised in a label because that is the honest picture — a neighbour's
+   * router with a 15 m ring visibly constrains far less than a gateway you put
+   * a tape on, and no number in a table conveys that as directly.
+   */
+  _drawEmitters(ctx) {
+    const list = (this.config.emitters || []).filter(
+      (e) => Array.isArray(e.position) && (e.status === 'approved' || e.status === 'surveyed')
+    );
+    if (!list.length) return;
+
+    list.forEach((e) => {
+      const [x, y] = e.position;
+      const { px, py, scale } = this._toPixel(x, y);
+      if (!Number.isFinite(px) || !Number.isFinite(py)) return;
+
+      // Dim anything explicitly on another storey, matching how nodes and walls
+      // behave. An emitter with no storey (a basement gateway, a neighbour's
+      // house) has nothing to compare against, so it always draws solid.
+      const onThisFloor = e.floor == null || e.floor === this._activeFloor;
+      ctx.globalAlpha = onThisFloor ? 1 : 0.3;
+
+      if (e.uncertainty_m > 0) {
+        ctx.beginPath();
+        ctx.arc(px, py, e.uncertainty_m * scale, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(46,160,67,0.45)';
+        ctx.setLineDash([4, 4]);
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      ctx.beginPath();
+      ctx.rect(px - EMITTER_HALF, py - EMITTER_HALF, EMITTER_HALF * 2, EMITTER_HALF * 2);
+      ctx.fillStyle = EMITTER_COLOR;
+      ctx.fill();
+      // A measured position gets a solid outline, an estimated one a hollow
+      // centre — the distinction the four-state model exists to make.
+      ctx.strokeStyle = '#0d1117';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      if (e.status === 'approved') {
+        ctx.beginPath();
+        ctx.rect(px - 2, py - 2, 4, 4);
+        ctx.fillStyle = '#0d1117';
+        ctx.fill();
+      }
+
+      ctx.fillStyle = EMITTER_COLOR;
+      ctx.font = '11px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(e.label || e.mac.slice(-8), px, py + EMITTER_HALF + 12);
+      ctx.textAlign = 'left';
+    });
+    ctx.globalAlpha = 1;
   }
 
   /** Draw the AP marker (a diamond, distinct from the round sensor nodes) —
