@@ -3,12 +3,12 @@
   "depth_m": 10.3632,
   "nodes": [
     {
-      "id": 3,
-      "x": 4.75488,
-      "y": 2.487168,
-      "z": 3.2004,
-      "floor": 2,
-      "label": "fuzzies room"
+      "id": 5,
+      "x": 3.029712,
+      "y": 2.999232,
+      "z": 0.508,
+      "floor": 1,
+      "label": "family room"
     },
     {
       "id": 6,
@@ -19,12 +19,12 @@
       "label": "dinning room"
     },
     {
-      "id": 5,
-      "x": 3.029712,
-      "y": 2.999232,
-      "z": 0.508,
-      "floor": 1,
-      "label": "family room"
+      "id": 2,
+      "x": 8.8392,
+      "y": 8.29056,
+      "z": 3.2004,
+      "floor": 2,
+      "label": "kids room"
     },
     {
       "id": 8,
@@ -35,20 +35,12 @@
       "label": "amys office"
     },
     {
-      "id": 0,
-      "x": 6.7056,
-      "y": 7.3152,
-      "z": 0.508,
-      "floor": 1,
-      "label": "Foyer"
-    },
-    {
-      "id": 2,
-      "x": 8.8392,
-      "y": 8.29056,
+      "id": 1,
+      "x": 0.0,
+      "y": 6.858,
       "z": 3.2004,
       "floor": 2,
-      "label": "kids room"
+      "label": "Guest room"
     },
     {
       "id": 4,
@@ -59,6 +51,14 @@
       "label": "master"
     },
     {
+      "id": 3,
+      "x": 4.75488,
+      "y": 2.487168,
+      "z": 3.2004,
+      "floor": 2,
+      "label": "fuzzies room"
+    },
+    {
       "id": 7,
       "x": 13.4112,
       "y": 6.7056,
@@ -67,12 +67,12 @@
       "label": "living room"
     },
     {
-      "id": 1,
-      "x": 0.0,
-      "y": 6.858,
-      "z": 3.2004,
-      "floor": 2,
-      "label": "Guest room"
+      "id": 0,
+      "x": 6.7056,
+      "y": 7.3152,
+      "z": 0.508,
+      "floor": 1,
+      "label": "Foyer"
     }
   ],
   "ap_position": [
@@ -80,6 +80,7 @@
     5.8674,
     4.9784
   ],
+  "ap_mac": "8c:30:66:86:a4:21",
   "floors": [
     {
       "level": 1,
@@ -147,6 +148,75 @@
           10.3632
         ]
       ]
+    }
+  ],
+  "emitters": [
+    {
+      "mac": "64:16:66:c7:8c:51",
+      "label": "Nest Aurora Room",
+      "status": "pending"
+    },
+    {
+      "mac": "64:16:66:cb:36:db",
+      "label": "Nest Basement",
+      "position": [
+        7.62,
+        7.3152,
+        -0.4064
+      ],
+      "uncertainty_m": 2.5,
+      "status": "approved"
+    },
+    {
+      "mac": "64:16:66:cb:35:e2",
+      "label": "Nest Entryway",
+      "status": "pending"
+    },
+    {
+      "mac": "e0:d3:62:d0:f9:08",
+      "label": "Nest Family Room",
+      "status": "pending"
+    },
+    {
+      "mac": "18:b4:30:b4:be:b7",
+      "label": "Nest Fuzzies",
+      "status": "pending"
+    },
+    {
+      "mac": "64:16:66:c7:6e:cd",
+      "label": "Nest Guest Room",
+      "status": "pending"
+    },
+    {
+      "mac": "64:16:66:c7:92:40",
+      "label": "Nest Master Bedroom",
+      "status": "pending"
+    },
+    {
+      "mac": "64:16:66:c7:64:36",
+      "label": "Nest Mud Room",
+      "status": "pending"
+    },
+    {
+      "mac": "64:16:66:cb:17:07",
+      "label": "Nest Upstairs Hall",
+      "status": "pending"
+    },
+    {
+      "mac": "00:23:a7:af:af:85",
+      "label": "TEG-394 Powerwall gateway",
+      "position": [
+        0.0,
+        7.9248,
+        -1.2192
+      ],
+      "uncertainty_m": 1.5,
+      "status": "approved"
+    },
+    {
+      "mac": "e8:ee:cc:a2:41:35",
+      "label": "unknown fleet-wide device",
+      "status": "pending"
     }
   ],
   "ap_floor": 2
