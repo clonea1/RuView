@@ -1806,6 +1806,17 @@ pub(crate) struct RoomConfig {
     /// future scope; this stays "one room, one AP, up to a few nodes."
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ap_position: Option<[f32; 3]>,
+    /// The access point's MAC, so it can be identified by ADDRESS.
+    ///
+    /// Without this the server had no way to recognise its own AP and fell
+    /// back to "a transmitter every receiver hears must be the infrastructure".
+    /// That held only while the per-node grid gate was hiding every other
+    /// transmitter. MEASURED 2026-09-01, hours after that gate moved per-link:
+    /// `e8:ee:cc:a2:41:35` was heard by all nine nodes and was NOT the AP, so
+    /// its links were being placed at the AP's coordinates and fed to the
+    /// position solver as if surveyed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ap_mac: Option<String>,
     /// Storeys, ascending. Empty means a single implicit ground floor, which
     /// is how every config written before this field existed behaves.
     ///
@@ -1866,6 +1877,27 @@ pub(crate) fn load_room_config(data_dir: &std::path::Path) -> RoomConfig {
         node.floor.get_or_insert(1);
     }
     config
+}
+
+/// Approved emitters that carry a position, keyed by MAC.
+///
+/// `pending` entries are deliberately excluded. Pending means "heard, not yet
+/// judged stationary", and a transmitter that moves teaches an association that
+/// is only true while it stands still — worse than having no illuminator at
+/// all. Promotion to `approved` is a decision, not a consequence of being loud.
+pub(crate) fn approved_emitter_positions(
+    config: &RoomConfig,
+) -> HashMap<[u8; 6], [f32; 3]> {
+    let mut out = HashMap::new();
+    for e in &config.emitters {
+        if e.status != "approved" {
+            continue;
+        }
+        if let (Some(mac), Some(pos)) = (parse_mac_str(&e.mac.to_ascii_lowercase()), e.position) {
+            out.insert(mac, pos);
+        }
+    }
+    out
 }
 
 /// Flatten a room config's per-storey outlines into rings for
@@ -1949,6 +1981,7 @@ mod room_config_tests {
             depth_m: 10.4,
             nodes: Vec::new(),
             ap_position: None,
+            ap_mac: None,
             ap_floor: None,
             floors: Vec::new(),
             walls: Vec::new(),
@@ -2249,6 +2282,50 @@ mod room_config_tests {
         assert!(validate_room_config(&c).is_ok());
     }
 
+
+    #[test]
+    fn a_malformed_ap_mac_is_rejected() {
+        let mut c = base();
+        c.ap_mac = Some("8c:30:66:86:a4".into());
+        assert!(validate_room_config(&c).unwrap_err().contains("ap_mac"));
+        c.ap_mac = Some("8c:30:66:86:a4:21".into());
+        assert!(validate_room_config(&c).is_ok());
+    }
+
+    /// Only APPROVED emitters become solver foci. `pending` means "heard, not
+    /// yet judged stationary", and a transmitter that moves teaches an
+    /// association only true while it stands still.
+    #[test]
+    fn only_approved_emitters_become_foci() {
+        let mut c = base();
+        let mut pending = emitter("64:16:66:c7:8c:51");
+        pending.position = Some([3.0, 4.0, 2.4]);           // positioned but unjudged
+        let mut approved = emitter("00:23:a7:af:af:85");
+        approved.position = Some([0.0, 7.92, -1.22]);
+        approved.status = "approved".into();
+        let mut excluded = emitter("18:b4:30:b4:be:b7");
+        excluded.position = Some([1.0, 1.0, 1.0]);
+        excluded.status = "excluded".into();
+        c.emitters = vec![pending, approved, excluded];
+
+        let foci = approved_emitter_positions(&c);
+        assert_eq!(foci.len(), 1, "only the approved emitter is a focus");
+        let teg = parse_mac_str("00:23:a7:af:af:85").unwrap();
+        assert_eq!(foci.get(&teg), Some(&[0.0f32, 7.92, -1.22]),
+                   "a basement emitter keeps its negative z as a focus");
+    }
+
+    /// An approved emitter with no position cannot be a focus. Validation
+    /// forbids that combination, but the table must not depend on it.
+    #[test]
+    fn an_approved_emitter_without_a_position_is_not_a_focus() {
+        let mut c = base();
+        let mut e = emitter("64:16:66:cb:36:db");
+        e.status = "approved".into();          // deliberately no position
+        c.emitters = vec![e];
+        assert!(approved_emitter_positions(&c).is_empty());
+    }
+
     #[test]
     fn first_floor_must_sit_at_the_origin() {
         let mut c = base();
@@ -2484,6 +2561,7 @@ mod room_config_tests {
                 RoomNode { id: 1, x: 3.66, y: 0.0, z: 0.4, floor: None, label: None },
             ],
             ap_position: Some([2.5, -1.0, 2.2]),
+            ap_mac: None,
             ap_floor: None,
         floors: Vec::new(),
         walls: Vec::new(),
@@ -2542,6 +2620,7 @@ mod room_config_tests {
                 RoomNode { id: 1, x: 3.66, y: 0.0, z: 0.4, floor: None, label: None },
             ],
             ap_position: None,
+            ap_mac: None,
             ap_floor: None,
         floors: Vec::new(),
         walls: Vec::new(),
@@ -2786,6 +2865,12 @@ struct AppStateInner {
     /// (`POST /api/v1/config/room`) and loaded from `room_config.json` at
     /// startup, mirroring `node_positions_config`. `None` until configured.
     ap_position: Option<[f32; 3]>,
+    /// The AP's MAC, for identifying it by address rather than by heuristic.
+    ap_mac: Option<[u8; 6]>,
+    /// Approved emitters with a known position, keyed by MAC. Only `approved`
+    /// entries land here: `pending` means "not yet judged stationary", and an
+    /// unproven position must not become a solver focus.
+    emitter_positions: HashMap<[u8; 6], [f32; 3]>,
     /// Room bounds `(width_m, depth_m)` from Room Builder — `(0.0, 0.0)`
     /// when never configured. Used only by `step_bistatic_filter` to clamp
     /// its dead-reckoned position to "inside the room"; every other tier is
@@ -3094,6 +3179,8 @@ impl AppStateInner {
             multistatic_fuser: MultistaticFuser::new(),
             node_positions_config: HashMap::new(),
             ap_position: None,
+            ap_mac: None,
+            emitter_positions: HashMap::new(),
             room_bounds: (0.0, 0.0),
             room_footprint: Vec::new(),
             room_debounced_level: "absent".to_string(),
@@ -10005,32 +10092,50 @@ fn rti_from_links(
         let Some(rx) = s.node_positions_config.get(&m.id.rx_node) else {
             continue;
         };
-        // Transmitter: known outright when the node reported its own MAC,
-        // otherwise the old hearing-set inference for nodes still on older
-        // firmware, otherwise assumed to be the configured AP.
-        let tx_node =
-            attribute_transmitter(&m.id.tx_mac, &s.node_macs, receivers, heard_by);
-        let tx = match tx_node {
-            Some(id) => match s.node_positions_config.get(&id) {
-                Some(p) => [p[0] as f64, p[1] as f64],
+        // Transmitter position, by ADDRESS wherever possible.
+        //
+        // Order matters: the AP's own MAC, then one of our boards, then an
+        // approved emitter. Only if none of those match do we consider the
+        // legacy hearing-set inference, and then only for a fleet still on
+        // pre-v2 firmware that cannot report its own MAC.
+        //
+        // The "heard by every receiver must be the AP" fallback below is now
+        // GUARDED. It was safe only while the per-node grid gate hid every
+        // non-associated transmitter. MEASURED 2026-09-01, hours after that
+        // gate moved per-link: `e8:ee:cc:a2:41:35` was heard by all nine nodes,
+        // was not the AP, and its links were being placed at the AP's
+        // coordinates — a fabricated position fed to the solver as if surveyed.
+        // With `ap_mac` configured the guess is never needed.
+        let tx = if Some(m.id.tx_mac) == s.ap_mac {
+            [ap[0] as f64, ap[1] as f64]
+        } else if let Some(p) = s.emitter_positions.get(&m.id.tx_mac) {
+            // An approved emitter: surveyed or deliberately approximated, and
+            // judged stationary. This is what makes a second AP, a Powerwall
+            // gateway or a ceiling smoke detector usable as a focus.
+            [p[0] as f64, p[1] as f64]
+        } else {
+            match attribute_transmitter(&m.id.tx_mac, &s.node_macs, receivers, heard_by) {
+                Some(id) => match s.node_positions_config.get(&id) {
+                    Some(p) => [p[0] as f64, p[1] as f64],
+                    None => {
+                        skipped_unknown_tx += 1;
+                        continue;
+                    }
+                },
                 None => {
-                    skipped_unknown_tx += 1;
-                    continue;
+                    // Only guess when we have no MAC for the AP at all. With
+                    // one configured, an unknown transmitter is skipped rather
+                    // than given somebody else's coordinates.
+                    let heard_all = s.ap_mac.is_none()
+                        && heard_by
+                            .get(&m.id.tx_mac)
+                            .is_some_and(|h| h.len() == receivers.len());
+                    if !heard_all {
+                        skipped_unknown_tx += 1;
+                        continue;
+                    }
+                    [ap[0] as f64, ap[1] as f64]
                 }
-            },
-            None => {
-                // Heard by every receiver ⇒ external infrastructure, which we
-                // take to be the configured AP. Heard by some but not all with
-                // no single hole ⇒ an unidentified transmitter whose position
-                // we do not know, and must not guess at.
-                let heard_all = heard_by
-                    .get(&m.id.tx_mac)
-                    .is_some_and(|h| h.len() == receivers.len());
-                if !heard_all {
-                    skipped_unknown_tx += 1;
-                    continue;
-                }
-                [ap[0] as f64, ap[1] as f64]
             }
         };
 
@@ -12744,6 +12849,8 @@ async fn main() {
     // guarded, so it needs no placeholder value that would only ever be
     // overwritten.
     let room_footprint: Vec<Vec<[f64; 2]>>;
+    let ap_mac: Option<[u8; 6]>;
+    let mut emitter_positions: HashMap<[u8; 6], [f32; 3]> = HashMap::new();
     let state: SharedState = Arc::new(RwLock::new(AppStateInner {
         link_table: links::LinkTable::new(),
         node_macs: HashMap::new(),
@@ -12885,6 +12992,22 @@ async fn main() {
                 info!("Loaded AP position from room_config.json: {ap:?}");
                 ap_position = Some(ap);
             }
+            ap_mac = room_config
+                .ap_mac
+                .as_ref()
+                .and_then(|m| parse_mac_str(&m.to_ascii_lowercase()));
+            if ap_mac.is_none() {
+                warn!(
+                    "room_config.json has no ap_mac: the AP will be identified by the                      legacy `heard by every receiver` heuristic, which mis-attributes                      any OTHER transmitter the whole fleet can hear (measured 2026-09-01).                      Set ap_mac to remove the guess."
+                );
+            }
+            emitter_positions = approved_emitter_positions(&room_config);
+            if !emitter_positions.is_empty() {
+                info!(
+                    "Loaded {} approved emitter position(s) usable as illumination foci",
+                    emitter_positions.len()
+                );
+            }
             engine_bridge_multistatic_cfg = Some(MultistaticConfig {
                 min_nodes: 1,
                 ..cfg
@@ -12893,6 +13016,8 @@ async fn main() {
         },
         node_positions_config,
         ap_position,
+        ap_mac,
+        emitter_positions,
         room_bounds,
         room_footprint,
         room_debounced_level: "absent".to_string(),
@@ -13940,6 +14065,7 @@ async fn config_get_room(State(state): State<SharedState>) -> Json<serde_json::V
         depth_m: saved.depth_m,
         nodes,
         ap_position: s.ap_position,
+        ap_mac: saved.ap_mac.clone(),
         ap_floor: saved.ap_floor,
         floors: saved.floors,
         walls: saved.walls,
@@ -14098,6 +14224,12 @@ pub(crate) fn validate_room_config(config: &RoomConfig) -> Result<(), String> {
                 "footprint {i} is on undefined floor {}",
                 ring.level
             ));
+        }
+    }
+
+    if let Some(m) = &config.ap_mac {
+        if parse_mac_str(&m.to_ascii_lowercase()).is_none() {
+            return Err(format!("ap_mac `{m}` is malformed; expected aa:bb:cc:dd:ee:ff"));
         }
     }
 
@@ -14377,6 +14509,11 @@ async fn config_set_room(
     }
     s.multistatic_fuser.set_node_positions(positions);
     s.ap_position = config.ap_position;
+    s.ap_mac = config
+        .ap_mac
+        .as_ref()
+        .and_then(|m| parse_mac_str(&m.to_ascii_lowercase()));
+    s.emitter_positions = approved_emitter_positions(&config);
     s.room_bounds = (config.width_m, config.depth_m);
     s.room_footprint = footprint_rings(&config);
     let data_dir = s.data_dir.clone();

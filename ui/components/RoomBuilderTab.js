@@ -57,6 +57,10 @@ export class RoomBuilderTab {
     // Where the pointer is, so the segment about to be committed is visible
     // before the click that commits it.
     this._ringHover = null;
+    // Live per-transmitter stats from /api/v1/links/inventory, keyed by MAC.
+    // Advisory only: the saved roster is config.emitters, so a transmitter
+    // that goes briefly silent must not vanish out of the editor mid-edit.
+    this._inventory = {};
     this._loaded = false;
     // Live tracked-position overlay, fed by sensingService (/ws/sensing).
     // `_liveDot` is only ever set from a "bistatic_velocity", "doppler_centroid",
@@ -380,6 +384,30 @@ export class RoomBuilderTab {
             </div>
           </div>
           <div class="rb-card">
+            <div class="rb-card-title">Illuminators</div>
+            <p class="rb-hint" style="margin-top:0;">
+              Every transmitter the fleet can hear. Each one is a potential
+              bistatic source — the AP is simply the one we happened to be
+              associated to. Giving a transmitter a position turns it into a
+              usable focus; leaving it blank is fine and still lets it serve
+              pattern-matching work, which never needs coordinates.
+            </p>
+            <p class="rb-hint" style="margin-top:0;">
+              <strong>approved</strong> means "trusted as a fixed focus" and needs a
+              position — it is a claim that the thing does not move.
+              <strong>pending</strong> is the default: heard, not yet judged.
+              <strong>excluded</strong> is for anything that moves; a mobile emitter
+              is worse than none, because what it teaches is only true while it
+              stands still.
+            </p>
+            <div class="rb-actions" style="margin-bottom:8px;">
+              <button class="rb-btn secondary" id="rbEmitRefresh">Refresh from fleet</button>
+              <button class="rb-btn secondary" id="rbEmitPrune"
+                      title="Forget entries with no position, no label and not currently heard">Prune unheard</button>
+            </div>
+            <div id="rbEmitterList"></div>
+          </div>
+          <div class="rb-card">
             <div class="rb-card-title">Sensor Nodes</div>
             <div class="rb-col-headers">
               <span>ID</span><span>Label</span><span>X (<span class="rb-unit-label">${this._unitLabel()}</span>)</span><span>Y (<span class="rb-unit-label">${this._unitLabel()}</span>)</span><span>Z (<span class="rb-hunit-label">${this._heightLabel()}</span>)</span><span>Floor</span><span></span>
@@ -598,6 +626,31 @@ export class RoomBuilderTab {
       this._renderFootprintControls();
       this._render();
     });
+    this.container.querySelector('#rbEmitRefresh').addEventListener('click', async (ev) => {
+      const b = ev.target;
+      b.disabled = true;
+      const was = b.textContent;
+      b.textContent = 'Refreshing...';
+      this._syncEmittersFromInputs();
+      await this._loadInventory();
+      this._renderIlluminators();
+      b.disabled = false;
+      b.textContent = was;
+    });
+    this.container.querySelector('#rbEmitPrune').addEventListener('click', () => {
+      // Only discard rows carrying no human decision AND not currently heard.
+      // A positioned or renamed entry is somebody's work, and a silent one may
+      // simply be asleep — normal for battery IoT, which wakes in bursts.
+      this._syncEmittersFromInputs();
+      const before = this.config.emitters.length;
+      this.config.emitters = this.config.emitters.filter((e) =>
+        e.position || e.label || e.status !== 'pending' || this._inventory[e.mac]);
+      const gone = before - this.config.emitters.length;
+      this._renderIlluminators();
+      toastManager.info(gone
+        ? ('Pruned ' + gone + ' unheard, unedited entr' + (gone === 1 ? 'y' : 'ies') + '.')
+        : 'Nothing to prune - every entry is heard or edited.');
+    });
     this.container.querySelector('#rbRemoveAp').addEventListener('click', () => {
       this.config.ap_position = null;
       this._renderApFields();
@@ -726,12 +779,14 @@ export class RoomBuilderTab {
           floors: Array.isArray(data.floors) ? data.floors : [],
           walls: Array.isArray(data.walls) ? data.walls : [],
           footprint: Array.isArray(data.footprint) ? data.footprint : [],
+          emitters: Array.isArray(data.emitters) ? data.emitters : [],
         };
       }
     } catch (e) {
       console.warn('[RoomBuilder] Failed to load room config, using defaults:', e.message);
     }
     this._loaded = true;
+    await this._loadInventory();
     this._refreshUnitDisplay();
   }
 
@@ -745,6 +800,149 @@ export class RoomBuilderTab {
     this._renderFloorControls();
     this._renderWallList();
     this._renderFootprintControls();
+    this._renderIlluminators();
+  }
+
+  // ---- Illuminators -----------------------------------------------------------
+
+  /** Pull live per-transmitter stats. Advisory only — the roster is whatever is
+   *  in config.emitters, so a transmitter that happens to be mid-silence still
+   *  shows its saved row rather than disappearing while you are editing it.
+   *  Nest units in particular sleep for minutes at a time. */
+  async _loadInventory() {
+    try {
+      const inv = await apiService.get('/api/v1/links/inventory');
+      const byTx = {};
+      (inv.links || []).forEach((r) => {
+        const t = byTx[r.tx_mac] || (byTx[r.tx_mac] = {
+          receivers: 0, best: -999, fps: 0, visible: 0, la: r.locally_administered,
+        });
+        t.receivers++;
+        t.best = Math.max(t.best, r.rssi_dbm);
+        t.fps += r.fps || 0;
+        if (r.visible_in_links) t.visible++;
+      });
+      this._inventory = byTx;
+    } catch (e) {
+      console.warn('[RoomBuilder] inventory unavailable:', e.message);
+    }
+  }
+
+  /** Union of the saved roster and whatever the fleet currently hears: a newly
+   *  discovered transmitter can be positioned without hand-editing JSON, and a
+   *  saved one never disappears because it went quiet. */
+  _emitterRows() {
+    if (!Array.isArray(this.config.emitters)) this.config.emitters = [];
+    const known = new Set(this.config.emitters.map((e) => e.mac));
+    Object.keys(this._inventory).forEach((mac) => {
+      if (!known.has(mac)) this.config.emitters.push({ mac, status: 'pending' });
+    });
+    const rank = { approved: 0, pending: 1, excluded: 2 };
+    return this.config.emitters.slice().sort((a, b) => {
+      const r = (rank[a.status] === undefined ? 1 : rank[a.status])
+              - (rank[b.status] === undefined ? 1 : rank[b.status]);
+      if (r) return r;
+      const ia = this._inventory[a.mac];
+      const ib = this._inventory[b.mac];
+      return ((ib && ib.receivers) || 0) - ((ia && ia.receivers) || 0);
+    });
+  }
+
+  _renderIlluminators() {
+    const host = this.container.querySelector('#rbEmitterList');
+    if (!host) return;
+    const rows = this._emitterRows();
+    if (!rows.length) {
+      host.innerHTML = '<p class="rb-hint" style="margin:6px 2px 0;">'
+        + 'No transmitters yet — press <strong>Refresh from fleet</strong>.</p>';
+      return;
+    }
+    const u = this._unitLabel();
+    const hu = this._heightLabel();
+    const GRID = 'grid-template-columns:92px 1fr 62px 62px 62px 58px 148px;';
+
+    let html = '<div class="rb-col-headers" style="' + GRID + '">'
+      + '<span>status</span><span>label / MAC</span>'
+      + '<span>X (' + u + ')</span><span>Y (' + u + ')</span><span>Z (' + hu + ')</span>'
+      + '<span>&plusmn;' + u + '</span><span>heard now</span></div>';
+
+    rows.forEach((e) => {
+      const idx = this.config.emitters.indexOf(e);
+      const st = this._inventory[e.mac];
+      const p = Array.isArray(e.position) ? e.position : null;
+      const xv = p ? this._toDisplay(p[0]).toFixed(2) : '';
+      const yv = p ? this._toDisplay(p[1]).toFixed(2) : '';
+      const zv = p ? this._toHeight(p[2]).toFixed(1) : '';
+      const uv = (e.uncertainty_m !== undefined && e.uncertainty_m !== null)
+        ? this._toDisplay(e.uncertainty_m).toFixed(0) : '';
+      const live = st
+        ? (st.receivers + ' rx &middot; ' + st.best.toFixed(0) + ' dBm &middot; ' + st.fps.toFixed(2) + ' fps')
+        : '<span style="color:#6b7280">silent right now</span>';
+      const opt = (v) => '<option value="' + v + '"'
+        + (e.status === v ? ' selected' : '') + '>' + v + '</option>';
+      const label = (e.label || '').split('"').join('&quot;');
+
+      html += '<div class="rb-emit-row" data-index="' + idx + '" style="display:grid; '
+        + GRID + ' gap:6px; align-items:center; margin-top:5px;">'
+        + '<select class="rb-em-status">' + opt('pending') + opt('approved') + opt('excluded') + '</select>'
+        + '<span><input class="rb-em-label" type="text" placeholder="unnamed" value="' + label + '" style="width:100%">'
+        + '<br><span style="font-size:10.5px; color:#6b7280">' + e.mac + '</span></span>'
+        + '<input class="rb-em-x" type="number" step="0.5" placeholder="&mdash;" value="' + xv + '">'
+        + '<input class="rb-em-y" type="number" step="0.5" placeholder="&mdash;" value="' + yv + '">'
+        + '<input class="rb-em-z" type="number" step="0.5" placeholder="&mdash;" value="' + zv + '">'
+        + '<input class="rb-em-u" type="number" step="1" min="0" placeholder="&mdash;"'
+        + ' title="How well the position is known. A neighbour&#39;s house might be 15;'
+        + ' something you measured, 0 or blank." value="' + uv + '">'
+        + '<span style="font-size:11px; color:#8b949e">' + live + '</span>'
+        + '</div>';
+    });
+    host.innerHTML = html;
+
+    host.querySelectorAll('.rb-emit-row').forEach((row) => {
+      row.querySelectorAll('input, select').forEach((el) => {
+        el.addEventListener('change', () => this._syncEmittersFromInputs());
+      });
+    });
+  }
+
+  /** Pull edited values back into config.emitters.
+   *
+   * Blank X/Y/Z means "position unknown", which is a real state rather than an
+   * omission — cross-receiver work never needs coordinates, only the geometric
+   * path does. Clearing the position also clears the uncertainty: a radius of
+   * doubt around nothing describes nothing, and the server rejects that pair. */
+  _syncEmittersFromInputs() {
+    this.container.querySelectorAll('.rb-emit-row').forEach((row) => {
+      const e = this.config.emitters[parseInt(row.dataset.index, 10)];
+      if (!e) return;
+      e.status = row.querySelector('.rb-em-status').value;
+      const label = row.querySelector('.rb-em-label').value.trim();
+      if (label) e.label = label; else delete e.label;
+
+      const num = (cls) => {
+        const raw = row.querySelector(cls).value.trim();
+        if (raw === '') return null;
+        const n = parseFloat(raw);
+        return Number.isFinite(n) ? n : null;
+      };
+      const x = num('.rb-em-x');
+      const y = num('.rb-em-y');
+      const z = num('.rb-em-z');
+      if (x === null && y === null && z === null) {
+        delete e.position;
+        delete e.uncertainty_m;
+        return;
+      }
+      const r = (val) => Math.round(val * 10000) / 10000;
+      e.position = [
+        r(this._fromDisplay(x || 0)),
+        r(this._fromDisplay(y || 0)),
+        r(this._fromHeight(z || 0)),
+      ];
+      const unc = num('.rb-em-u');
+      if (unc === null) delete e.uncertainty_m;
+      else e.uncertainty_m = r(this._fromDisplay(unc));
+    });
   }
 
   _refreshUnitDisplay() {
@@ -830,6 +1028,7 @@ export class RoomBuilderTab {
     // numeric fields don't write back into this.config until blur/save.
     this._syncNodesFromInputs();
     this._syncApFromInputs();
+    this._syncEmittersFromInputs();
     const ids = this.config.nodes.map((n) => n.id);
     if (new Set(ids).size !== ids.length) {
       toastManager.error('Cannot save: two or more nodes have the same ID. Give each a unique ID first.');
