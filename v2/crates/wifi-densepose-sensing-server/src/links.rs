@@ -61,7 +61,16 @@ const LINK_HISTORY: usize = 32;
 /// most are irrelevant; this is a sensing surface, not a registry. Links are
 /// admitted first-come and expired by staleness, so a full table still turns
 /// over rather than wedging permanently.
-const MAX_LINKS: usize = 256;
+///
+/// Raised 256 -> 1024 on 2026-09-01. Until then the per-node grid gate in
+/// `main.rs` discarded every transmitter that did not match the AP's format, so
+/// the table only ever held ~30 links. With that gate moved per-link, a node
+/// admits everything it hears: MEASURED 24 transmitters at one node, so nine
+/// nodes is ~216 links before churn — inside 256, but with no headroom, and
+/// admission fails SILENTLY when full. Memory is the trade: a link holds up to
+/// `LINK_HISTORY` amplitude vectors, so 1024 links of 64-bin frames is ~17 MB
+/// and the realistic mixed case is well under 30 MB.
+pub const MAX_LINKS: usize = 1024;
 
 /// A link with no frame for this long is dropped, freeing its slot.
 const LINK_STALE_AFTER: Duration = Duration::from_secs(30);
@@ -114,6 +123,13 @@ struct LinkState {
     rssi_ema: f64,
     baseline: f64,
     baseline_samples: u64,
+    /// Subcarrier width this link's history is locked to. 0 until the first
+    /// frame. Densest-wins: a denser frame clears the history and re-locks.
+    grid: usize,
+    /// Frames dropped for arriving on a sparser grid than `grid`. Counted, not
+    /// silent — an invisible drop is what hid every foreign transmitter until
+    /// 2026-09-01.
+    sparser_skipped: u64,
 }
 
 impl LinkState {
@@ -135,6 +151,39 @@ impl LinkState {
         }
         (self.stamps.len() as f64 - 1.0) / span
     }
+}
+
+/// One row of [`LinkTable::inventory`] — a link as the table holds it, before
+/// any scoring decides whether it is renderable.
+#[derive(Debug, Clone)]
+pub struct LinkInventory {
+    pub id: LinkId,
+    pub frames: u64,
+    pub rssi: f64,
+    /// Frames currently in the rolling history (cap `LINK_HISTORY`).
+    pub history_len: usize,
+    /// `(subcarrier_width, frames)` seen in that history, most frequent first.
+    /// A transmitter that interleaves PPDU formats shows several entries.
+    pub widths: Vec<(usize, usize)>,
+    pub modal_width: usize,
+    pub frames_at_modal: usize,
+    /// Whether this link currently survives into `metrics()`.
+    pub visible: bool,
+    /// Why not, when `visible` is false.
+    pub reason: &'static str,
+    pub age_ms: u64,
+    pub baseline_samples: u64,
+    /// Delivery rate over the link's own window. The single best triage
+    /// number: a loud transmitter at 0.02 fps cannot form a history and will
+    /// never be usable, however strong it looks.
+    pub fps: f64,
+    /// Wall-clock span of the history window, seconds. `fps` is only
+    /// comparable between links whose spans are comparable.
+    pub window_span_s: f64,
+    /// Subcarrier width this link is locked to.
+    pub grid: usize,
+    /// Frames refused for arriving on a sparser grid.
+    pub sparser_skipped: u64,
 }
 
 /// Per-link motion, as reported to callers.
@@ -307,7 +356,43 @@ impl LinkTable {
             rssi_ema: rssi as f64,
             baseline: 0.0,
             baseline_samples: 0,
+            grid: 0,
+            sparser_skipped: 0,
         });
+        // ── Per-link subcarrier-grid policy (ADR-110 / issue #1005) ──────────
+        //
+        // Same rule the per-node gate applied, applied where it belongs. A
+        // 64-bin HT frame and a 256-bin HE frame sample different frequency
+        // grids (312.5 kHz against 78.125 kHz tone spacing); differencing them
+        // is not a noisier measurement, it is a different one reported under
+        // the same name.
+        //
+        // Keyed per LINK rather than per node, because grid is a property of
+        // the transmitter. Keying it by node locked every link to whatever the
+        // associated AP negotiated and silently discarded every other
+        // transmitter in the building — measured 2026-09-01, 24 transmitters
+        // seen by a node, 10 admitted fleet-wide.
+        //
+        // Densest-wins, re-warm on upgrade: a denser grid carries more
+        // information, so adopt it and drop the coarser history rather than
+        // mixing. A sparser frame still refreshes liveness and RSSI — the link
+        // is real and present — it simply contributes no sample.
+        let width = amplitudes.len();
+        if width > st.grid {
+            st.history.clear();
+            st.stamps.clear();
+            st.grid = width;
+            st.baseline = 0.0;
+            st.baseline_samples = 0;
+        }
+        if width < st.grid {
+            st.last_seen = now;
+            st.frames += 1;
+            st.rssi_ema = st.rssi_ema * 0.9 + rssi as f64 * 0.1;
+            st.sparser_skipped += 1;
+            return;
+        }
+
         st.history.push_back(amplitudes.to_vec());
         st.stamps.push_back(now);
         if st.history.len() > LINK_HISTORY {
@@ -383,6 +468,78 @@ impl LinkTable {
 
     pub fn len(&self) -> usize {
         self.links.len()
+    }
+
+    /// Every link in the table, including the ones [`LinkTable::metrics`]
+    /// omits, with the reason each one is missing.
+    ///
+    /// `metrics()` is a `filter_map` over [`agc_normalised_motion`], so a link
+    /// that cannot yet produce a motion value vanishes from `/api/v1/links`,
+    /// from `hearing_index`, and from the RTI observation set with no error, no
+    /// counter and no log. MEASURED 2026-09-01: a node hears ~24 transmitters
+    /// and the server renders 3 of them. That gap was invisible from every
+    /// existing endpoint, which is exactly why this one exists — it reports
+    /// what the table HOLDS rather than what survived scoring.
+    ///
+    /// Diagnosis is taken from `agc_normalised_motion` itself for `visible`,
+    /// and the supporting fields are recomputed alongside it, so the two can
+    /// never drift into disagreeing about the same link.
+    pub fn inventory(&self, now: Instant) -> Vec<LinkInventory> {
+        let mut out: Vec<LinkInventory> = self
+            .links
+            .iter()
+            .map(|(id, st)| {
+                let mut width_counts: BTreeMap<usize, usize> = BTreeMap::new();
+                for f in st.history.iter() {
+                    if !f.is_empty() {
+                        *width_counts.entry(f.len()).or_insert(0) += 1;
+                    }
+                }
+                let modal_width = width_counts
+                    .iter()
+                    .max_by_key(|(width, count)| (**count, **width))
+                    .map(|(w, _)| *w)
+                    .unwrap_or(0);
+                let frames_at_modal = width_counts.get(&modal_width).copied().unwrap_or(0);
+
+                let visible = agc_normalised_motion(&st.history).is_some();
+                let reason = if visible {
+                    "ok"
+                } else if st.history.len() < MIN_FRAMES_FOR_METRIC {
+                    "history_below_min"
+                } else if modal_width == 0 {
+                    "no_usable_width"
+                } else if frames_at_modal < MIN_FRAMES_FOR_METRIC {
+                    "modal_width_below_min"
+                } else {
+                    "motion_undefined"
+                };
+
+                let mut widths: Vec<(usize, usize)> = width_counts.into_iter().collect();
+                widths.sort_by(|a, b| b.1.cmp(&a.1));
+
+                LinkInventory {
+                    id: *id,
+                    frames: st.frames,
+                    rssi: st.rssi_ema,
+                    history_len: st.history.len(),
+                    widths,
+                    modal_width,
+                    frames_at_modal,
+                    visible,
+                    reason,
+                    age_ms: now.duration_since(st.last_seen).as_millis() as u64,
+                    baseline_samples: st.baseline_samples,
+                    fps: st.delivery_fps(),
+                    window_span_s: st.window_span_s(),
+                    grid: st.grid,
+                    sparser_skipped: st.sparser_skipped,
+                }
+            })
+            .collect();
+        // Loudest first: the ones worth keeping as illuminators sort to the top.
+        out.sort_by(|a, b| b.rssi.partial_cmp(&a.rssi).unwrap_or(std::cmp::Ordering::Equal));
+        out
     }
 
     pub fn is_empty(&self) -> bool {
@@ -836,5 +993,81 @@ mod tests {
             }
         }
         assert_eq!(t.len(), 81, "all 81 nine-node links must be admitted");
+    }
+
+    // ---- per-link subcarrier-grid policy -----------------------------------
+
+    /// The bug this replaced: the gate was keyed by NODE, so whichever grid the
+    /// associated AP used locked out every other transmitter. Two transmitters
+    /// on the SAME receiver must be able to hold different grids at once.
+    #[test]
+    fn two_transmitters_on_one_receiver_keep_independent_grids() {
+        let t0 = Instant::now();
+        let mut t = LinkTable::new();
+        for i in 0..12 {
+            let at = t0 + Duration::from_millis(i * 10);
+            t.observe(3, AP, &steady(256, 20.0), -70, at);    // dense HE
+            t.observe(3, PEER, &steady(64, 20.0), -85, at);   // sparse HT
+        }
+        let inv = t.inventory(t0 + Duration::from_millis(200));
+        let ap = inv.iter().find(|r| r.id.tx_mac == AP).expect("AP link");
+        let peer = inv.iter().find(|r| r.id.tx_mac == PEER).expect("peer link");
+        assert_eq!(ap.grid, 256, "AP locked to its own grid");
+        assert_eq!(peer.grid, 64, "peer keeps ITS grid, not the AP's");
+        assert_eq!(peer.history_len, 12, "sparse transmitter still accumulates");
+        assert_eq!(peer.sparser_skipped, 0);
+    }
+
+    /// A denser frame is more information, so it wins and the coarser history
+    /// is discarded rather than mixed — bins from different grids are not
+    /// comparable (issue #1005).
+    #[test]
+    fn a_denser_frame_upgrades_the_link_and_rewarms() {
+        let t0 = Instant::now();
+        let mut t = LinkTable::new();
+        for i in 0..10 {
+            t.observe(1, AP, &steady(64, 20.0), -70, t0 + Duration::from_millis(i * 10));
+        }
+        t.observe(1, AP, &steady(256, 20.0), -70, t0 + Duration::from_millis(200));
+        let inv = t.inventory(t0 + Duration::from_millis(210));
+        let r = &inv[0];
+        assert_eq!(r.grid, 256, "upgraded to the denser grid");
+        assert_eq!(r.history_len, 1, "coarse history cleared, not mixed");
+        assert_eq!(r.baseline_samples, 0, "baseline re-warms on upgrade");
+    }
+
+    /// A sparser frame must not enter the history, but the link is still real:
+    /// liveness and frame count keep moving, and the skip is COUNTED. A silent
+    /// drop is what hid every foreign transmitter until 2026-09-01.
+    #[test]
+    fn a_sparser_frame_is_counted_not_silently_dropped() {
+        let t0 = Instant::now();
+        let mut t = LinkTable::new();
+        for i in 0..10 {
+            t.observe(1, AP, &steady(256, 20.0), -70, t0 + Duration::from_millis(i * 10));
+        }
+        t.observe(1, AP, &steady(64, 20.0), -70, t0 + Duration::from_millis(200));
+        let inv = t.inventory(t0 + Duration::from_millis(210));
+        let r = &inv[0];
+        assert_eq!(r.grid, 256);
+        assert_eq!(r.history_len, 10, "sparser frame kept out of the history");
+        assert_eq!(r.sparser_skipped, 1, "and counted");
+        assert_eq!(r.frames, 11, "but it still counts as a frame on the link");
+    }
+
+    /// A uniform-grid history is what `agc_normalised_motion` wants, so after
+    /// the policy runs the link should actually be renderable.
+    #[test]
+    fn a_sparse_only_transmitter_becomes_visible() {
+        let t0 = Instant::now();
+        let mut t = LinkTable::new();
+        for i in 0..16 {
+            let level = 20.0 + (i % 5) as f64;
+            t.observe(2, PEER, &steady(64, level), -84, t0 + Duration::from_millis(i * 10));
+        }
+        let inv = t.inventory(t0 + Duration::from_millis(200));
+        let r = &inv[0];
+        assert_eq!(r.grid, 64);
+        assert!(r.visible, "a 64-bin-only transmitter must render: {}", r.reason);
     }
 }

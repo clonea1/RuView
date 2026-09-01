@@ -1699,8 +1699,94 @@ pub(crate) struct Wall {
     pub kind: Option<String>,
 }
 
-/// Room geometry (a simple rectangle) plus sensor node placements, as
-/// defined via the Room Builder UI (`POST /api/v1/config/room`).
+/// The building's real outline on one storey, as a closed ring in plan view.
+///
+/// `width_m x depth_m` is a bounding box, and a bounding box is a poor
+/// description of a real house: an L-shaped plan leaves a notch inside the box
+/// that is not part of the building at all, and the RTI search will happily
+/// score those cells and return a peak standing in the garden. A ring says
+/// which cells are actually indoors.
+///
+/// Several rings may share a `level`. They are a **union**, not a ring plus
+/// holes: a wing, a detached garage, or a stairwell landing are each their own
+/// outline, and a cell counts as inside the building if it falls inside any of
+/// them. There is deliberately no way to express a hole — an interior void a
+/// person cannot occupy is a wall's job, not a footprint's.
+///
+/// Coordinates may be negative. The origin is the north-west corner of the
+/// first floor's *main block*, fixed when the fleet's positions were measured;
+/// a wing to the west of it is at negative x rather than a reason to re-origin
+/// every node.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Footprint {
+    /// Storey this outline describes. Storeys of a real house differ — an
+    /// upper floor rarely covers the whole ground floor — so the outline is
+    /// per-storey rather than one shape for the building.
+    pub level: i32,
+    /// Ring vertices in room coordinates, implicitly closed: the last vertex
+    /// connects back to the first, so a triangle is three points, not four.
+    pub points: Vec<[f32; 2]>,
+}
+
+/// A transmitter the fleet can hear, and what is known about where it is.
+///
+/// Deliberately separates "where" from "how sure", because for illumination
+/// those are different questions and conflating them is what makes a solver
+/// trust a guess as much as a tape measure. Four states are expressible:
+///
+/// - **surveyed** — `position` set, `uncertainty_m` zero or absent. Your own
+///   access points, the Powerwall gateway, anything you can walk to.
+/// - **approximate** — `position` set with a large `uncertainty_m`. A
+///   neighbour's router: you know which house, not which room.
+/// - **unknown** — `position` is `None`. Still useful: cross-receiver
+///   correlation learns which region a receiver group covers WITHOUT ever
+///   needing the transmitter's coordinates. Only the geometric/ellipsoid path
+///   requires a position.
+/// - **excluded** — `exclude` set, for a transmitter known to move. A mobile
+///   emitter is worse than none, because the association it teaches is only
+///   true while it stands still.
+///
+/// On why `uncertainty_m` is worth carrying rather than rounding away: an
+/// emitter's positional error matters in proportion to its DISTANCE. Fifteen
+/// metres of doubt about a router 60 m away is roughly 14 degrees of bearing,
+/// and error along the line of sight matters far less than error across it. A
+/// consumer can weight by `uncertainty_m / distance`; it cannot recover that
+/// from a bare coordinate.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Emitter {
+    /// Lower-case colon-separated MAC, matching `/api/v1/links` `tx_mac`.
+    pub mac: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Room coordinates, same frame as `nodes`. `None` means "position not
+    /// known", which is a first-class state here, not a missing field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<[f32; 3]>,
+    /// Which storey, when that is meaningful. A neighbour's house has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor: Option<i32>,
+    /// Radius of doubt around `position`, metres. Absent or zero means
+    /// surveyed. Meaningless without a `position`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uncertainty_m: Option<f32>,
+    /// Admission state. Defaults to `pending`: a newly discovered transmitter
+    /// is NEVER trusted as a fixed illuminator just because it was heard.
+    ///
+    /// - `pending`  — seen, not yet judged. Usable for learned/fingerprint
+    ///   work, never as a fixed geometric focus.
+    /// - `approved` — observed stationary long enough to be trusted as a focus.
+    ///   Promotion is a decision, informed by measured stability, not an
+    ///   automatic consequence of being loud.
+    /// - `excluded` — known to move, or otherwise unwanted. A mobile emitter is
+    ///   worse than none: the association it teaches is only true while it
+    ///   stands still.
+    #[serde(default = "emitter_status_default")]
+    pub status: String,
+}
+
+/// Room geometry (a bounding box plus an optional real outline) and sensor
+/// node placements, as defined via the Room Builder UI
+/// (`POST /api/v1/config/room`).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RoomConfig {
     pub width_m: f32,
@@ -1733,6 +1819,22 @@ pub(crate) struct RoomConfig {
     /// Wall segments in plan view, tagged by storey.
     #[serde(default)]
     pub walls: Vec<Wall>,
+    /// The building's real outline, one or more rings per storey. Empty means
+    /// "the building is the whole `width_m x depth_m` box", which is how every
+    /// config written before footprints existed behaves.
+    #[serde(default)]
+    pub footprint: Vec<Footprint>,
+    /// Transmitters usable as illumination sources, keyed by MAC.
+    ///
+    /// `ap_position` above is the ONE associated access point and stays as it
+    /// is; this is everything else the fleet can hear. MEASURED 2026-09-01,
+    /// once the per-node grid gate moved per-link the nine boards admitted 30+
+    /// distinct transmitters — a second access point at -58 dBm across seven
+    /// receivers, a Powerwall gateway at -73 across four, and household devices
+    /// heard by all nine. Each is a potential bistatic illuminator, and none of
+    /// them had anywhere to record a position.
+    #[serde(default)]
+    pub emitters: Vec<Emitter>,
     /// Which storey the access point is on. `None` means the first floor.
     ///
     /// `ap_position` already carries an absolute z, so this is not needed for
@@ -1749,9 +1851,79 @@ pub(crate) struct RoomConfig {
 /// is absent or malformed.
 pub(crate) fn load_room_config(data_dir: &std::path::Path) -> RoomConfig {
     let path = data_dir.join("room_config.json");
-    match std::fs::read_to_string(&path) {
+    let mut config: RoomConfig = match std::fs::read_to_string(&path) {
         Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
         Err(_) => RoomConfig::default(),
+    };
+    // An absent `floor` already documents the first storey, so settle it once
+    // here instead of leaving every consumer to re-derive it. The validator
+    // and the Room Builder each carried their own `unwrap_or(1)` and the GET
+    // response carried none, so a node written before storeys existed reported
+    // no storey at all and stayed that way through every save/load cycle until
+    // someone set it by hand. Deserialisation still accepts the field's
+    // absence; only the in-memory value is made explicit.
+    for node in &mut config.nodes {
+        node.floor.get_or_insert(1);
+    }
+    config
+}
+
+/// Flatten a room config's per-storey outlines into rings for
+/// [`rti::estimate`], in the `f64` room coordinates it works in.
+///
+/// Rings with fewer than three vertices are dropped rather than passed on.
+/// [`validate_room_config`] rejects them at the API, but `room_config.json` can
+/// also be hand-edited, and a degenerate ring reaching `estimate` would mask
+/// away the entire search grid — every cell reads as outside a shape that
+/// encloses nothing. Silently ignoring a non-shape is the safe reading;
+/// silently losing all position output is not.
+pub(crate) fn footprint_rings(config: &RoomConfig) -> Vec<Vec<[f64; 2]>> {
+    config
+        .footprint
+        .iter()
+        .filter(|ring| ring.points.len() >= 3)
+        .map(|ring| {
+            ring.points
+                .iter()
+                .map(|p| [p[0] as f64, p[1] as f64])
+                .collect()
+        })
+        .collect()
+}
+
+/// The grid the RTI search should cover: origin (north-west corner) plus
+/// extent, in metres.
+///
+/// With no footprint this is the bounding box exactly as before — origin at
+/// (0, 0), the room's own width and depth. With one it is the bounding box of
+/// the outlines themselves, which may start at negative coordinates: the
+/// origin is pinned to the north-west corner of the main block because that is
+/// what the fleet's node positions were measured against, so a wing west or
+/// north of it has negative coordinates rather than being a reason to
+/// re-measure nine nodes.
+///
+/// A footprint smaller than `width_m x depth_m` legitimately *shrinks* the
+/// grid. That is the point: cells the building does not occupy are cells the
+/// search should never have scored.
+pub(crate) fn search_box(
+    rings: &[Vec<[f64; 2]>],
+    room_w: f64,
+    room_d: f64,
+) -> ([f64; 2], f64, f64) {
+    let mut min = [f64::INFINITY, f64::INFINITY];
+    let mut max = [f64::NEG_INFINITY, f64::NEG_INFINITY];
+    for p in rings.iter().flatten() {
+        min[0] = min[0].min(p[0]);
+        min[1] = min[1].min(p[1]);
+        max[0] = max[0].max(p[0]);
+        max[1] = max[1].max(p[1]);
+    }
+    let w = max[0] - min[0];
+    let h = max[1] - min[1];
+    if w > 0.0 && h > 0.0 && min.iter().all(|v| v.is_finite()) {
+        (min, w, h)
+    } else {
+        ([0.0, 0.0], room_w, room_d)
     }
 }
 
@@ -1780,6 +1952,8 @@ mod room_config_tests {
             ap_floor: None,
             floors: Vec::new(),
             walls: Vec::new(),
+            footprint: Vec::new(),
+            emitters: Vec::new(),
         }
     }
 
@@ -1810,16 +1984,269 @@ mod room_config_tests {
         c.nodes = vec![RoomNode {
             id: 1, x: 1.0, y: 1.0, z: 3.5, floor: Some(2), label: Some("kids".into()),
         }];
+        c.footprint = vec![Footprint {
+            level: 1,
+            points: vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0]],
+        }];
 
         let v = serde_json::to_value(&c).expect("serialises");
         for key in ["width_m", "depth_m", "nodes", "ap_position", "ap_floor",
-                    "floors", "walls"] {
+                    "floors", "walls", "footprint"] {
             assert!(v.get(key).is_some(), "GET response is missing `{key}`");
         }
         // And the nested optionals that were also dropped at various points.
         assert!(v["nodes"][0].get("floor").is_some(), "node.floor missing");
         assert!(v["walls"][0].get("kind").is_some(), "wall.kind missing");
         assert!(v["floors"][0].get("subfloor_m").is_some(), "floor.subfloor_m missing");
+        assert!(v["footprint"][0].get("points").is_some(), "footprint.points missing");
+    }
+
+    // ── Footprint ────────────────────────────────────────────────────────
+
+    fn ring(level: i32, points: &[[f32; 2]]) -> Footprint {
+        Footprint { level, points: points.to_vec() }
+    }
+
+    #[test]
+    fn a_ring_needs_three_vertices_to_enclose_anything() {
+        let mut c = base();
+        c.footprint = vec![ring(1, &[[0.0, 0.0], [4.0, 0.0]])];
+        let err = validate_room_config(&c).unwrap_err();
+        assert!(err.contains("at least 3"), "{err}");
+
+        c.footprint = vec![ring(1, &[[0.0, 0.0], [4.0, 0.0], [4.0, 4.0]])];
+        assert!(validate_room_config(&c).is_ok());
+    }
+
+    #[test]
+    fn a_footprint_cannot_be_on_a_storey_that_does_not_exist() {
+        let mut c = base();
+        c.floors = vec![floor(1, 0.0)];
+        c.footprint = vec![ring(2, &[[0.0, 0.0], [4.0, 0.0], [4.0, 4.0]])];
+        assert!(validate_room_config(&c).unwrap_err().contains("undefined floor"));
+    }
+
+    #[test]
+    fn a_non_finite_vertex_is_rejected() {
+        let mut c = base();
+        c.footprint = vec![ring(1, &[[0.0, 0.0], [f32::NAN, 0.0], [4.0, 4.0]])];
+        assert!(validate_room_config(&c).unwrap_err().contains("non-finite"));
+    }
+
+    /// A footprint reaching `rti::estimate` with fewer than three vertices
+    /// would mask away every cell in the grid — `point_in_polygon` reports
+    /// every point outside a shape that encloses nothing — and position output
+    /// would stop with no error anywhere. The API rejects such a ring, but a
+    /// hand-edited room_config.json does not go through the API.
+    #[test]
+    fn a_degenerate_ring_is_dropped_rather_than_masking_the_whole_grid() {
+        let mut c = base();
+        c.footprint = vec![
+            ring(1, &[[0.0, 0.0], [4.0, 0.0]]),
+            ring(1, &[[0.0, 0.0], [4.0, 0.0], [4.0, 4.0]]),
+        ];
+        let rings = footprint_rings(&c);
+        assert_eq!(rings.len(), 1, "only the real ring survives");
+        assert_eq!(rings[0].len(), 3);
+    }
+
+    #[test]
+    fn no_footprint_leaves_the_search_grid_exactly_as_it_was() {
+        let (origin, w, d) = search_box(&[], 13.4, 10.4);
+        assert_eq!(origin, [0.0, 0.0]);
+        assert_eq!((w, d), (13.4, 10.4));
+    }
+
+    /// The whole reason the grid gained an origin: the west wing is at
+    /// negative x, because the origin is pinned to the main block the nine
+    /// nodes were measured against.
+    #[test]
+    fn a_wing_west_of_the_origin_moves_the_search_grid_to_reach_it() {
+        let mut c = base();
+        c.footprint = vec![
+            ring(1, &[[0.0, 0.0], [13.4, 0.0], [13.4, 10.4], [0.0, 10.4]]),
+            ring(1, &[[-4.0, 2.0], [0.0, 2.0], [0.0, 8.0], [-4.0, 8.0]]),
+        ];
+        let (origin, w, d) = search_box(&footprint_rings(&c), 13.4, 10.4);
+        assert_eq!(origin, [-4.0, 0.0], "the grid starts at the wing, not the block");
+        assert!((w - 17.4).abs() < 1e-5, "width {w} must span wing plus block");
+        assert!((d - 10.4).abs() < 1e-5, "depth {d} must span the block");
+    }
+
+    #[test]
+    fn footprint_rings_round_trip_with_their_storey() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = base();
+        c.floors = vec![floor(1, 0.0), floor(2, 3.0)];
+        c.footprint = vec![
+            ring(1, &[[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]]),
+            ring(2, &[[0.0, 0.0], [3.0, 0.0], [3.0, 3.0]]),
+        ];
+        save_room_config(dir.path(), &c);
+        let loaded = load_room_config(dir.path());
+        assert_eq!(loaded.footprint.len(), 2);
+        assert_eq!(loaded.footprint[1].level, 2, "storey survives the round trip");
+        assert_eq!(loaded.footprint[0].points.len(), 4);
+    }
+
+    /// Every config written before footprints existed — the fleet's own
+    /// room_config.json among them — must keep loading and validating.
+    #[test]
+    fn a_config_without_a_footprint_field_is_still_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("room_config.json"),
+            r#"{"width_m":13.4,"depth_m":10.4,"nodes":[{"id":0,"x":1.0,"y":1.0,"z":0.5}]}"#,
+        )
+        .unwrap();
+        let loaded = load_room_config(dir.path());
+        assert!(loaded.footprint.is_empty());
+        assert!(validate_room_config(&loaded).is_ok());
+        assert!(footprint_rings(&loaded).is_empty(), "no rings means no masking");
+    }
+
+
+    // ── Emitters ─────────────────────────────────────────────────────────
+
+    fn emitter(mac: &str) -> Emitter {
+        Emitter { mac: mac.into(), label: None, position: None,
+                  floor: None, uncertainty_m: None,
+                  status: emitter_status_default() }
+    }
+
+    #[test]
+    fn an_emitter_with_no_position_is_valid() {
+        // "I have no idea where this is" is a first-class state: cross-receiver
+        // correlation never needs the transmitter's coordinates, only the
+        // geometric path does.
+        let mut c = base();
+        c.emitters = vec![emitter("04:71:4b:00:52:bc")];
+        assert!(validate_room_config(&c).is_ok());
+    }
+
+    #[test]
+    fn a_malformed_emitter_mac_is_rejected() {
+        let mut c = base();
+        for bad in ["04:71:4b:00:52", "0471:4b:00:52:bc", "zz:71:4b:00:52:bc",
+                    "04:71:4b:00:52:bc:ff", "004:71:4b:0:52:bc"] {
+            c.emitters = vec![emitter(bad)];
+            assert!(validate_room_config(&c).is_err(), "accepted `{bad}`");
+        }
+        c.emitters = vec![emitter("04:71:4b:00:52:bc")];
+        assert!(validate_room_config(&c).is_ok());
+    }
+
+    /// Two rows for one transmitter would let a later save silently win and
+    /// move an illuminator without anyone seeing it.
+    #[test]
+    fn duplicate_emitter_macs_are_rejected() {
+        let mut c = base();
+        c.emitters = vec![emitter("04:71:4b:00:52:bc"), emitter("04:71:4b:00:52:bc")];
+        assert!(validate_room_config(&c).unwrap_err().contains("duplicate emitter"));
+    }
+
+    /// Uncertainty describes a position. Left behind after the position was
+    /// cleared it describes nothing, so it is refused rather than carried.
+    #[test]
+    fn uncertainty_without_a_position_is_rejected() {
+        let mut c = base();
+        let mut e = emitter("04:71:4b:00:52:bc");
+        e.uncertainty_m = Some(15.0);
+        c.emitters = vec![e];
+        assert!(validate_room_config(&c).unwrap_err().contains("no position"));
+    }
+
+    /// The neighbour case: a position you only know to within a house.
+    #[test]
+    fn an_approximate_position_round_trips_with_its_uncertainty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = base();
+        let mut sue = emitter("e0:d3:62:d0:f1:5c");
+        sue.label = Some("Sue's house".into());
+        sue.position = Some([-30.0, 12.0, 3.0]);
+        sue.uncertainty_m = Some(15.0);
+        let mut teg = emitter("00:23:a7:af:af:85");
+        teg.label = Some("TEG-394 (basement)".into());
+        teg.position = Some([6.0, 5.0, -2.5]);
+        teg.uncertainty_m = Some(0.5);
+        c.emitters = vec![sue, teg];
+        assert!(validate_room_config(&c).is_ok());
+
+        save_room_config(dir.path(), &c);
+        let loaded = load_room_config(dir.path());
+        assert_eq!(loaded.emitters.len(), 2);
+        assert_eq!(loaded.emitters[0].uncertainty_m, Some(15.0));
+        assert_eq!(loaded.emitters[1].position, Some([6.0, 5.0, -2.5]),
+                   "a basement emitter keeps its negative z");
+    }
+
+    #[test]
+    fn a_config_without_emitters_is_still_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("room_config.json"),
+            r#"{"width_m":13.4,"depth_m":10.4,"nodes":[]}"#).unwrap();
+        let loaded = load_room_config(dir.path());
+        assert!(loaded.emitters.is_empty());
+        assert!(validate_room_config(&loaded).is_ok());
+    }
+
+    #[test]
+    fn mac_parsing_accepts_exactly_six_octets() {
+        assert_eq!(parse_mac_str("00:23:a7:af:af:85"),
+                   Some([0x00, 0x23, 0xa7, 0xaf, 0xaf, 0x85]));
+        assert!(parse_mac_str("00:23:a7:af:af").is_none());
+        assert!(parse_mac_str("").is_none());
+    }
+
+
+    /// A newly heard transmitter must never arrive pre-trusted. Being loud is
+    /// not evidence of standing still.
+    #[test]
+    fn a_new_emitter_defaults_to_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("room_config.json"),
+            r#"{"width_m":13.4,"depth_m":10.4,"nodes":[],
+                "emitters":[{"mac":"04:71:4b:00:52:bc"}]}"#).unwrap();
+        let loaded = load_room_config(dir.path());
+        assert_eq!(loaded.emitters[0].status, "pending",
+                   "an emitter with no status must not be trusted");
+        assert!(validate_room_config(&loaded).is_ok());
+    }
+
+    /// Approval asserts "this does not move", which is a claim about a PLACE.
+    /// Approving something unlocated would put an unpositioned focus into the
+    /// geometric path.
+    #[test]
+    fn approving_an_emitter_requires_a_position() {
+        let mut c = base();
+        let mut e = emitter("04:71:4b:00:52:bc");
+        e.status = "approved".into();
+        c.emitters = vec![e.clone()];
+        assert!(validate_room_config(&c).unwrap_err().contains("no position"));
+
+        e.position = Some([2.0, 3.0, 1.0]);
+        c.emitters = vec![e];
+        assert!(validate_room_config(&c).is_ok());
+    }
+
+    #[test]
+    fn an_unknown_emitter_status_is_rejected() {
+        let mut c = base();
+        let mut e = emitter("04:71:4b:00:52:bc");
+        e.status = "trusted".into();
+        c.emitters = vec![e];
+        assert!(validate_room_config(&c).unwrap_err().contains("unknown status"));
+    }
+
+    /// Excluding a mobile emitter must not require knowing where it is - the
+    /// whole point is that it has no stable position.
+    #[test]
+    fn excluding_an_emitter_needs_no_position() {
+        let mut c = base();
+        let mut e = emitter("04:71:4b:00:52:bc");
+        e.status = "excluded".into();
+        c.emitters = vec![e];
+        assert!(validate_room_config(&c).is_ok());
     }
 
     #[test]
@@ -2060,6 +2487,8 @@ mod room_config_tests {
             ap_floor: None,
         floors: Vec::new(),
         walls: Vec::new(),
+        footprint: Vec::new(),
+        emitters: Vec::new(),
         };
         save_room_config(dir.path(), &saved);
         let loaded = load_room_config(dir.path());
@@ -2070,6 +2499,24 @@ mod room_config_tests {
         assert_eq!(loaded.nodes[0].label.as_deref(), Some("front-right"));
         assert_eq!(loaded.nodes[1].label, None);
         assert_eq!(loaded.ap_position, Some([2.5, -1.0, 2.2]));
+    }
+
+    #[test]
+    fn node_without_a_floor_field_loads_as_the_first_storey() {
+        // `None` documents the ground floor, so it is settled at load: the GET
+        // response then reports a storey for every node, and the Room Builder's
+        // next save persists it rather than round-tripping the gap forever.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("room_config.json"),
+            r#"{"width_m":5.0,"depth_m":4.0,"nodes":[
+                 {"id":0,"x":1.0,"y":1.0,"z":0.5},
+                 {"id":1,"x":2.0,"y":2.0,"z":3.2,"floor":2}]}"#,
+        )
+        .unwrap();
+        let loaded = load_room_config(dir.path());
+        assert_eq!(loaded.nodes[0].floor, Some(1), "absent floor must settle to the first storey");
+        assert_eq!(loaded.nodes[1].floor, Some(2), "an explicit storey must survive untouched");
     }
 
     #[test]
@@ -2098,6 +2545,8 @@ mod room_config_tests {
             ap_floor: None,
         floors: Vec::new(),
         walls: Vec::new(),
+        footprint: Vec::new(),
+        emitters: Vec::new(),
         }
     }
 
@@ -2342,6 +2791,16 @@ struct AppStateInner {
     /// its dead-reckoned position to "inside the room"; every other tier is
     /// unaffected by this field.
     room_bounds: (f32, f32),
+    /// The building's real outline as rings in room coordinates, ready for
+    /// [`rti::estimate`]. Empty means "the building is the whole bounding
+    /// box", the behaviour of every config written before footprints existed.
+    ///
+    /// Storeys are **flattened together** here, deliberately. The RTI search
+    /// is a single 2D plane with no notion of which floor a person is on, so
+    /// the honest mask is the union of every storey's outline — anywhere in
+    /// the building — rather than one storey's outline applied to links that
+    /// span all of them.
+    room_footprint: Vec<Vec<[f64; 2]>>,
     /// Debounced room-level classification state — see
     /// `debounce_room_classification`. `fuse_room` is a fresh, memoryless
     /// plurality vote every cycle with no debounce of its own (unlike each
@@ -2636,6 +3095,7 @@ impl AppStateInner {
             node_positions_config: HashMap::new(),
             ap_position: None,
             room_bounds: (0.0, 0.0),
+            room_footprint: Vec::new(),
             room_debounced_level: "absent".to_string(),
             room_debounce_candidate: "absent".to_string(),
             room_debounce_since: None,
@@ -9303,9 +9763,144 @@ async fn fusion_endpoint(State(state): State<SharedState>) -> Json<serde_json::V
         "paired_fraction": st.paired_fraction(),
         "by_receivers": by,
         "pairs": pairs,
+        "snapshots": st.snapshots,
+        "retain_full": st.retain_full,
         "open_keys": s.fusion_index.open_len(),
         "overflow": st.overflow,
         "note": "wire v3 frames only; v1/v2 carry no rx_seq and are excluded"
+    }))
+}
+
+/// `GET /api/v1/fusion/snapshots?limit=N` — recent paired transmissions with
+/// the CSI each receiver measured.
+///
+/// The point of this endpoint is to make the premise falsifiable before
+/// anything is built on it: do co-receiver amplitude vectors for the SAME
+/// packet actually covary when something moves? That is an empirical question
+/// nobody has looked at, and it decides whether cross-receiver localisation is
+/// possible at all.
+///
+/// Bounded response: each snapshot is up to nine receivers of 256 subcarriers,
+/// so an unbounded `limit` would serialise megabytes of floats per request. A
+/// poller should take small batches often and use `seq` to notice gaps —
+/// snapshots are evicted from a ring, not queued for delivery.
+async fn fusion_snapshots_endpoint(
+    State(state): State<SharedState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    const DEFAULT_LIMIT: usize = 20;
+    const MAX_LIMIT: usize = 200;
+    let limit = q
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_LIMIT)
+        .clamp(1, MAX_LIMIT);
+
+    let s = state.read().await;
+    let rows: Vec<serde_json::Value> = s
+        .fusion_index
+        .recent_snapshots(limit)
+        .iter()
+        .map(|snap| {
+            serde_json::json!({
+                "seq": snap.seq,
+                "tx_mac": format!(
+                    "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    snap.tx[0], snap.tx[1], snap.tx[2], snap.tx[3], snap.tx[4], snap.tx[5]
+                ),
+                "rx_seq": snap.rx_seq,
+                "receivers": snap.obs.iter().map(|(id, amps)| serde_json::json!({
+                    "node_id": id,
+                    "n_subcarriers": amps.len(),
+                    "amplitudes": amps,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "count": rows.len(),
+        "snapshots": rows,
+        "note": "one transmission as several receivers measured it; amplitudes are \
+                 raw per-subcarrier magnitudes, no baseline subtracted"
+    }))
+}
+
+/// `GET /api/v1/links/inventory` — every link the table holds, including the
+/// ones `/api/v1/links` omits, with the reason each is missing.
+///
+/// MEASURED 2026-09-01: a node's radio produces CSI for ~24 transmitters, the
+/// node forwards ~20 of them, and `/api/v1/links` renders 3. The difference is
+/// `LinkTable::metrics`, a `filter_map` that drops any link without a motion
+/// value — silently, with no error, counter or log. Every existing endpoint
+/// therefore agreed the other transmitters did not exist.
+///
+/// This reports the table's actual contents so illuminator selection is made
+/// from data rather than inference. It also surfaces `MAX_LINKS` headroom: the
+/// admission check drops new links silently once full, which would be the same
+/// class of invisible failure one layer up.
+async fn links_inventory_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    let now = std::time::Instant::now();
+    let inv = s.link_table.inventory(now);
+
+    let visible = inv.iter().filter(|r| r.visible).count();
+    let mut by_reason: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
+    for r in &inv {
+        *by_reason.entry(r.reason).or_insert(0) += 1;
+    }
+    // Distinct transmitters across every receiver — the illuminator roster,
+    // as opposed to the link count, which counts each (rx, tx) pair.
+    let distinct_tx: std::collections::BTreeSet<[u8; 6]> =
+        inv.iter().map(|r| r.id.tx_mac).collect();
+
+    let rows: Vec<serde_json::Value> = inv
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "rx_node": r.id.rx_node,
+                "tx_mac": format!(
+                    "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    r.id.tx_mac[0], r.id.tx_mac[1], r.id.tx_mac[2],
+                    r.id.tx_mac[3], r.id.tx_mac[4], r.id.tx_mac[5]
+                ),
+                // The locally-administered bit separates a virtual BSSID (an AP
+                // advertising several SSIDs) from a burned-in device address.
+                // Cheap, and it is the difference between "an access point" and
+                // "somebody's phone" without any vendor lookup.
+                "locally_administered": (r.id.tx_mac[0] & 0x02) != 0,
+                "frames": r.frames,
+                "rssi_dbm": r.rssi,
+                "history_len": r.history_len,
+                "widths": r.widths.iter()
+                    .map(|(w, c)| serde_json::json!({"subcarriers": w, "frames": c}))
+                    .collect::<Vec<_>>(),
+                "modal_width": r.modal_width,
+                "frames_at_modal": r.frames_at_modal,
+                "visible_in_links": r.visible,
+                "reason": r.reason,
+                "age_ms": r.age_ms,
+                "baseline_samples": r.baseline_samples,
+                "fps": r.fps,
+                "window_span_s": r.window_span_s,
+                "grid": r.grid,
+                "sparser_skipped": r.sparser_skipped,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "links_total": inv.len(),
+        "links_visible": visible,
+        "links_hidden": inv.len() - visible,
+        "distinct_transmitters": distinct_tx.len(),
+        "max_links": links::MAX_LINKS,
+        "headroom": links::MAX_LINKS.saturating_sub(inv.len()),
+        "hidden_by_reason": by_reason,
+        "links": rows,
+        "note": "everything the link table holds; /api/v1/links shows only rows \
+                 with a computable motion metric"
     }))
 }
 
@@ -9451,17 +10046,19 @@ fn rti_from_links(
         });
     }
 
+    // The grid follows the building, not the bounding box. With no footprint
+    // drawn this is (0, 0) plus width x depth — exactly the search every
+    // release before footprints performed.
+    let (origin_m, grid_w, grid_d) =
+        search_box(&s.room_footprint, room_w as f64, room_d as f64);
     let cfg = rti::RtiConfig {
-        width_m: room_w as f64,
-        depth_m: room_d as f64,
+        origin_m,
+        width_m: grid_w,
+        depth_m: grid_d,
         ..Default::default()
     };
 
-    // No footprint yet: RoomConfig still describes the building as a bare
-    // width x depth rectangle, so there are no rings to mask against and the
-    // search covers the whole box exactly as before. Passing the real outline
-    // here is the remaining half of the L-shaped-plan work.
-    match rti::estimate(&observations, &cfg, &[]) {
+    match rti::estimate(&observations, &cfg, &s.room_footprint) {
         Some(e) => serde_json::json!({
             "x": e.x,
             "y": e.y,
@@ -10117,6 +10714,49 @@ async fn udp_receiver_task(
                     s.source = "esp32".to_string();
                     s.last_esp32_frame = Some(std::time::Instant::now());
 
+                    // ── Per-link accumulation — BEFORE the per-node grid gate ──
+                    //
+                    // MEASURED 2026-09-01: the gate below is keyed by NODE and
+                    // locks onto the densest grid that node has seen, which the
+                    // associated AP sets at 256-bin HE. It used to `continue`,
+                    // so every 64-bin HT frame — i.e. essentially every OTHER
+                    // transmitter in the building — was discarded before it
+                    // could become a link. A node's radio produced CSI for 24
+                    // transmitters and the server admitted 10, all our own.
+                    //
+                    // A link is (receiver, transmitter), so grid consistency is
+                    // a per-LINK property, not a per-node one, and `LinkTable`
+                    // now enforces it there. Running this first means a frame
+                    // the node-level feature path cannot use is still available
+                    // to the link and fusion paths, which can.
+                    if let Some(tx) = frame.source_mac {
+                        let now = std::time::Instant::now();
+                        s.link_table
+                            .observe(frame.node_id, tx, &frame.amplitudes, frame.rssi, now);
+                        s.link_table.expire(now);
+                        // Wire v3 only. A v1/v2 frame has no transmission
+                        // identity, and keying it on a placeholder would pair
+                        // every older node's frames with every other node's --
+                        // exactly the state a partial OTA passes through, so
+                        // this cannot be an `unwrap_or(0)`.
+                        if let Some(rx_seq) = frame.rx_seq {
+                            // Retain the amplitude vector alongside the
+                            // pairing, so a finalised transmission can be
+                            // compared ACROSS the receivers that captured it
+                            // rather than only counted. Best-effort: when the
+                            // retention budget is full the pairing statistics
+                            // are unaffected and only the vectors are skipped.
+                            s.fusion_index.observe_with_csi(
+                                frame.node_id,
+                                tx,
+                                rx_seq,
+                                now,
+                                Some(&frame.amplitudes),
+                            );
+                            s.fusion_index.expire(now);
+                        }
+                    }
+
                     // ── ADR-110 / issue #1005: per-node subcarrier-grid gate ──
                     // ESP32-C6 nodes interleave HE-SU 256-bin frames (~84%)
                     // with HT 64-bin frames on the same socket. HT-LTF and
@@ -10187,27 +10827,6 @@ async fn udp_receiver_task(
                     // to avoid unsafe raw pointer (review finding #2).
                     let adaptive_model_clone = s.adaptive_model.clone();
 
-                    // Per-link accumulation, done before the per-node borrow
-                    // below so the link table and one node aren't borrowed at
-                    // once. Only wire v2 frames carry a transmitter; a frame
-                    // without one cannot be attributed to a link at all, and
-                    // giving it a placeholder key would recreate exactly the
-                    // mixing this layer exists to undo.
-                    if let Some(tx) = frame.source_mac {
-                        let now = std::time::Instant::now();
-                        s.link_table
-                            .observe(node_id, tx, &frame.amplitudes, frame.rssi, now);
-                        s.link_table.expire(now);
-                        // Wire v3 only. A v1/v2 frame has no transmission
-                        // identity, and keying it on a placeholder would pair
-                        // every older node's frames with every other node's --
-                        // exactly the state a partial OTA passes through, so
-                        // this cannot be an `unwrap_or(0)`.
-                        if let Some(rx_seq) = frame.rx_seq {
-                            s.fusion_index.observe(node_id, tx, rx_seq, now);
-                            s.fusion_index.expire(now);
-                        }
-                    }
                     let ns = s.node_states.entry(node_id).or_insert_with(NodeState::new);
                     // ADR-110 iter 19 — feed the per-node fps EMA from real
                     // CSI arrivals. The helper sets `last_frame_time` as a
@@ -12119,6 +12738,12 @@ async fn main() {
     // `(0.0, 0.0)` (never configured) disables that tier's clamp step at the
     // call site — see its guard there.
     let mut room_bounds: (f32, f32) = (0.0, 0.0);
+    // The building's real outline, if one has been drawn. Empty means the
+    // search covers the whole bounding box, as it always did. Assigned exactly
+    // once below, unconditionally — unlike `room_bounds`, whose assignment is
+    // guarded, so it needs no placeholder value that would only ever be
+    // overwritten.
+    let room_footprint: Vec<Vec<[f64; 2]>>;
     let state: SharedState = Arc::new(RwLock::new(AppStateInner {
         link_table: links::LinkTable::new(),
         node_macs: HashMap::new(),
@@ -12230,6 +12855,14 @@ async fn main() {
             if room_config.width_m > 0.0 && room_config.depth_m > 0.0 {
                 room_bounds = (room_config.width_m, room_config.depth_m);
             }
+            room_footprint = footprint_rings(&room_config);
+            if !room_footprint.is_empty() {
+                info!(
+                    "Loaded a {}-ring building footprint from room_config.json; \
+                     the position search is masked to it",
+                    room_footprint.len()
+                );
+            }
             if !room_config.nodes.is_empty() {
                 info!(
                     "Loaded {} node position(s) from room_config.json (overrides --node-positions)",
@@ -12261,6 +12894,7 @@ async fn main() {
         node_positions_config,
         ap_position,
         room_bounds,
+        room_footprint,
         room_debounced_level: "absent".to_string(),
         room_debounce_candidate: "absent".to_string(),
         room_debounce_since: None,
@@ -12537,7 +13171,9 @@ async fn main() {
         .route("/api/v1/mesh/metrics", get(mesh_metrics_endpoint))
         // ADR-345: per-link CSI perturbation (receiver, transmitter).
         .route("/api/v1/links", get(links_endpoint))
+        .route("/api/v1/links/inventory", get(links_inventory_endpoint))
         .route("/api/v1/fusion", get(fusion_endpoint))
+        .route("/api/v1/fusion/snapshots", get(fusion_snapshots_endpoint))
         // Vital sign endpoints
         .route("/api/v1/vital-signs", get(vital_signs_endpoint))
         .route("/api/v1/edge-vitals", get(edge_vitals_endpoint))
@@ -13307,6 +13943,8 @@ async fn config_get_room(State(state): State<SharedState>) -> Json<serde_json::V
         ap_floor: saved.ap_floor,
         floors: saved.floors,
         walls: saved.walls,
+        footprint: saved.footprint,
+        emitters: saved.emitters,
     };
     Json(serde_json::to_value(&cfg).unwrap_or_else(|_| serde_json::json!({})))
 }
@@ -13432,8 +14070,129 @@ pub(crate) fn validate_room_config(config: &RoomConfig) -> Result<(), String> {
         }
     }
 
+    // ── Footprint ────────────────────────────────────────────────────────
+    for (i, ring) in config.footprint.iter().enumerate() {
+        // Two points are a line and one is a dot; neither encloses anything,
+        // and `point_in_polygon` reports every query point outside them. A
+        // degenerate ring saved here would silently mask the ENTIRE search
+        // grid away rather than fail visibly, so it is rejected at the door.
+        if ring.points.len() < 3 {
+            return Err(format!(
+                "footprint {i} has {} point(s); a closed outline needs at least 3",
+                ring.points.len()
+            ));
+        }
+        // Bounded for the same reason every other list here is: this arrives
+        // from the network and is walked once per grid cell per tick.
+        if ring.points.len() > MAX_FOOTPRINT_POINTS {
+            return Err(format!(
+                "footprint {i} has {} points; the limit is {MAX_FOOTPRINT_POINTS}",
+                ring.points.len()
+            ));
+        }
+        if !ring.points.iter().flatten().all(|v| v.is_finite()) {
+            return Err(format!("footprint {i} has a non-finite vertex"));
+        }
+        if !config.floors.is_empty() && !levels.contains(&ring.level) {
+            return Err(format!(
+                "footprint {i} is on undefined floor {}",
+                ring.level
+            ));
+        }
+    }
+
+    // ── Emitters ─────────────────────────────────────────────────────────
+    let mut seen_macs = std::collections::HashSet::new();
+    for (i, e) in config.emitters.iter().enumerate() {
+        let mac = e.mac.to_ascii_lowercase();
+        if parse_mac_str(&mac).is_none() {
+            return Err(format!(
+                "emitter {i} has a malformed MAC `{}`; expected aa:bb:cc:dd:ee:ff",
+                e.mac
+            ));
+        }
+        // Two entries for one transmitter would let a later save silently win
+        // and quietly move an illuminator, which is exactly the class of
+        // invisible change this config exists to prevent.
+        if !seen_macs.insert(mac) {
+            return Err(format!("duplicate emitter MAC `{}`", e.mac));
+        }
+        if let Some([x, y, z]) = e.position {
+            if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+                return Err(format!("emitter {i} has a non-finite coordinate"));
+            }
+        }
+        if let Some(u) = e.uncertainty_m {
+            if !u.is_finite() || u < 0.0 {
+                return Err(format!("emitter {i} uncertainty_m must be zero or positive"));
+            }
+            // An uncertainty with nothing to be uncertain about is a sign the
+            // position was cleared and the doubt left behind. Reject it rather
+            // than carry a number that describes nothing.
+            if e.position.is_none() {
+                return Err(format!(
+                    "emitter {i} has uncertainty_m but no position; \
+                     an unknown position is expressed by omitting position entirely"
+                ));
+            }
+        }
+        if !EMITTER_STATUSES.contains(&e.status.as_str()) {
+            return Err(format!(
+                "emitter {i} has unknown status `{}`; expected one of {:?}",
+                e.status, EMITTER_STATUSES
+            ));
+        }
+        // Approval asserts "this thing does not move", which is a claim about a
+        // place. Approving an emitter whose position is unknown would put an
+        // unlocated focus into the geometric path.
+        if e.status == "approved" && e.position.is_none() {
+            return Err(format!(
+                "emitter {i} is approved but has no position; approval means                  it is trusted as a fixed focus, which requires one"
+            ));
+        }
+        if !config.floors.is_empty() {
+            if let Some(lvl) = e.floor {
+                if !levels.contains(&lvl) {
+                    return Err(format!("emitter {i} is on undefined floor {lvl}"));
+                }
+            }
+        }
+    }
+
     Ok(())
 }
+
+/// Newly discovered transmitters start unapproved. Being audible is not
+/// evidence of being stationary, and only a stationary emitter can serve as a
+/// fixed focus.
+pub(crate) fn emitter_status_default() -> String {
+    "pending".to_string()
+}
+
+/// The admission states an emitter may hold.
+pub(crate) const EMITTER_STATUSES: [&str; 3] = ["pending", "approved", "excluded"];
+
+/// Parse `aa:bb:cc:dd:ee:ff` into six octets. `None` for anything else.
+pub(crate) fn parse_mac_str(s: &str) -> Option<[u8; 6]> {
+    let mut out = [0u8; 6];
+    let mut parts = s.split(':');
+    for slot in out.iter_mut() {
+        let p = parts.next()?;
+        if p.len() != 2 {
+            return None;
+        }
+        *slot = u8::from_str_radix(p, 16).ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Cap on vertices in one footprint ring. A hand-drawn house outline is a
+/// dozen corners; a thousand is a bug or an attempt to make the per-cell
+/// point-in-polygon test expensive.
+const MAX_FOOTPRINT_POINTS: usize = 512;
 
 /// Read the fleet OTA pre-shared key, which also authenticates recalibration.
 ///
@@ -13619,6 +14378,7 @@ async fn config_set_room(
     s.multistatic_fuser.set_node_positions(positions);
     s.ap_position = config.ap_position;
     s.room_bounds = (config.width_m, config.depth_m);
+    s.room_footprint = footprint_rings(&config);
     let data_dir = s.data_dir.clone();
     drop(s);
     save_room_config(&data_dir, &config);
