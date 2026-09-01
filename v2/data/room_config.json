@@ -180,8 +180,14 @@
     },
     {
       "mac": "e8:ee:cc:a2:41:35",
-      "label": "Abode M5 hub",
-      "status": "pending"
+      "label": "3D printer (basement SE)",
+      "position": [
+        12.4968,
+        6.096,
+        -2.7432
+      ],
+      "uncertainty_m": 0.9144,
+      "status": "approved"
     },
     {
       "mac": "78:6c:84:c7:fb:f6",
