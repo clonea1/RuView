@@ -144,6 +144,12 @@ const BASELINE_FREEZE_RATIO: f64 = 1.5;
 /// residual "motion" in an empty room.
 const BASELINE_SUBTRACTION: f64 = 0.85;
 
+/// How many transmitters beyond the receiver count `infer_transmitting_node`
+/// tolerates before it stops guessing. Each node may transmit, and a house has
+/// an access point or two; anything past that and a one-receiver hole in a
+/// hearing set is coincidence rather than a fingerprint.
+const INFERENCE_EXTRA_TRANSMITTERS: usize = 3;
+
 /// Frames required before a link reports a motion metric at all.
 const MIN_FRAMES_FOR_METRIC: usize = 8;
 
@@ -676,14 +682,29 @@ impl LinkTable {
 ///   exactly one" are the same observation, so the signature carries nothing.
 /// - More than one receiver missing — a peer out of range, or newly booted,
 ///   looks identical to a peer that is simply not ours.
+/// - **More transmitters than the signature can survive.** The whole premise
+///   assumes the population is "our boards plus some infrastructure", so a
+///   one-receiver hole is distinctive. MEASURED 2026-09-01: once the per-link
+///   grid fix admitted 40 transmitters, any foreign device heard by 8 of 9
+///   nodes matches the signature by coincidence and would be labelled as that
+///   ninth node's own board. So the inference now switches itself off when the
+///   population outgrows its assumption.
 ///
-/// A wrong answer here mislabels a display row. It never feeds a metric.
+/// A wrong answer used to only mislabel a display row. That is NO LONGER TRUE:
+/// `attribute_transmitter` feeds `rti_from_links`, so a wrong answer places a
+/// link at a node's surveyed coordinates and hands it to the position solver as
+/// if measured. Callers must keep preferring a reported MAC over this.
 pub fn infer_transmitting_node(
     tx_mac: &[u8; 6],
     receivers: &std::collections::BTreeSet<u8>,
     heard_by: &std::collections::BTreeMap<[u8; 6], std::collections::BTreeSet<u8>>,
 ) -> Option<u8> {
     if receivers.len() < 3 {
+        return None;
+    }
+    // Each receiver can transmit, plus a small allowance for infrastructure.
+    // Beyond that the hole in a hearing set is coincidence, not a signature.
+    if heard_by.len() > receivers.len() + INFERENCE_EXTRA_TRANSMITTERS {
         return None;
     }
     let heard = heard_by.get(tx_mac)?;
@@ -801,6 +822,36 @@ mod tests {
             t.observe(1, AP, &steady(56, 20.0), -50, now);
         }
         assert_eq!(t.len(), 2);
+    }
+
+
+    /// The failure this guard prevents. With nine receivers and forty
+    /// transmitters — the fleet as of 2026-09-01 — a foreign device heard by
+    /// eight of nine matches "all but one" purely by coincidence, and would be
+    /// labelled as the ninth node's own board. That label now feeds the
+    /// position solver, so it would place the link at that node's surveyed
+    /// coordinates as if measured.
+    #[test]
+    fn inference_stops_guessing_once_the_channel_is_crowded() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let receivers: BTreeSet<u8> = (0..9u8).collect();
+        let foreign = [0x64, 0x16, 0x66, 0xc7, 0x8c, 0x51];
+        let mut heard: BTreeMap<[u8; 6], BTreeSet<u8>> = BTreeMap::new();
+        // heard by 8 of 9 — exactly the signature of node 8's own board
+        heard.insert(foreign, (0..9u8).filter(|n| *n != 8).collect());
+
+        // A quiet channel: the signature is trustworthy and still fires.
+        assert_eq!(infer_transmitting_node(&foreign, &receivers, &heard), Some(8));
+
+        // A crowded one: same hearing set, but the population has outgrown the
+        // assumption, so it declines rather than guessing.
+        for i in 0..40u8 {
+            heard.insert([0xAA, 0xBB, 0xCC, 0, 0, i], (0..4u8).collect());
+        }
+        assert_eq!(
+            infer_transmitting_node(&foreign, &receivers, &heard), None,
+            "with 40+ transmitters a one-receiver hole is coincidence, not a fingerprint"
+        );
     }
 
     #[test]
