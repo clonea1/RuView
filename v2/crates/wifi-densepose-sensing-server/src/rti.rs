@@ -67,6 +67,16 @@ pub struct LinkObservation {
 /// Search-grid and kernel parameters.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RtiConfig {
+    /// North-west corner of the search grid, in room coordinates.
+    ///
+    /// Not always the room origin. The origin is fixed at the north-west
+    /// corner of the building's main block — it is what every node position
+    /// was measured against — so a wing extending west or north of that block
+    /// lives at negative coordinates. A grid that always started at (0, 0)
+    /// could not search there at all, whatever the footprint said, and would
+    /// silently confine every estimate to the main block.
+    pub origin_m: [f64; 2],
+    /// Grid extent from `origin_m`, not from the room origin.
     pub width_m: f64,
     pub depth_m: f64,
     /// Grid pitch. 0.25 m over a 13.4x10.4 m room is ~2200 cells; at six links
@@ -79,6 +89,7 @@ pub struct RtiConfig {
 impl Default for RtiConfig {
     fn default() -> Self {
         Self {
+            origin_m: [0.0, 0.0],
             width_m: 10.0,
             depth_m: 10.0,
             cell_m: 0.25,
@@ -283,8 +294,8 @@ pub fn estimate(
     for iy in 0..ny {
         for ix in 0..nx {
             let cell = [
-                (ix as f64 + 0.5) * cfg.cell_m,
-                (iy as f64 + 0.5) * cfg.cell_m,
+                cfg.origin_m[0] + (ix as f64 + 0.5) * cfg.cell_m,
+                cfg.origin_m[1] + (iy as f64 + 0.5) * cfg.cell_m,
             ];
             // Outside the building is not a place a person can be. Skipping
             // these cells is not cosmetic: they are scored against the same
@@ -363,6 +374,7 @@ mod tests {
 
     fn room() -> RtiConfig {
         RtiConfig {
+            origin_m: [0.0, 0.0],
             width_m: 13.4112,
             depth_m: 10.3632,
             cell_m: 0.25,
@@ -520,5 +532,126 @@ mod tests {
     fn a_degenerate_zero_length_link_contributes_nothing_instead_of_dividing_by_zero() {
         assert_eq!(link_weight(NODE0, NODE0, [1.0, 1.0], 0.6), 0.0);
         assert_eq!(link_weight(NODE0, NODE1, [1.0, 1.0], 0.0), 0.0);
+    }
+
+    // ── Footprint masking ────────────────────────────────────────────────
+
+    #[test]
+    fn a_notch_in_an_l_shaped_plan_is_outside_the_building() {
+        // An L: the whole 10x10 box minus the south-east quadrant.
+        let l = vec![
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [10.0, 5.0],
+            [5.0, 5.0],
+            [5.0, 10.0],
+            [0.0, 10.0],
+        ];
+        assert!(point_in_polygon([2.0, 2.0], &l), "north-west block is indoors");
+        assert!(point_in_polygon([2.0, 8.0], &l), "the south leg is indoors");
+        assert!(point_in_polygon([8.0, 2.0], &l), "the east leg is indoors");
+        assert!(
+            !point_in_polygon([8.0, 8.0], &l),
+            "the notch is the garden, not the house"
+        );
+    }
+
+    #[test]
+    fn a_ring_with_too_few_vertices_encloses_nothing() {
+        // Not an error: `estimate` reads "no cell is inside" and returns None
+        // rather than searching a shape that does not exist. The config
+        // validator rejects such a ring before it can get this far.
+        assert!(!point_in_polygon([1.0, 1.0], &[[0.0, 0.0], [2.0, 2.0]]));
+        assert!(!point_in_polygon([1.0, 1.0], &[]));
+    }
+
+    #[test]
+    fn a_peak_outside_the_footprint_cannot_win() {
+        let cfg = room();
+        // Truth in the middle of the node triangle, which the solver recovers
+        // unmasked (see `a_target_inside_the_node_triangle_is_recovered`).
+        let truth = [2.4, 1.4];
+        let obs = observations_for(truth, &cfg);
+
+        // Now declare that the real building is only the far east strip. The
+        // cells that explain these observations best are all outside it, so
+        // the answer must come from inside the strip -- or not at all.
+        let east_strip = vec![
+            [10.0, 0.0],
+            [13.4, 0.0],
+            [13.4, 10.3],
+            [10.0, 10.3],
+        ];
+        if let Some(e) = estimate(&obs, &cfg, &[east_strip]) {
+            assert!(
+                e.x >= 10.0,
+                "estimate {:?} landed outside the declared footprint",
+                (e.x, e.y)
+            );
+        }
+    }
+
+    #[test]
+    fn rings_are_a_union_not_a_single_outline() {
+        // Two disjoint wings. A cell in either is searchable; the gap is not.
+        let west = vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]];
+        let east = vec![[8.0, 0.0], [12.0, 0.0], [12.0, 4.0], [8.0, 4.0]];
+        let rings = [west, east];
+        let inside = |p: [f64; 2]| rings.iter().any(|r| point_in_polygon(p, r));
+        assert!(inside([2.0, 2.0]), "west wing");
+        assert!(inside([10.0, 2.0]), "east wing");
+        assert!(!inside([6.0, 2.0]), "the gap between them is not building");
+    }
+
+    // ── Grid origin ──────────────────────────────────────────────────────
+
+    /// The west wing sits at negative x because the origin is pinned to the
+    /// main block, where the fleet's positions were measured. A grid that
+    /// always started at (0, 0) could not place anyone there at all.
+    #[test]
+    fn a_wing_west_of_the_origin_is_searchable_only_once_the_grid_moves() {
+        // Four corners of a wing spanning x in [-4, 0], with both diagonals
+        // as links so their crossing point is the strongest cell.
+        let (nw, ne) = ([-4.0, 0.0], [0.0, 0.0]);
+        let (sw, se) = ([-4.0, 4.0], [0.0, 4.0]);
+        let truth = [-2.0, 2.0];
+        let ellipse = 0.6;
+        let obs: Vec<LinkObservation> = [(nw, se), (ne, sw), (nw, ne), (sw, se)]
+            .iter()
+            .map(|&(rx, tx)| LinkObservation {
+                rx,
+                tx,
+                response: 1.0 + 4.0 * link_weight(rx, tx, truth, ellipse),
+            })
+            .collect();
+
+        let wing = RtiConfig {
+            origin_m: [-5.0, -1.0],
+            width_m: 6.0,
+            depth_m: 6.0,
+            cell_m: 0.25,
+            ellipse_width_m: ellipse,
+        };
+        let est = estimate(&obs, &wing, &[]).expect("the wing is inside this grid");
+        let err = ((est.x - truth[0]).powi(2) + (est.y - truth[1]).powi(2)).sqrt();
+        assert!(err < 1.0, "error {err:.2} m at {:?}", (est.x, est.y));
+
+        // The same observations against a grid pinned to the origin: every
+        // cell it can offer is east of the wing, so nothing it returns is the
+        // truth. This is the failure the offset exists to remove.
+        let pinned = RtiConfig { origin_m: [0.0, 0.0], ..wing };
+        if let Some(e) = estimate(&obs, &pinned, &[]) {
+            assert!(
+                e.x >= 0.0,
+                "a grid starting at x=0 reported a cell at x={:.2}",
+                e.x
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_grid_still_starts_at_the_origin() {
+        // Every caller that predates the offset must be unaffected by it.
+        assert_eq!(RtiConfig::default().origin_m, [0.0, 0.0]);
     }
 }

@@ -65,11 +65,56 @@ pub const MAX_NODES: usize = 16;
 /// window holds a few hundred entries; 20k is far above any legitimate load.
 const MAX_OPEN: usize = 20_000;
 
+/// Cap on open keys that additionally retain CSI vectors.
+///
+/// Separate from `MAX_OPEN` on purpose. `MAX_OPEN` bounds an anti-abuse
+/// surface — `observe` is fed straight from the network. This one bounds
+/// *memory*, and the two want very different numbers: a key costs a few bytes,
+/// a key with three 256-subcarrier vectors costs ~3 KB.
+///
+/// MEASURED 2026-08-31 on the nine-node fleet: 61 open keys typical, 30 paired
+/// transmissions/s, 2.99 receivers each. So 8192 is ~130x the observed load and
+/// still bounds retention at roughly 25 MB.
+const RETAIN_MAX_KEYS: usize = 8_192;
+
+/// Finalised paired snapshots kept for inspection. ~3 KB each at three
+/// receivers and 256 subcarriers, so this bounds the ring at about 12 MB.
+const SNAPSHOT_RING: usize = 4_096;
+
+/// One transmission as several receivers measured it, at the same instant,
+/// over different paths.
+///
+/// This is the observation the whole cross-receiver approach is built on, and
+/// it is the thing the index used to throw away: pairing proved *that* N nodes
+/// heard one packet, then discarded *what they heard*. Comparing how the
+/// channel changed at several receivers for the SAME packet needs no forward
+/// model — unlike the link-line kernel in `rti.rs`, whose "response is high
+/// near the line" assumption was measured false on this fleet.
+#[derive(Clone, Debug)]
+pub struct PairedSnapshot {
+    /// Monotonic id, so a poller can detect that it missed some.
+    pub seq: u64,
+    pub tx: [u8; 6],
+    pub rx_seq: u16,
+    /// `(node_id, amplitudes)` per receiver, at least two by construction.
+    ///
+    /// Amplitudes are `f32`, not `f64`: they derive from i8 I/Q pairs, so the
+    /// magnitude never exceeds ~181 and `f32` holds every representable value
+    /// exactly enough. That halves the memory for no loss. Note this is a
+    /// precision choice, NOT a subcarrier-selection one — every subcarrier is
+    /// kept, because which ones carry the disturbance signature is precisely
+    /// what we do not yet know.
+    pub obs: Vec<(u8, Vec<f32>)>,
+}
+
 struct Open {
     first: Instant,
     /// Bitmask of node_ids that reported this transmission.
     nodes: u32,
     count: u8,
+    /// Retained CSI per receiver. Empty when this key was opened without
+    /// vectors, or when the retention budget was already full.
+    vecs: Vec<(u8, Vec<f32>)>,
 }
 
 /// Rolling pairing statistics.
@@ -87,6 +132,14 @@ pub struct FusionStats {
     pub pairs: [[u64; MAX_NODES]; MAX_NODES],
     /// Frames dropped because the open-key map was at capacity.
     pub overflow: u64,
+    /// Paired snapshots finalised with CSI retained — the ones usable for
+    /// cross-receiver comparison.
+    pub snapshots: u64,
+    /// Frames whose CSI was NOT retained because the retention budget was
+    /// full. Counted separately from `overflow`: the pairing statistics are
+    /// unaffected, only the vectors are missing, and conflating the two would
+    /// make a memory-bound look like dropped data.
+    pub retain_full: u64,
 }
 
 impl FusionStats {
@@ -112,6 +165,12 @@ impl FusionStats {
 pub struct FusionIndex {
     open: HashMap<([u8; 6], u16), Open>,
     stats: FusionStats,
+    /// Open keys currently holding vectors, tracked rather than recounted:
+    /// `expire` runs every frame and walking the map to sum it would be the
+    /// hot path.
+    retaining: usize,
+    snapshots: std::collections::VecDeque<PairedSnapshot>,
+    next_seq: u64,
 }
 
 impl Default for FusionIndex {
@@ -125,6 +184,9 @@ impl FusionIndex {
         Self {
             open: HashMap::new(),
             stats: FusionStats::default(),
+            retaining: 0,
+            snapshots: std::collections::VecDeque::new(),
+            next_seq: 0,
         }
     }
 
@@ -134,6 +196,26 @@ impl FusionIndex {
     /// have no transmission identity, and keying them on a placeholder would
     /// pair every older node's frames with every other node's.
     pub fn observe(&mut self, node_id: u8, tx: [u8; 6], rx_seq: u16, now: Instant) {
+        self.observe_with_csi(node_id, tx, rx_seq, now, None);
+    }
+
+    /// As [`FusionIndex::observe`], additionally retaining this receiver's
+    /// amplitude vector so the finalised transmission can be compared ACROSS
+    /// its receivers.
+    ///
+    /// Retention is best-effort by design: when the budget is full the pairing
+    /// statistics carry on exactly as before and only the vectors are skipped,
+    /// counted in `retain_full`. Losing a snapshot degrades what can be
+    /// analysed; it must never degrade the headline pairing numbers, which are
+    /// the fleet's health metric.
+    pub fn observe_with_csi(
+        &mut self,
+        node_id: u8,
+        tx: [u8; 6],
+        rx_seq: u16,
+        now: Instant,
+        amplitudes: Option<&[f64]>,
+    ) {
         self.stats.observations += 1;
 
         let key = (tx, rx_seq);
@@ -142,6 +224,13 @@ impl FusionIndex {
             if (node_id as usize) < MAX_NODES && e.nodes & bit == 0 {
                 e.nodes |= bit;
                 e.count = e.count.saturating_add(1);
+                // Only retain for a key already retaining. A key that opened
+                // without vectors stays without them: a snapshot missing its
+                // first receiver is not a snapshot, and half of one would
+                // silently bias every cross-receiver comparison drawn from it.
+                if let (Some(a), false) = (amplitudes, e.vecs.is_empty()) {
+                    e.vecs.push((node_id, a.iter().map(|v| *v as f32).collect()));
+                }
             }
             return;
         }
@@ -155,14 +244,32 @@ impl FusionIndex {
         } else {
             0
         };
+        let mut vecs = Vec::new();
+        if let Some(a) = amplitudes {
+            if !a.is_empty() && bit != 0 {
+                if self.retaining < RETAIN_MAX_KEYS {
+                    vecs.push((node_id, a.iter().map(|v| *v as f32).collect()));
+                    self.retaining += 1;
+                } else {
+                    self.stats.retain_full += 1;
+                }
+            }
+        }
         self.open.insert(
             key,
             Open {
                 first: now,
                 nodes: bit,
                 count: u8::from(bit != 0),
+                vecs,
             },
         );
+    }
+
+    /// Most recent paired snapshots, newest last, up to `limit`.
+    pub fn recent_snapshots(&self, limit: usize) -> Vec<&PairedSnapshot> {
+        let n = self.snapshots.len();
+        self.snapshots.iter().skip(n.saturating_sub(limit)).collect()
     }
 
     /// Finalise every key older than `WINDOW` into the statistics.
@@ -182,6 +289,24 @@ impl FusionIndex {
                 self.stats.transmissions += 1;
                 let n = (e.count as usize).min(MAX_NODES);
                 self.stats.by_receivers[n] += 1;
+                if !e.vecs.is_empty() {
+                    self.retaining = self.retaining.saturating_sub(1);
+                }
+                // A snapshot needs two receivers of the SAME packet — one
+                // receiver's vector describes a channel, not a comparison.
+                if e.vecs.len() >= 2 {
+                    if self.snapshots.len() >= SNAPSHOT_RING {
+                        self.snapshots.pop_front();
+                    }
+                    self.snapshots.push_back(PairedSnapshot {
+                        seq: self.next_seq,
+                        tx: k.0,
+                        rx_seq: k.1,
+                        obs: e.vecs,
+                    });
+                    self.next_seq += 1;
+                    self.stats.snapshots += 1;
+                }
                 if e.count >= 2 {
                     for a in 0..MAX_NODES {
                         if e.nodes & (1 << a) == 0 {
@@ -316,5 +441,109 @@ mod tests {
         }
         assert!(idx.open_len() <= MAX_OPEN);
         assert!(idx.stats().overflow > 0, "overflow is counted, not silent");
+    }
+
+    // ---- CSI retention -----------------------------------------------------
+
+    const A1: [f64; 4] = [10.0, 11.0, 12.0, 13.0];
+    const A2: [f64; 4] = [20.0, 21.0, 22.0, 23.0];
+
+    #[test]
+    fn two_receivers_of_one_packet_finalise_into_a_snapshot() {
+        let t0 = Instant::now();
+        let mut idx = FusionIndex::new();
+        idx.observe_with_csi(1, TX, 7, t0, Some(&A1));
+        idx.observe_with_csi(5, TX, 7, t0 + Duration::from_millis(3), Some(&A2));
+        let s = drained(&mut idx, t0);
+        assert_eq!(s.snapshots, 1);
+
+        let snaps = idx.recent_snapshots(10);
+        assert_eq!(snaps.len(), 1);
+        let snap = snaps[0];
+        assert_eq!(snap.rx_seq, 7);
+        assert_eq!(snap.obs.len(), 2, "both receivers must be present");
+        // The whole point is comparing receivers of ONE packet, so each
+        // receiver's own measurement must survive intact and attributed.
+        let a = snap.obs.iter().find(|(id, _)| *id == 1).expect("node 1");
+        let b = snap.obs.iter().find(|(id, _)| *id == 5).expect("node 5");
+        assert_eq!(a.1, vec![10.0f32, 11.0, 12.0, 13.0]);
+        assert_eq!(b.1, vec![20.0f32, 21.0, 22.0, 23.0]);
+    }
+
+    /// One receiver is a channel measurement, not a comparison. Emitting it as
+    /// a snapshot would put unpairable rows into the very dataset whose only
+    /// purpose is cross-receiver comparison.
+    #[test]
+    fn a_single_receiver_never_becomes_a_snapshot() {
+        let t0 = Instant::now();
+        let mut idx = FusionIndex::new();
+        idx.observe_with_csi(1, TX, 8, t0, Some(&A1));
+        let s = drained(&mut idx, t0);
+        assert_eq!(s.transmissions, 1, "it is still a finalised transmission");
+        assert_eq!(s.snapshots, 0, "but not a snapshot");
+        assert!(idx.recent_snapshots(10).is_empty());
+    }
+
+    /// A key opened without vectors must not acquire them from a later
+    /// receiver: a snapshot missing its first receiver is not a snapshot, and
+    /// half of one would silently bias every comparison drawn from it.
+    #[test]
+    fn a_key_opened_without_csi_stays_without_it() {
+        let t0 = Instant::now();
+        let mut idx = FusionIndex::new();
+        idx.observe(1, TX, 9, t0);
+        idx.observe_with_csi(5, TX, 9, t0 + Duration::from_millis(3), Some(&A2));
+        let s = drained(&mut idx, t0);
+        assert_eq!(s.by_receivers[2], 1, "pairing is unaffected");
+        assert_eq!(s.snapshots, 0, "no partial snapshot");
+    }
+
+    /// Retention is best-effort: exhausting its budget must degrade what can
+    /// be analysed, never the pairing statistics the fleet is judged by.
+    #[test]
+    fn a_full_retention_budget_does_not_disturb_pairing() {
+        let t0 = Instant::now();
+        let mut idx = FusionIndex::new();
+        for i in 0..(RETAIN_MAX_KEYS + 64) {
+            idx.observe_with_csi(1, TX, i as u16, t0, Some(&A1));
+        }
+        let s = idx.stats().clone();
+        assert_eq!(s.observations as usize, RETAIN_MAX_KEYS + 64);
+        assert_eq!(s.overflow, 0, "the open map is nowhere near MAX_OPEN");
+        assert!(s.retain_full >= 64, "the budget refused the excess: {}", s.retain_full);
+    }
+
+    /// The budget must be RECLAIMED as keys finalise, or retention stops
+    /// forever after one busy window.
+    #[test]
+    fn retention_budget_is_released_when_a_key_finalises() {
+        let t0 = Instant::now();
+        let mut idx = FusionIndex::new();
+        for i in 0..RETAIN_MAX_KEYS {
+            idx.observe_with_csi(1, TX, i as u16, t0, Some(&A1));
+        }
+        idx.observe_with_csi(2, TX, 60000, t0, Some(&A1));
+        assert!(idx.stats().retain_full >= 1, "budget was full");
+
+        drained(&mut idx, t0);
+        let before = idx.stats().retain_full;
+        idx.observe_with_csi(3, TX, 61000, t0 + WINDOW + Duration::from_millis(2), Some(&A1));
+        assert_eq!(idx.stats().retain_full, before, "budget was released on expiry");
+    }
+
+    #[test]
+    fn the_snapshot_ring_is_bounded_and_keeps_the_newest() {
+        let t0 = Instant::now();
+        let mut idx = FusionIndex::new();
+        // Each iteration opens and finalises one paired key.
+        for i in 0..(SNAPSHOT_RING + 32) {
+            let t = t0 + Duration::from_millis(i as u64);
+            idx.observe_with_csi(1, TX, i as u16, t, Some(&A1));
+            idx.observe_with_csi(2, TX, i as u16, t, Some(&A2));
+            idx.expire(t + WINDOW + Duration::from_millis(1));
+        }
+        assert_eq!(idx.recent_snapshots(usize::MAX).len(), SNAPSHOT_RING);
+        let newest = idx.recent_snapshots(1)[0].seq;
+        assert_eq!(newest as usize, SNAPSHOT_RING + 31, "the ring keeps the newest");
     }
 }
