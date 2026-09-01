@@ -201,8 +201,14 @@
     },
     {
       "mac": "e0:d3:62:d0:f9:08",
-      "label": "Amys Office power strip",
-      "status": "pending"
+      "label": "Kasa Amys Office strip",
+      "position": [
+        3.048,
+        7.3152,
+        0.0
+      ],
+      "uncertainty_m": 0.9144,
+      "status": "approved"
     },
     {
       "mac": "00:24:b1:06:1c:c7",
@@ -306,8 +312,14 @@
     },
     {
       "mac": "78:20:51:6f:94:96",
-      "label": "Kasa Living Room",
-      "status": "pending"
+      "label": "Kasa Living Room (floor)",
+      "position": [
+        8.8392,
+        6.7056,
+        0.0
+      ],
+      "uncertainty_m": 2.4384,
+      "status": "approved"
     },
     {
       "mac": "a8:29:48:23:5d:67",
@@ -316,8 +328,14 @@
     },
     {
       "mac": "a8:29:48:23:5a:27",
-      "label": "Kasa Server Rack",
-      "status": "pending"
+      "label": "Kasa Server Rack (basement S wall)",
+      "position": [
+        6.7056,
+        10.3632,
+        -1.524
+      ],
+      "uncertainty_m": 0.9144,
+      "status": "approved"
     },
     {
       "mac": "2c:2b:f9:1c:3c:55",
