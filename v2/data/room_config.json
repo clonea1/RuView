@@ -3,22 +3,6 @@
   "depth_m": 10.3632,
   "nodes": [
     {
-      "id": 5,
-      "x": 3.029712,
-      "y": 2.999232,
-      "z": 0.508,
-      "floor": 1,
-      "label": "family room"
-    },
-    {
-      "id": 6,
-      "x": 10.250424,
-      "y": 1.350264,
-      "z": 0.508,
-      "floor": 1,
-      "label": "dinning room"
-    },
-    {
       "id": 2,
       "x": 8.8392,
       "y": 8.29056,
@@ -27,12 +11,12 @@
       "label": "kids room"
     },
     {
-      "id": 8,
-      "x": 0.0,
-      "y": 8.5344,
-      "z": 1.0668,
+      "id": 0,
+      "x": 6.7056,
+      "y": 7.3152,
+      "z": 0.508,
       "floor": 1,
-      "label": "amys office"
+      "label": "Foyer"
     },
     {
       "id": 1,
@@ -43,12 +27,28 @@
       "label": "Guest room"
     },
     {
+      "id": 5,
+      "x": 3.029712,
+      "y": 2.999232,
+      "z": 0.508,
+      "floor": 1,
+      "label": "family room"
+    },
+    {
       "id": 4,
       "x": 13.4112,
       "y": 0.762,
       "z": 3.2004,
       "floor": 2,
       "label": "master"
+    },
+    {
+      "id": 6,
+      "x": 10.250424,
+      "y": 1.350264,
+      "z": 0.508,
+      "floor": 1,
+      "label": "dinning room"
     },
     {
       "id": 3,
@@ -59,20 +59,20 @@
       "label": "fuzzies room"
     },
     {
+      "id": 8,
+      "x": 0.0,
+      "y": 8.5344,
+      "z": 1.0668,
+      "floor": 1,
+      "label": "amys office"
+    },
+    {
       "id": 7,
       "x": 13.4112,
       "y": 6.7056,
       "z": 0.508,
       "floor": 1,
       "label": "living room"
-    },
-    {
-      "id": 0,
-      "x": 6.7056,
-      "y": 7.3152,
-      "z": 0.508,
-      "floor": 1,
-      "label": "Foyer"
     }
   ],
   "ap_position": [
@@ -152,11 +152,6 @@
   ],
   "emitters": [
     {
-      "mac": "64:16:66:c7:8c:51",
-      "label": "Nest Aurora Room",
-      "status": "pending"
-    },
-    {
       "mac": "64:16:66:cb:36:db",
       "label": "Nest Basement",
       "position": [
@@ -166,41 +161,6 @@
       ],
       "uncertainty_m": 2.5,
       "status": "approved"
-    },
-    {
-      "mac": "64:16:66:cb:35:e2",
-      "label": "Nest Entryway",
-      "status": "pending"
-    },
-    {
-      "mac": "e0:d3:62:d0:f9:08",
-      "label": "Nest Family Room",
-      "status": "pending"
-    },
-    {
-      "mac": "18:b4:30:b4:be:b7",
-      "label": "Nest Fuzzies",
-      "status": "pending"
-    },
-    {
-      "mac": "64:16:66:c7:6e:cd",
-      "label": "Nest Guest Room",
-      "status": "pending"
-    },
-    {
-      "mac": "64:16:66:c7:92:40",
-      "label": "Nest Master Bedroom",
-      "status": "pending"
-    },
-    {
-      "mac": "64:16:66:c7:64:36",
-      "label": "Nest Mud Room",
-      "status": "pending"
-    },
-    {
-      "mac": "64:16:66:cb:17:07",
-      "label": "Nest Upstairs Hall",
-      "status": "pending"
     },
     {
       "mac": "00:23:a7:af:af:85",
@@ -214,9 +174,249 @@
       "status": "approved"
     },
     {
-      "mac": "e8:ee:cc:a2:41:35",
-      "label": "unknown fleet-wide device",
+      "mac": "38:8a:06:e3:b8:de",
+      "label": "AMY S24 Ultra",
       "status": "pending"
+    },
+    {
+      "mac": "e8:ee:cc:a2:41:35",
+      "label": "Abode M5 hub",
+      "status": "pending"
+    },
+    {
+      "mac": "78:6c:84:c7:fb:f6",
+      "label": "Amazon Kindle Fire",
+      "status": "pending"
+    },
+    {
+      "mac": "f0:a6:54:5c:f4:53",
+      "label": "Amys Laptop",
+      "status": "pending"
+    },
+    {
+      "mac": "e0:d3:62:d0:f9:08",
+      "label": "Amys Office power strip",
+      "status": "pending"
+    },
+    {
+      "mac": "00:24:b1:06:1c:c7",
+      "label": "ChargePoint Garage",
+      "status": "pending"
+    },
+    {
+      "mac": "c8:ff:77:da:b3:95",
+      "label": "DysonAirFilter",
+      "status": "pending"
+    },
+    {
+      "mac": "9c:cc:01:40:18:b8",
+      "label": "ESP node 0 foyer",
+      "status": "pending"
+    },
+    {
+      "mac": "e8:f6:0a:fc:fb:6c",
+      "label": "ESP node 1 guest room",
+      "status": "pending"
+    },
+    {
+      "mac": "e8:f6:0a:fc:b2:a8",
+      "label": "ESP node 2 kids room",
+      "status": "pending"
+    },
+    {
+      "mac": "e8:f6:0a:fc:e6:70",
+      "label": "ESP node 3 fuzzies room",
+      "status": "pending"
+    },
+    {
+      "mac": "9c:cc:01:40:16:84",
+      "label": "ESP node 4 Master room",
+      "status": "pending"
+    },
+    {
+      "mac": "9c:cc:01:40:1a:e8",
+      "label": "ESP node 5 family room",
+      "status": "pending"
+    },
+    {
+      "mac": "9c:cc:01:40:33:ac",
+      "label": "ESP node 6 dinning room",
+      "status": "pending"
+    },
+    {
+      "mac": "e8:f6:0a:fc:bf:a0",
+      "label": "ESP node 7 living room",
+      "status": "pending"
+    },
+    {
+      "mac": "e8:f6:0a:fb:4b:e8",
+      "label": "ESP node 8 Amys office",
+      "status": "pending"
+    },
+    {
+      "mac": "e0:d3:62:d1:06:7e",
+      "label": "Family Room power strip",
+      "status": "pending"
+    },
+    {
+      "mac": "d4:f5:47:95:94:30",
+      "label": "Google-Nest-Mini",
+      "status": "pending"
+    },
+    {
+      "mac": "5c:e7:53:54:aa:b8",
+      "label": "Govee Hub",
+      "status": "pending"
+    },
+    {
+      "mac": "fc:b4:67:ab:94:6c",
+      "label": "Hatch Rest 2nd Gen",
+      "status": "pending"
+    },
+    {
+      "mac": "48:70:1e:29:ff:a2",
+      "label": "Infinity Thermostat 1st Floor",
+      "status": "pending"
+    },
+    {
+      "mac": "b0:7e:11:e0:a7:40",
+      "label": "Infinity Thermostat 2nd Floor",
+      "status": "pending"
+    },
+    {
+      "mac": "a8:29:48:23:55:db",
+      "label": "Kasa Bug Zapper",
+      "status": "pending"
+    },
+    {
+      "mac": "78:20:51:6f:ab:bc",
+      "label": "Kasa Guest Room",
+      "status": "pending"
+    },
+    {
+      "mac": "78:20:51:6f:a2:d4",
+      "label": "Kasa Kitchen Garden",
+      "status": "pending"
+    },
+    {
+      "mac": "78:20:51:6f:94:96",
+      "label": "Kasa Living Room",
+      "status": "pending"
+    },
+    {
+      "mac": "a8:29:48:23:5d:67",
+      "label": "Kasa Projector",
+      "status": "pending"
+    },
+    {
+      "mac": "a8:29:48:23:5a:27",
+      "label": "Kasa Server Rack",
+      "status": "pending"
+    },
+    {
+      "mac": "2c:2b:f9:1c:3c:55",
+      "label": "LG Dryer",
+      "status": "pending"
+    },
+    {
+      "mac": "b8:16:5f:d0:19:96",
+      "label": "LG Microwave",
+      "status": "pending"
+    },
+    {
+      "mac": "e0:d3:62:d0:f1:5c",
+      "label": "Livving Room power strip",
+      "status": "pending"
+    },
+    {
+      "mac": "08:36:c9:71:ff:52",
+      "label": "Meural Fuzzies Room",
+      "status": "pending"
+    },
+    {
+      "mac": "64:16:66:c7:8c:51",
+      "label": "Nest Protect Aurora Room",
+      "status": "pending"
+    },
+    {
+      "mac": "64:16:66:cb:35:e2",
+      "label": "Nest Protect Entryway",
+      "status": "pending"
+    },
+    {
+      "mac": "18:b4:30:b4:be:b7",
+      "label": "Nest Protect Fuzzies",
+      "status": "pending"
+    },
+    {
+      "mac": "64:16:66:c7:6e:cd",
+      "label": "Nest Protect Guest Room",
+      "status": "pending"
+    },
+    {
+      "mac": "64:16:66:c7:92:40",
+      "label": "Nest Protect Master Bedroom",
+      "status": "pending"
+    },
+    {
+      "mac": "64:16:66:c7:64:36",
+      "label": "Nest Protect Mud Room",
+      "status": "pending"
+    },
+    {
+      "mac": "64:16:66:cb:17:07",
+      "label": "Nest Protect Upstairs Hall",
+      "status": "pending"
+    },
+    {
+      "mac": "cc:c0:79:ec:1c:d8",
+      "label": "Rachio 3",
+      "status": "pending"
+    },
+    {
+      "mac": "80:64:6f:ac:d7:ad",
+      "label": "Rachio Valve hub",
+      "status": "pending"
+    },
+    {
+      "mac": "cc:c0:79:b2:ef:cc",
+      "label": "Sense Energy Monitor",
+      "status": "pending"
+    },
+    {
+      "mac": "10:a5:62:24:bb:30",
+      "label": "Skylight",
+      "status": "pending"
+    },
+    {
+      "mac": "8c:30:66:86:ac:81",
+      "label": "AP 1 (1st floor) 8c",
+      "position": [
+        -3.6576,
+        0.0,
+        2.1336
+      ],
+      "status": "surveyed"
+    },
+    {
+      "mac": "92:30:66:86:ac:81",
+      "label": "AP 1 (1st floor) 92",
+      "position": [
+        -3.6576,
+        0.0,
+        2.1336
+      ],
+      "status": "surveyed"
+    },
+    {
+      "mac": "96:30:66:86:ac:81",
+      "label": "AP 1 (1st floor) 96",
+      "position": [
+        -3.6576,
+        0.0,
+        2.1336
+      ],
+      "status": "surveyed"
     }
   ],
   "ap_floor": 2
