@@ -10084,6 +10084,9 @@ async fn links_inventory_endpoint(State(state): State<SharedState>) -> Json<serd
                 "window_span_s": r.window_span_s,
                 "grid": r.grid,
                 "sparser_skipped": r.sparser_skipped,
+                "interval_s": r.interval_s,
+                "stale_after_s": r.stale_after_s,
+                "gap_resets": r.gap_resets,
             })
         })
         .collect();

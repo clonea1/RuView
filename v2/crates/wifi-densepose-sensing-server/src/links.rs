@@ -72,8 +72,61 @@ const LINK_HISTORY: usize = 32;
 /// and the realistic mixed case is well under 30 MB.
 pub const MAX_LINKS: usize = 1024;
 
-/// A link with no frame for this long is dropped, freeing its slot.
-const LINK_STALE_AFTER: Duration = Duration::from_secs(30);
+/// Eviction floor: never drop a link faster than this, however chatty it is.
+const LINK_STALE_MIN: Duration = Duration::from_secs(30);
+
+/// Eviction ceiling: never keep a silent link longer than this, however slowly
+/// it normally speaks. Bounds the table against transmitters that leave for
+/// good — a visiting phone, a neighbour who moves house.
+const LINK_STALE_MAX: Duration = Duration::from_secs(900);
+
+/// Silence, as a multiple of the link's OWN typical interval, before it is
+/// considered gone.
+///
+/// A flat wall-clock threshold cannot serve this fleet. MEASURED 2026-09-01
+/// over the same 100 s, two Nest Protects of the same make: `cb:35:e2` held
+/// ~22 fps with `age_ms` never above 364, while `cb:17:07` sat at 0 fps with
+/// `age_ms` climbing 16 s -> 28 s toward eviction. The sleepy one accumulated
+/// 2-3 frames per wake, was dropped at 30 s, and started from zero on the next
+/// wake — so it could never reach `MIN_FRAMES_FOR_METRIC`, and never reach the
+/// 200 samples `rti` wants for a baseline either. It was structurally
+/// incapable of ever becoming usable.
+///
+/// Judging silence against the link's own cadence serves both without anyone
+/// classifying anything: the arrival history IS the classification.
+const STALE_INTERVAL_MULTIPLE: f64 = 20.0;
+
+/// Gap, as a multiple of the link's own typical interval, that ends the current
+/// measurement window.
+///
+/// Separate from eviction on purpose, because they are different concerns that
+/// were conflated in one constant. Eviction is about reclaiming a slot; this is
+/// about MEASUREMENT VALIDITY. A 32-frame history spanning two wakes ten
+/// minutes apart, differenced, reports how the room changed overnight and calls
+/// it motion — the same category of error as differencing a 64-bin frame
+/// against a 256-bin one, and it gets the same remedy: a discontinuity starts a
+/// fresh window rather than being blended into the old one.
+const HISTORY_GAP_MULTIPLE: f64 = 8.0;
+
+/// Absolute floor on that gap, whatever the cadence.
+///
+/// Without it a fast link resets constantly: at 10 ms between frames, eight
+/// intervals is 80 ms, and UDP delivers in bursts — the fps estimator's own
+/// notes record arrivals clumping hard enough to bias a reciprocal-mean
+/// estimator. A sub-second hiccup does not make two frames incomparable; the
+/// measurement is of human movement over roughly one-second windows. Only a
+/// gap long enough for the room itself to have changed should end the window.
+const HISTORY_GAP_MIN: Duration = Duration::from_secs(2);
+
+/// Smoothing for the per-link interval estimate. Deliberately brisk: a link
+/// that changes cadence (a device entering power-save) should be tracked in a
+/// few samples, not a few hundred.
+const INTERVAL_ALPHA: f64 = 0.25;
+
+/// Cap on how fast the interval estimate may grow per sample, so one long gap
+/// cannot inflate it and thereby make the link near-immortal. Growth to a
+/// genuinely slower cadence still happens, over a handful of samples.
+const INTERVAL_GROWTH_CAP: f64 = 4.0;
 
 /// EMA rate for a link's resting-state baseline. Matches the amplitude
 /// pipeline's existing slow-baseline approach rather than inventing a second
@@ -130,9 +183,31 @@ struct LinkState {
     /// silent — an invisible drop is what hid every foreign transmitter until
     /// 2026-09-01.
     sparser_skipped: u64,
+    /// Typical seconds between frames on this link. 0 until the second frame.
+    /// This is what makes staleness and continuity relative to the transmitter
+    /// rather than to a constant chosen around the access point.
+    interval_s: f64,
+    /// Times the measurement window was reset by a gap. Counted, because a link
+    /// that resets constantly is telling you its cadence estimate is wrong.
+    gap_resets: u64,
 }
 
 impl LinkState {
+    /// How long this link may stay silent before it is considered gone.
+    ///
+    /// Relative to its own cadence, bounded at both ends: a link delivering
+    /// every 20 s is not stale at 30 s, it is on schedule, while a link that
+    /// has genuinely left must still free its slot eventually.
+    fn stale_after(&self) -> Duration {
+        if self.interval_s <= 0.0 {
+            return LINK_STALE_MIN;
+        }
+        let secs = self.interval_s * STALE_INTERVAL_MULTIPLE;
+        Duration::from_secs_f64(
+            secs.clamp(LINK_STALE_MIN.as_secs_f64(), LINK_STALE_MAX.as_secs_f64()),
+        )
+    }
+
     /// Wall-clock seconds between the oldest and newest frame in the window.
     fn window_span_s(&self) -> f64 {
         match (self.stamps.front(), self.stamps.back()) {
@@ -184,6 +259,12 @@ pub struct LinkInventory {
     pub grid: usize,
     /// Frames refused for arriving on a sparser grid.
     pub sparser_skipped: u64,
+    /// Typical seconds between frames on this link.
+    pub interval_s: f64,
+    /// Seconds of silence this link is allowed before eviction.
+    pub stale_after_s: f64,
+    /// Times a gap ended the measurement window.
+    pub gap_resets: u64,
 }
 
 /// Per-link motion, as reported to callers.
@@ -358,7 +439,35 @@ impl LinkTable {
             baseline_samples: 0,
             grid: 0,
             sparser_skipped: 0,
+            interval_s: 0.0,
+            gap_resets: 0,
         });
+        // ── Cadence, and the continuity guard ────────────────────────────────
+        //
+        // Measured BEFORE `last_seen` moves, so `dt` is the real silence since
+        // the previous frame. A brand-new link has dt == 0 and teaches nothing.
+        let dt = now.duration_since(st.last_seen).as_secs_f64();
+        if dt > 0.0 {
+            let gap_limit =
+                (HISTORY_GAP_MULTIPLE * st.interval_s).max(HISTORY_GAP_MIN.as_secs_f64());
+            if st.interval_s > 0.0 && dt > gap_limit {
+                // The window ended. Drop the samples — they are not comparable
+                // across the gap — but KEEP the link, its baseline, its frame
+                // count and its cadence estimate. Throwing those away is what
+                // made a sleepy transmitter permanently unusable: the baseline
+                // needs 200 samples and was being reset every 30 s.
+                st.history.clear();
+                st.stamps.clear();
+                st.gap_resets += 1;
+            }
+            st.interval_s = if st.interval_s <= 0.0 {
+                dt
+            } else {
+                let capped = dt.min(st.interval_s * INTERVAL_GROWTH_CAP);
+                st.interval_s * (1.0 - INTERVAL_ALPHA) + capped * INTERVAL_ALPHA
+            };
+        }
+
         // ── Per-link subcarrier-grid policy (ADR-110 / issue #1005) ──────────
         //
         // Same rule the per-node gate applied, applied where it belongs. A
@@ -435,7 +544,7 @@ impl LinkTable {
     /// Drop links unseen for [`LINK_STALE_AFTER`].
     pub fn expire(&mut self, now: Instant) {
         self.links
-            .retain(|_, st| now.duration_since(st.last_seen) < LINK_STALE_AFTER);
+            .retain(|_, st| now.duration_since(st.last_seen) < st.stale_after());
     }
 
     /// Current per-link metrics, strongest perturbation first.
@@ -534,6 +643,9 @@ impl LinkTable {
                     window_span_s: st.window_span_s(),
                     grid: st.grid,
                     sparser_skipped: st.sparser_skipped,
+                    interval_s: st.interval_s,
+                    stale_after_s: st.stale_after().as_secs_f64(),
+                    gap_resets: st.gap_resets,
                 }
             })
             .collect();
@@ -699,8 +811,106 @@ mod tests {
             t.observe(0, AP, &steady(56, 10.0), -60, t0);
         }
         assert_eq!(t.len(), 1);
-        t.expire(t0 + LINK_STALE_AFTER + Duration::from_secs(1));
+        // Every frame arrived at the same instant, so there is no cadence to
+        // measure and the link falls back to the eviction floor.
+        t.expire(t0 + LINK_STALE_MIN + Duration::from_secs(1));
         assert_eq!(t.len(), 0, "stale link must be dropped");
+    }
+
+    // ---- cadence-relative staleness ----------------------------------------
+
+    /// The bug this replaces: a flat 30 s window evicted a slow-but-steady
+    /// transmitter mid-conversation. MEASURED 2026-09-01 on a Nest Protect that
+    /// accumulated 2-3 frames per wake, was dropped, and started from zero every
+    /// time — so it could never reach MIN_FRAMES_FOR_METRIC, nor the 200 samples
+    /// rti wants for a baseline.
+    #[test]
+    fn a_slow_but_steady_link_is_not_evicted_at_the_old_flat_window() {
+        let t0 = Instant::now();
+        let mut t = LinkTable::new();
+        for i in 0..6 {
+            t.observe(0, PEER, &steady(64, 10.0), -80, t0 + Duration::from_secs(i * 20));
+        }
+        let last = t0 + Duration::from_secs(100);
+        // 40 s of silence: past the old flat window, well inside 20x a 20 s cadence.
+        t.expire(last + Duration::from_secs(40));
+        assert_eq!(t.len(), 1, "a link on a 20 s cadence is not stale at 40 s");
+
+        let inv = t.inventory(last + Duration::from_secs(40));
+        assert!(inv[0].interval_s > 10.0, "cadence learned: {}", inv[0].interval_s);
+        assert!(inv[0].stale_after_s > 100.0, "allowance scales with it: {}", inv[0].stale_after_s);
+    }
+
+    /// It must still bound the table: a transmitter that leaves for good frees
+    /// its slot rather than living forever behind a generous multiplier.
+    #[test]
+    fn a_link_that_stops_for_good_is_still_evicted() {
+        let t0 = Instant::now();
+        let mut t = LinkTable::new();
+        for i in 0..6 {
+            t.observe(0, PEER, &steady(64, 10.0), -80, t0 + Duration::from_secs(i * 20));
+        }
+        t.expire(t0 + Duration::from_secs(100) + LINK_STALE_MAX + Duration::from_secs(1));
+        assert_eq!(t.len(), 0, "silence beyond the ceiling always evicts");
+    }
+
+    /// A chatty link keeps the floor, not a 1-second allowance derived from its
+    /// own 50 ms cadence.
+    #[test]
+    fn a_fast_link_keeps_the_eviction_floor() {
+        let t0 = Instant::now();
+        let mut t = LinkTable::new();
+        for i in 0..20 {
+            t.observe(0, AP, &steady(256, 10.0), -60, t0 + Duration::from_millis(i * 50));
+        }
+        let inv = t.inventory(t0 + Duration::from_secs(1));
+        assert!(inv[0].interval_s < 0.2, "fast cadence: {}", inv[0].interval_s);
+        assert!((inv[0].stale_after_s - LINK_STALE_MIN.as_secs_f64()).abs() < 0.001,
+                "clamped to the floor, got {}", inv[0].stale_after_s);
+    }
+
+
+    /// The floor exists because a fast link would otherwise reset constantly:
+    /// eight intervals of 10 ms is 80 ms, and UDP arrives in bursts. A
+    /// sub-second hiccup must not end the measurement window.
+    #[test]
+    fn a_brief_hiccup_does_not_reset_a_fast_link() {
+        let t0 = Instant::now();
+        let mut t = LinkTable::new();
+        for i in 0..10 {
+            t.observe(0, AP, &steady(256, 20.0), -60, t0 + Duration::from_millis(i * 10));
+        }
+        // 110 ms later: 11x the cadence, but far below the absolute floor.
+        t.observe(0, AP, &steady(256, 20.0), -60, t0 + Duration::from_millis(200));
+        let inv = t.inventory(t0 + Duration::from_millis(200));
+        assert_eq!(inv[0].gap_resets, 0, "a 110 ms gap is jitter, not a discontinuity");
+        assert_eq!(inv[0].history_len, 11, "history survives intact");
+    }
+
+    /// Continuity: a gap ends the measurement window, because differencing
+    /// frames either side of a long silence reports how the room changed while
+    /// nobody was looking and calls it motion. The LINK survives — throwing away
+    /// its baseline is what made a sleepy transmitter permanently unusable.
+    #[test]
+    fn a_long_gap_resets_the_window_but_keeps_the_link() {
+        let t0 = Instant::now();
+        let mut t = LinkTable::new();
+        for i in 0..12 {
+            t.observe(0, PEER, &steady(64, 10.0 + i as f64), -80, t0 + Duration::from_secs(i));
+        }
+        let before = t.inventory(t0 + Duration::from_secs(12));
+        assert_eq!(before[0].history_len, 12);
+        let frames_before = before[0].frames;
+
+        // Wake far later: 8x a ~1 s cadence is comfortably exceeded.
+        let woke = t0 + Duration::from_secs(300);
+        t.observe(0, PEER, &steady(64, 99.0), -80, woke);
+
+        let after = t.inventory(woke);
+        assert_eq!(after[0].history_len, 1, "window restarted, not blended across the gap");
+        assert_eq!(after[0].gap_resets, 1, "and the reset is counted, not silent");
+        assert_eq!(after[0].frames, frames_before + 1, "the link itself survives");
+        assert_eq!(t.len(), 1);
     }
 
     #[test]
