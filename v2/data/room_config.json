@@ -1,42 +1,10 @@
 {
-  "width_m": 13.4112,
-  "depth_m": 10.3632,
+  "width_m": 13.2334,
+  "depth_m": 10.7696,
   "nodes": [
     {
-      "id": 2,
-      "x": 8.8392,
-      "y": 8.29056,
-      "z": 3.2004,
-      "floor": 2,
-      "label": "kids room"
-    },
-    {
-      "id": 0,
-      "x": 6.7056,
-      "y": 7.3152,
-      "z": 0.508,
-      "floor": 1,
-      "label": "Foyer"
-    },
-    {
-      "id": 1,
-      "x": 0.0,
-      "y": 6.858,
-      "z": 3.2004,
-      "floor": 2,
-      "label": "Guest room"
-    },
-    {
-      "id": 5,
-      "x": 3.029712,
-      "y": 2.999232,
-      "z": 0.508,
-      "floor": 1,
-      "label": "family room"
-    },
-    {
       "id": 4,
-      "x": 13.4112,
+      "x": 13.2334,
       "y": 0.762,
       "z": 3.2004,
       "floor": 2,
@@ -51,6 +19,38 @@
       "label": "dinning room"
     },
     {
+      "id": 8,
+      "x": 0.0,
+      "y": 9.525,
+      "z": 1.0922,
+      "floor": 1,
+      "label": "amys office"
+    },
+    {
+      "id": 2,
+      "x": 8.8392,
+      "y": 8.29056,
+      "z": 3.2004,
+      "floor": 2,
+      "label": "kids room"
+    },
+    {
+      "id": 7,
+      "x": 13.2334,
+      "y": 6.7056,
+      "z": 0.508,
+      "floor": 1,
+      "label": "living room"
+    },
+    {
+      "id": 1,
+      "x": 0.0,
+      "y": 6.858,
+      "z": 3.2004,
+      "floor": 2,
+      "label": "Guest room"
+    },
+    {
       "id": 3,
       "x": 4.75488,
       "y": 2.487168,
@@ -59,20 +59,20 @@
       "label": "fuzzies room"
     },
     {
-      "id": 8,
-      "x": 0.0,
-      "y": 8.5344,
-      "z": 1.0668,
-      "floor": 1,
-      "label": "amys office"
-    },
-    {
-      "id": 7,
-      "x": 13.4112,
-      "y": 6.7056,
+      "id": 5,
+      "x": 3.029712,
+      "y": 2.999232,
       "z": 0.508,
       "floor": 1,
-      "label": "living room"
+      "label": "family room"
+    },
+    {
+      "id": 0,
+      "x": 6.7056,
+      "y": 7.3152,
+      "z": 0.508,
+      "floor": 1,
+      "label": "Foyer"
     }
   ],
   "ap_position": [
@@ -97,33 +97,218 @@
       "subfloor_m": 0.4064
     }
   ],
-  "walls": [],
+  "walls": [
+    {
+      "level": 1,
+      "x1": -3.683,
+      "y1": 0.0,
+      "x2": 2.54,
+      "y2": 0.0,
+      "kind": "exterior"
+    },
+    {
+      "level": 1,
+      "x1": 2.54,
+      "y1": 0.0,
+      "x2": 2.54,
+      "y2": 2.999232,
+      "kind": "interior-appliance-wall-double-oven-cooktop-granite-tile-DISPUTED-x-from-244in-but-n5-confirmed-west-of-it"
+    },
+    {
+      "level": 1,
+      "x1": 2.54,
+      "y1": 2.999232,
+      "x2": -3.683,
+      "y2": 2.999232,
+      "kind": "interior-2x4-stud-sheetrock-both-faces"
+    },
+    {
+      "level": 1,
+      "x1": -3.683,
+      "y1": 2.999232,
+      "x2": -3.683,
+      "y2": 0.0,
+      "kind": "exterior"
+    },
+    {
+      "level": 1,
+      "x1": 10.250424,
+      "y1": 0.0,
+      "x2": 13.2334,
+      "y2": 0.0,
+      "kind": "exterior"
+    },
+    {
+      "level": 1,
+      "x1": 13.2334,
+      "y1": 0.0,
+      "x2": 13.2334,
+      "y2": 2.999232,
+      "kind": "exterior"
+    },
+    {
+      "level": 1,
+      "x1": 13.2334,
+      "y1": 2.999232,
+      "x2": 10.250424,
+      "y2": 2.999232,
+      "kind": "interior-2x4-stud-sheetrock-both-faces"
+    },
+    {
+      "level": 1,
+      "x1": 10.250424,
+      "y1": 2.999232,
+      "x2": 10.250424,
+      "y2": 0.0,
+      "kind": "interior-2x4-stud-sheetrock-both-faces"
+    },
+    {
+      "level": 1,
+      "x1": 2.54,
+      "y1": 0.0,
+      "x2": 10.250424,
+      "y2": 0.0,
+      "kind": "exterior"
+    },
+    {
+      "level": 1,
+      "x1": 10.250424,
+      "y1": 2.999232,
+      "x2": 2.54,
+      "y2": 2.999232,
+      "kind": "interior-2x4-stud-sheetrock-both-faces"
+    },
+    {
+      "level": 1,
+      "x1": 13.2334,
+      "y1": 2.999232,
+      "x2": 13.2334,
+      "y2": 10.7696,
+      "kind": "exterior"
+    },
+    {
+      "level": 1,
+      "x1": 13.2334,
+      "y1": 10.7696,
+      "x2": 10.250424,
+      "y2": 10.7696,
+      "kind": "exterior"
+    },
+    {
+      "level": 1,
+      "x1": 10.250424,
+      "y1": 10.7696,
+      "x2": 10.250424,
+      "y2": 2.999232,
+      "kind": "interior-2x4-stud-sheetrock-both-faces"
+    },
+    {
+      "level": 1,
+      "x1": -3.683,
+      "y1": 0.0,
+      "x2": 13.2334,
+      "y2": 0.0,
+      "kind": "exterior"
+    },
+    {
+      "level": 1,
+      "x1": 13.2334,
+      "y1": 0.0,
+      "x2": 13.2334,
+      "y2": 10.7696,
+      "kind": "exterior"
+    },
+    {
+      "level": 1,
+      "x1": 0.0,
+      "y1": 10.7696,
+      "x2": 10.250424,
+      "y2": 10.7696,
+      "kind": "exterior"
+    },
+    {
+      "level": 1,
+      "x1": 0.0,
+      "y1": 6.7056,
+      "x2": 0.0,
+      "y2": 10.7696,
+      "kind": "exterior"
+    },
+    {
+      "level": 1,
+      "x1": -3.683,
+      "y1": 6.7056,
+      "x2": 0.0,
+      "y2": 6.7056,
+      "kind": "exterior"
+    },
+    {
+      "level": 1,
+      "x1": -3.683,
+      "y1": 2.999232,
+      "x2": -3.683,
+      "y2": 6.7056,
+      "kind": "exterior"
+    },
+    {
+      "level": 2,
+      "x1": 0.0,
+      "y1": 0.0,
+      "x2": 13.2334,
+      "y2": 0.0,
+      "kind": "exterior"
+    },
+    {
+      "level": 2,
+      "x1": 13.2334,
+      "y1": 0.0,
+      "x2": 13.2334,
+      "y2": 10.7696,
+      "kind": "exterior"
+    },
+    {
+      "level": 2,
+      "x1": 0.0,
+      "y1": 10.7696,
+      "x2": 13.2334,
+      "y2": 10.7696,
+      "kind": "exterior"
+    },
+    {
+      "level": 2,
+      "x1": 0.0,
+      "y1": 0.0,
+      "x2": 0.0,
+      "y2": 10.7696,
+      "kind": "exterior"
+    }
+  ],
   "footprint": [
     {
       "level": 1,
       "points": [
         [
-          -3.6576,
+          -3.683,
           0.0
         ],
         [
-          13.4112,
+          13.2334,
           0.0
         ],
         [
-          13.4112,
-          10.3632
+          13.2334,
+          10.7696
         ],
         [
           0.0,
-          10.3632
+          10.7696
         ],
         [
           0.0,
           6.7056
         ],
         [
-          -3.6576,
+          -3.683,
           6.7056
         ]
       ]
@@ -136,16 +321,16 @@
           0.0
         ],
         [
-          13.4112,
+          13.2334,
           0.0
         ],
         [
-          13.4112,
-          10.3632
+          13.2334,
+          10.7696
         ],
         [
           0.0,
-          10.3632
+          10.7696
         ]
       ]
     }
@@ -155,11 +340,11 @@
       "mac": "64:16:66:cb:36:db",
       "label": "Nest Basement",
       "position": [
-        7.62,
-        7.3152,
+        6.7818,
+        9.017,
         -0.4064
       ],
-      "uncertainty_m": 2.5,
+      "uncertainty_m": 0.1524,
       "status": "approved"
     },
     {
@@ -167,10 +352,10 @@
       "label": "TEG-394 Powerwall gateway",
       "position": [
         0.0,
-        7.9248,
-        -1.2192
+        9.0932,
+        -0.8636
       ],
-      "uncertainty_m": 1.5,
+      "uncertainty_m": 0.1524,
       "status": "approved"
     },
     {
@@ -182,11 +367,11 @@
       "mac": "e8:ee:cc:a2:41:35",
       "label": "3D printer (basement SE)",
       "position": [
-        12.4968,
-        6.096,
-        -2.7432
+        11.7348,
+        5.8928,
+        -2.8194
       ],
-      "uncertainty_m": 0.9144,
+      "uncertainty_m": 0.1524,
       "status": "approved"
     },
     {
@@ -203,11 +388,11 @@
       "mac": "e0:d3:62:d0:f9:08",
       "label": "Kasa Amys Office strip",
       "position": [
-        3.048,
-        7.3152,
-        0.0
+        1.8796,
+        7.4168,
+        0.381
       ],
-      "uncertainty_m": 0.9144,
+      "uncertainty_m": 0.1524,
       "status": "approved"
     },
     {
@@ -320,11 +505,11 @@
       "mac": "78:20:51:6f:94:96",
       "label": "Kasa Living Room (floor)",
       "position": [
-        8.8392,
-        6.7056,
+        0.0,
+        10.0076,
         0.0
       ],
-      "uncertainty_m": 2.4384,
+      "uncertainty_m": 0.1524,
       "status": "approved"
     },
     {
@@ -336,11 +521,11 @@
       "mac": "a8:29:48:23:5a:27",
       "label": "Kasa Server Rack (basement S wall)",
       "position": [
-        6.7056,
-        10.3632,
-        -1.524
+        2.667,
+        10.7696,
+        -1.3716
       ],
-      "uncertainty_m": 0.9144,
+      "uncertainty_m": 0.1524,
       "status": "approved"
     },
     {
@@ -355,7 +540,13 @@
     },
     {
       "mac": "e0:d3:62:d0:f1:5c",
-      "label": "Livving Room power strip",
+      "label": "Living Room power strip",
+      "position": [
+        8.8392,
+        6.7056,
+        0.0
+      ],
+      "uncertainty_m": 2.4384,
       "status": "pending"
     },
     {
@@ -400,24 +591,36 @@
     },
     {
       "mac": "cc:c0:79:ec:1c:d8",
-      "label": "Rachio 3",
-      "status": "pending"
+      "label": "Rachio 3 irrigation timer (basement)",
+      "position": [
+        1.6256,
+        10.7696,
+        -1.2192
+      ],
+      "uncertainty_m": 0.1524,
+      "status": "approved"
     },
     {
       "mac": "80:64:6f:ac:d7:ad",
-      "label": "Rachio Valve hub (basement)",
+      "label": "Rachio hose-timer hub (on server rack, basement)",
       "position": [
-        4.2672,
-        10.3632,
-        -1.3716
+        2.8194,
+        10.7696,
+        -1.9812
       ],
-      "uncertainty_m": 0.9144,
+      "uncertainty_m": 0.1524,
       "status": "approved"
     },
     {
       "mac": "cc:c0:79:b2:ef:cc",
       "label": "Sense Energy Monitor",
-      "status": "pending"
+      "position": [
+        0.0,
+        8.3058,
+        -1.0668
+      ],
+      "uncertainty_m": 0.1524,
+      "status": "approved"
     },
     {
       "mac": "10:a5:62:24:bb:30",
@@ -434,7 +637,7 @@
       "mac": "8c:30:66:86:ac:81",
       "label": "AP 1 (1st floor) 8c",
       "position": [
-        -3.6576,
+        -3.683,
         0.0,
         2.1336
       ],
@@ -444,7 +647,7 @@
       "mac": "92:30:66:86:ac:81",
       "label": "AP 1 (1st floor) 92",
       "position": [
-        -3.6576,
+        -3.683,
         0.0,
         2.1336
       ],
@@ -454,11 +657,40 @@
       "mac": "96:30:66:86:ac:81",
       "label": "AP 1 (1st floor) 96",
       "position": [
-        -3.6576,
+        -3.683,
         0.0,
         2.1336
       ],
       "status": "surveyed"
+    },
+    {
+      "mac": "96:30:66:86:a4:21",
+      "status": "pending"
+    },
+    {
+      "mac": "8c:30:66:86:a4:21",
+      "status": "pending"
+    },
+    {
+      "mac": "cc:8c:bf:a8:fb:6b",
+      "status": "pending"
+    },
+    {
+      "mac": "04:71:4b:00:52:bc",
+      "status": "pending"
+    },
+    {
+      "mac": "00:23:a7:af:af:84",
+      "label": "TEG2 - unconfirmed 2nd radio of TEG-394 (no position)",
+      "status": "pending"
+    },
+    {
+      "mac": "d4:e2:cb:9d:8e:58",
+      "status": "pending"
+    },
+    {
+      "mac": "04:71:4b:00:24:62",
+      "status": "pending"
     }
   ],
   "ap_floor": 2
