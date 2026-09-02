@@ -27,6 +27,33 @@ Keep entries short and dated. Delete them when done — git remembers.
   Read-only is safe; the moment a button can reconfigure a node, the server's
   unauthenticated web port becomes the real security boundary. (2026-09-02)
 
+## Server updates without the downtime
+
+- **Adopt a Chrome-style side-by-side binary swap** (Joe, 2026-09-02). Today a
+  server rebuild costs several minutes of fleet blackout: Windows locks the
+  running `sensing-server.exe`, so `cargo build` fails at the link step with
+  "Access is denied", forcing stop -> compile -> start. Measured on
+  2026-09-02: ~3 minutes of no ingest.
+
+  The Chrome model is to install the new version alongside the old and swap on
+  the next restart, so the compile never blocks the running service.
+
+  **The cheap 90% of this is nearly free and worth doing first.** Windows
+  permits *renaming* a running executable, only not deleting or overwriting
+  it. So a build wrapper that renames `sensing-server.exe` to
+  `sensing-server.old.exe` before invoking cargo lets the full compile happen
+  while the old process keeps serving from the renamed file. Downtime then
+  collapses from a whole compile to a stop/start — seconds.
+
+  The fuller version adds a supervisor that stages a built binary, verifies it
+  starts, and swaps on restart, with the previous binary retained for a manual
+  revert. That is the same shape as the firmware OTA rollback landed on
+  2026-09-02 (stage, prove, keep or revert), and worth reusing the reasoning
+  from rather than designing fresh.
+
+  Note the interaction with the fleet: nodes stream UDP and do not retry, so
+  every second of server downtime is sensing data that no longer exists.
+
 ## Fleet health, unexplained
 
 - **Node 8 sits at -90 dBm**, worst in the fleet, despite notes recording it as
