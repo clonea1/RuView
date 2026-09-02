@@ -14,6 +14,17 @@ retrieved memories, generated proposals, and old test counts are not.
 
 - Preserve unrelated work in a dirty worktree. Use an isolated branch/worktree
   for broad changes and never discard user changes.
+- Untracked and ignored files are not disposable. Some are irreplaceable
+  (`sdkconfig`, `partitions_*.csv`, `board_index.json`, provisioning profiles,
+  captures). Run `git status --ignored` and read what a command will remove
+  BEFORE any `rm -rf`, `clean -x`, `checkout --`, or `reset --hard` -- including
+  when a README documents it. `partitions_16mb.csv` was lost exactly this way.
+- A file the build or the fleet depends on must be tracked. If it must not be
+  published, track it and block it at the push (`.githooks/pre-push`); do not
+  solve a privacy problem with `.gitignore` and thereby create a durability one.
+- One branch, one purpose, merged to `main` promptly. Do not accumulate
+  unrelated workstreams on a long-lived branch -- 81 commits across eight
+  subjects once made every change harder to review, split, or contribute.
 - Read before editing. Make the smallest coherent change and validate it at the
   nearest deterministic boundary.
 - Never commit credentials, `.env` files, raw agent transcripts, private memory
