@@ -10133,6 +10133,12 @@ async fn links_endpoint(State(state): State<SharedState>) -> Json<serde_json::Va
                 "label": m.id.label(),
                 "frames": m.frames,
                 "rssi_dbm": m.rssi,
+                // Reported per frame by the chip. ESP-IDF exposes no AGC gain
+                // field, so this is the only observable that can betray a gain
+                // step -- without it a drop in amplitude is ambiguous between
+                // attenuation and the receiver down-rating itself.
+                "noise_floor_dbm": m.noise,
+                "snr_db": m.rssi - m.noise,
                 "raw_motion": m.raw_motion,
                 "motion": m.motion,
                 // Both metrics above are statistics over a fixed 64-frame
@@ -10961,7 +10967,14 @@ async fn udp_receiver_task(
                         }
                         let now = std::time::Instant::now();
                         s.link_table
-                            .observe(frame.node_id, tx, &frame.amplitudes, frame.rssi, now);
+                            .observe(
+                                frame.node_id,
+                                tx,
+                                &frame.amplitudes,
+                                frame.rssi,
+                                frame.noise_floor,
+                                now,
+                            );
                         s.link_table.expire(now);
                         // Wire v3 only. A v1/v2 frame has no transmission
                         // identity, and keying it on a placeholder would pair

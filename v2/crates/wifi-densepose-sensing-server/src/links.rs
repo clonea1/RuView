@@ -180,6 +180,18 @@ struct LinkState {
     last_seen: Instant,
     frames: u64,
     rssi_ema: f64,
+    /// Smoothed receiver noise floor, dBm, as the chip reports it per frame.
+    ///
+    /// Carried because AGC is otherwise invisible. ESP-IDF exposes no gain
+    /// field -- `wifi_pkt_rx_ctrl_t` gives `noise_floor` and then a run of
+    /// reserved bits -- so there is no documented way to tell a real 6 dB drop
+    /// (a body, a wall) from the receiver quietly turning itself down. If the
+    /// reported noise floor moves with gain state, it is the only observable
+    /// that betrays an AGC step, and correcting for it costs no firmware
+    /// change. If it turns out to be constant it carries nothing, and a
+    /// register-level gain lock is the only route. This exists to settle
+    /// which.
+    noise_ema: f64,
     baseline: f64,
     baseline_samples: u64,
     /// Subcarrier width this link's history is locked to. 0 until the first
@@ -241,6 +253,8 @@ pub struct LinkInventory {
     pub id: LinkId,
     pub frames: u64,
     pub rssi: f64,
+    /// Smoothed receiver noise floor, dBm. See `LinkState::noise_ema`.
+    pub noise: f64,
     /// Frames currently in the rolling history (cap `LINK_HISTORY`).
     pub history_len: usize,
     /// `(subcarrier_width, frames)` seen in that history, most frequent first.
@@ -281,6 +295,8 @@ pub struct LinkMetric {
     pub frames: u64,
     /// EMA of received signal strength, dBm.
     pub rssi: f64,
+    /// Smoothed receiver noise floor, dBm. See `LinkState::noise_ema`.
+    pub noise: f64,
     /// Raw perturbation: p90 over subcarriers of the temporal standard
     /// deviation of AGC-normalised amplitude.
     pub raw_motion: f64,
@@ -425,6 +441,7 @@ impl LinkTable {
         tx_mac: [u8; 6],
         amplitudes: &[f64],
         rssi: i8,
+        noise_floor: i8,
         now: Instant,
     ) {
         if amplitudes.is_empty() {
@@ -441,6 +458,7 @@ impl LinkTable {
             last_seen: now,
             frames: 0,
             rssi_ema: rssi as f64,
+            noise_ema: noise_floor as f64,
             baseline: 0.0,
             baseline_samples: 0,
             grid: 0,
@@ -504,6 +522,8 @@ impl LinkTable {
             st.last_seen = now;
             st.frames += 1;
             st.rssi_ema = st.rssi_ema * 0.9 + rssi as f64 * 0.1;
+        st.noise_ema = st.noise_ema * 0.9 + noise_floor as f64 * 0.1;
+            st.noise_ema = st.noise_ema * 0.9 + noise_floor as f64 * 0.1;
             st.sparser_skipped += 1;
             return;
         }
@@ -519,6 +539,7 @@ impl LinkTable {
         st.last_seen = now;
         st.frames += 1;
         st.rssi_ema = st.rssi_ema * 0.9 + rssi as f64 * 0.1;
+        st.noise_ema = st.noise_ema * 0.9 + noise_floor as f64 * 0.1;
 
         if let Some(raw) = agc_normalised_motion(&st.history) {
             st.baseline_samples += 1;
@@ -564,6 +585,7 @@ impl LinkTable {
                     id: *id,
                     frames: st.frames,
                     rssi: st.rssi_ema,
+                    noise: st.noise_ema,
                     raw_motion: raw,
                     motion: (raw - st.baseline * BASELINE_SUBTRACTION).max(0.0),
                     baseline: st.baseline,
@@ -637,6 +659,7 @@ impl LinkTable {
                     id: *id,
                     frames: st.frames,
                     rssi: st.rssi_ema,
+                    noise: st.noise_ema,
                     history_len: st.history.len(),
                     widths,
                     modal_width,
@@ -794,10 +817,10 @@ mod tests {
         let mut t = LinkTable::new();
         let now = Instant::now();
         for i in 0..20 {
-            t.observe(2, AP, &steady(56, 10.0), -60, now);
+            t.observe(2, AP, &steady(56, 10.0), -60, -92, now);
             let tilt = (i % 5) as f64;
             let moving: Vec<f64> = (0..56).map(|k| 10.0 + tilt * (k as f64 % 3.0)).collect();
-            t.observe(2, PEER, &moving, -70, now);
+            t.observe(2, PEER, &moving, -70, -92, now);
         }
         assert_eq!(t.len(), 2, "one receiver, two transmitters => two links");
         let m = t.metrics();
@@ -818,8 +841,8 @@ mod tests {
         let mut t = LinkTable::new();
         let now = Instant::now();
         for _ in 0..12 {
-            t.observe(0, AP, &steady(56, 10.0), -60, now);
-            t.observe(1, AP, &steady(56, 20.0), -50, now);
+            t.observe(0, AP, &steady(56, 10.0), -60, -92, now);
+            t.observe(1, AP, &steady(56, 20.0), -50, -92, now);
         }
         assert_eq!(t.len(), 2);
     }
@@ -859,7 +882,7 @@ mod tests {
         let mut t = LinkTable::new();
         let t0 = Instant::now();
         for _ in 0..12 {
-            t.observe(0, AP, &steady(56, 10.0), -60, t0);
+            t.observe(0, AP, &steady(56, 10.0), -60, -92, t0);
         }
         assert_eq!(t.len(), 1);
         // Every frame arrived at the same instant, so there is no cadence to
@@ -880,7 +903,7 @@ mod tests {
         let t0 = Instant::now();
         let mut t = LinkTable::new();
         for i in 0..6 {
-            t.observe(0, PEER, &steady(64, 10.0), -80, t0 + Duration::from_secs(i * 20));
+            t.observe(0, PEER, &steady(64, 10.0), -80, -92, t0 + Duration::from_secs(i * 20));
         }
         let last = t0 + Duration::from_secs(100);
         // 40 s of silence: past the old flat window, well inside 20x a 20 s cadence.
@@ -899,7 +922,7 @@ mod tests {
         let t0 = Instant::now();
         let mut t = LinkTable::new();
         for i in 0..6 {
-            t.observe(0, PEER, &steady(64, 10.0), -80, t0 + Duration::from_secs(i * 20));
+            t.observe(0, PEER, &steady(64, 10.0), -80, -92, t0 + Duration::from_secs(i * 20));
         }
         t.expire(t0 + Duration::from_secs(100) + LINK_STALE_MAX + Duration::from_secs(1));
         assert_eq!(t.len(), 0, "silence beyond the ceiling always evicts");
@@ -912,7 +935,7 @@ mod tests {
         let t0 = Instant::now();
         let mut t = LinkTable::new();
         for i in 0..20 {
-            t.observe(0, AP, &steady(256, 10.0), -60, t0 + Duration::from_millis(i * 50));
+            t.observe(0, AP, &steady(256, 10.0), -60, -92, t0 + Duration::from_millis(i * 50));
         }
         let inv = t.inventory(t0 + Duration::from_secs(1));
         assert!(inv[0].interval_s < 0.2, "fast cadence: {}", inv[0].interval_s);
@@ -929,10 +952,10 @@ mod tests {
         let t0 = Instant::now();
         let mut t = LinkTable::new();
         for i in 0..10 {
-            t.observe(0, AP, &steady(256, 20.0), -60, t0 + Duration::from_millis(i * 10));
+            t.observe(0, AP, &steady(256, 20.0), -60, -92, t0 + Duration::from_millis(i * 10));
         }
         // 110 ms later: 11x the cadence, but far below the absolute floor.
-        t.observe(0, AP, &steady(256, 20.0), -60, t0 + Duration::from_millis(200));
+        t.observe(0, AP, &steady(256, 20.0), -60, -92, t0 + Duration::from_millis(200));
         let inv = t.inventory(t0 + Duration::from_millis(200));
         assert_eq!(inv[0].gap_resets, 0, "a 110 ms gap is jitter, not a discontinuity");
         assert_eq!(inv[0].history_len, 11, "history survives intact");
@@ -947,7 +970,7 @@ mod tests {
         let t0 = Instant::now();
         let mut t = LinkTable::new();
         for i in 0..12 {
-            t.observe(0, PEER, &steady(64, 10.0 + i as f64), -80, t0 + Duration::from_secs(i));
+            t.observe(0, PEER, &steady(64, 10.0 + i as f64), -80, -92, t0 + Duration::from_secs(i));
         }
         let before = t.inventory(t0 + Duration::from_secs(12));
         assert_eq!(before[0].history_len, 12);
@@ -955,7 +978,7 @@ mod tests {
 
         // Wake far later: 8x a ~1 s cadence is comfortably exceeded.
         let woke = t0 + Duration::from_secs(300);
-        t.observe(0, PEER, &steady(64, 99.0), -80, woke);
+        t.observe(0, PEER, &steady(64, 99.0), -80, -92, woke);
 
         let after = t.inventory(woke);
         assert_eq!(after[0].history_len, 1, "window restarted, not blended across the gap");
@@ -970,7 +993,7 @@ mod tests {
         let now = Instant::now();
         for i in 0..(MAX_LINKS as u32 + 40) {
             let mac = [0xAA, 0xBB, 0xCC, (i >> 16) as u8, (i >> 8) as u8, i as u8];
-            t.observe(0, mac, &steady(56, 10.0), -70, now);
+            t.observe(0, mac, &steady(56, 10.0), -70, -92, now);
         }
         assert!(
             t.len() <= MAX_LINKS,
@@ -1065,6 +1088,7 @@ mod tests {
                 id: LinkId { rx_node, tx_mac },
                 frames: 100,
                 rssi: -70.0,
+                noise: -92.0,
                 raw_motion: 1.0,
                 motion: 0.5,
                 baseline: 1.0,
@@ -1209,7 +1233,7 @@ mod tests {
         let mut t = LinkTable::new();
         let quiet = vec![10.0f64; 32];
         for i in 0..300 {
-            t.observe(0, [1, 2, 3, 4, 5, 6], &quiet, -60,
+            t.observe(0, [1, 2, 3, 4, 5, 6], &quiet, -60, -92,
                       now + Duration::from_millis(i * 50));
         }
         let settled = t.metrics()[0].baseline;
@@ -1220,7 +1244,7 @@ mod tests {
             let hot: Vec<f64> = (0..32)
                 .map(|sc| if sc < 8 { 10.0 + if i % 2 == 0 { 6.0 } else { -6.0 } } else { 10.0 })
                 .collect();
-            t.observe(0, [1, 2, 3, 4, 5, 6], &hot, -60,
+            t.observe(0, [1, 2, 3, 4, 5, 6], &hot, -60, -92,
                       now + Duration::from_millis(i * 50));
         }
         let m = &t.metrics()[0];
@@ -1244,13 +1268,13 @@ mod tests {
                 if rx == tx { continue; }
                 let mac = [0xE8, 0xF6, 0x0A, 0, 0, tx];
                 for i in 0..MIN_FRAMES_FOR_METRIC + 2 {
-                    t.observe(rx, mac, &amp, -70,
+                    t.observe(rx, mac, &amp, -70, -92,
                               now + Duration::from_millis(i as u64 * 10));
                 }
             }
             let ap = [0x8C, 0x30, 0x66, 0, 0, 1];
             for i in 0..MIN_FRAMES_FOR_METRIC + 2 {
-                t.observe(rx, ap, &amp, -70, now + Duration::from_millis(i as u64 * 10));
+                t.observe(rx, ap, &amp, -70, -92, now + Duration::from_millis(i as u64 * 10));
             }
         }
         assert_eq!(t.len(), 81, "all 81 nine-node links must be admitted");
@@ -1267,8 +1291,8 @@ mod tests {
         let mut t = LinkTable::new();
         for i in 0..12 {
             let at = t0 + Duration::from_millis(i * 10);
-            t.observe(3, AP, &steady(256, 20.0), -70, at);    // dense HE
-            t.observe(3, PEER, &steady(64, 20.0), -85, at);   // sparse HT
+            t.observe(3, AP, &steady(256, 20.0), -70, -92, at);    // dense HE
+            t.observe(3, PEER, &steady(64, 20.0), -85, -92, at);   // sparse HT
         }
         let inv = t.inventory(t0 + Duration::from_millis(200));
         let ap = inv.iter().find(|r| r.id.tx_mac == AP).expect("AP link");
@@ -1287,9 +1311,9 @@ mod tests {
         let t0 = Instant::now();
         let mut t = LinkTable::new();
         for i in 0..10 {
-            t.observe(1, AP, &steady(64, 20.0), -70, t0 + Duration::from_millis(i * 10));
+            t.observe(1, AP, &steady(64, 20.0), -70, -92, t0 + Duration::from_millis(i * 10));
         }
-        t.observe(1, AP, &steady(256, 20.0), -70, t0 + Duration::from_millis(200));
+        t.observe(1, AP, &steady(256, 20.0), -70, -92, t0 + Duration::from_millis(200));
         let inv = t.inventory(t0 + Duration::from_millis(210));
         let r = &inv[0];
         assert_eq!(r.grid, 256, "upgraded to the denser grid");
@@ -1305,9 +1329,9 @@ mod tests {
         let t0 = Instant::now();
         let mut t = LinkTable::new();
         for i in 0..10 {
-            t.observe(1, AP, &steady(256, 20.0), -70, t0 + Duration::from_millis(i * 10));
+            t.observe(1, AP, &steady(256, 20.0), -70, -92, t0 + Duration::from_millis(i * 10));
         }
-        t.observe(1, AP, &steady(64, 20.0), -70, t0 + Duration::from_millis(200));
+        t.observe(1, AP, &steady(64, 20.0), -70, -92, t0 + Duration::from_millis(200));
         let inv = t.inventory(t0 + Duration::from_millis(210));
         let r = &inv[0];
         assert_eq!(r.grid, 256);
@@ -1324,7 +1348,7 @@ mod tests {
         let mut t = LinkTable::new();
         for i in 0..16 {
             let level = 20.0 + (i % 5) as f64;
-            t.observe(2, PEER, &steady(64, level), -84, t0 + Duration::from_millis(i * 10));
+            t.observe(2, PEER, &steady(64, level), -84, -92, t0 + Duration::from_millis(i * 10));
         }
         let inv = t.inventory(t0 + Duration::from_millis(200));
         let r = &inv[0];
