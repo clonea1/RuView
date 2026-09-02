@@ -20,8 +20,8 @@
     },
     {
       "id": 5,
-      "x": 3.029712,
-      "y": 2.999232,
+      "x": 1.709928,
+      "y": 4.300728,
       "z": 0.508,
       "floor": 1,
       "label": "family room"
@@ -44,7 +44,7 @@
     },
     {
       "id": 4,
-      "x": 13.2334,
+      "x": 13.234416,
       "y": 0.762,
       "z": 3.2004,
       "floor": 2,
@@ -52,7 +52,7 @@
     },
     {
       "id": 6,
-      "x": 9.1948,
+      "x": 9.195816,
       "y": 1.350264,
       "z": 0.508,
       "floor": 1,
@@ -60,7 +60,7 @@
     },
     {
       "id": 7,
-      "x": 13.2334,
+      "x": 13.234416,
       "y": 6.7056,
       "z": 0.508,
       "floor": 1,
@@ -69,7 +69,7 @@
     {
       "id": 0,
       "x": 6.7056,
-      "y": 7.7216,
+      "y": 7.720584,
       "z": 0.508,
       "floor": 1,
       "label": "Foyer"
@@ -345,6 +345,14 @@
       "x2": 8.662416,
       "y2": 7.7216,
       "kind": "interior-2x4-stud-sheetrock-both-faces"
+    },
+    {
+      "level": 2,
+      "x1": 13.2334,
+      "y1": 0.0,
+      "x2": 13.2334,
+      "y2": 10.7696,
+      "kind": "exterior"
     }
   ],
   "footprint": [
@@ -405,10 +413,10 @@
       "label": "Nest Basement",
       "position": [
         6.7818,
-        9.017,
+        9.016,
         -0.4064
       ],
-      "uncertainty_m": 0.1524,
+      "uncertainty_m": 0.3048,
       "status": "approved"
     },
     {
@@ -416,10 +424,10 @@
       "label": "TEG-394 Powerwall gateway",
       "position": [
         0.0,
-        9.0932,
+        9.0922,
         -0.8636
       ],
-      "uncertainty_m": 0.1524,
+      "uncertainty_m": 0.3048,
       "status": "approved"
     },
     {
@@ -432,10 +440,10 @@
       "label": "3D printer (basement SE)",
       "position": [
         11.7348,
-        5.8928,
+        5.8918,
         -2.8194
       ],
-      "uncertainty_m": 0.1524,
+      "uncertainty_m": 0.3048,
       "status": "approved"
     },
     {
@@ -452,11 +460,11 @@
       "mac": "e0:d3:62:d0:f9:08",
       "label": "Kasa Amys Office strip",
       "position": [
-        1.8796,
-        7.4168,
+        1.8806,
+        7.4158,
         0.381
       ],
-      "uncertainty_m": 0.1524,
+      "uncertainty_m": 0.3048,
       "status": "approved"
     },
     {
@@ -570,10 +578,10 @@
       "label": "Kasa Living Room (floor)",
       "position": [
         0.0,
-        10.0076,
+        10.0066,
         0.0
       ],
-      "uncertainty_m": 0.1524,
+      "uncertainty_m": 0.3048,
       "status": "approved"
     },
     {
@@ -586,10 +594,10 @@
       "label": "Kasa Server Rack (basement S wall)",
       "position": [
         2.667,
-        10.7696,
+        10.7686,
         -1.3716
       ],
-      "uncertainty_m": 0.1524,
+      "uncertainty_m": 0.3048,
       "status": "approved"
     },
     {
@@ -657,11 +665,11 @@
       "mac": "cc:c0:79:ec:1c:d8",
       "label": "Rachio 3 irrigation timer (basement)",
       "position": [
-        1.6256,
-        10.7696,
+        1.6246,
+        10.7686,
         -1.2192
       ],
-      "uncertainty_m": 0.1524,
+      "uncertainty_m": 0.3048,
       "status": "approved"
     },
     {
@@ -669,10 +677,10 @@
       "label": "Rachio hose-timer hub (on server rack, basement)",
       "position": [
         2.8194,
-        10.7696,
+        10.7686,
         -1.9812
       ],
-      "uncertainty_m": 0.1524,
+      "uncertainty_m": 0.3048,
       "status": "approved"
     },
     {
@@ -683,7 +691,7 @@
         8.3058,
         -1.0668
       ],
-      "uncertainty_m": 0.1524,
+      "uncertainty_m": 0.3048,
       "status": "approved"
     },
     {
@@ -701,7 +709,7 @@
       "mac": "8c:30:66:86:ac:81",
       "label": "AP 1 (1st floor) 8c",
       "position": [
-        -3.683,
+        -3.682,
         0.0,
         2.1336
       ],
@@ -711,7 +719,7 @@
       "mac": "92:30:66:86:ac:81",
       "label": "AP 1 (1st floor) 92",
       "position": [
-        -3.683,
+        -3.682,
         0.0,
         2.1336
       ],
@@ -721,7 +729,7 @@
       "mac": "96:30:66:86:ac:81",
       "label": "AP 1 (1st floor) 96",
       "position": [
-        -3.683,
+        -3.682,
         0.0,
         2.1336
       ],
@@ -754,6 +762,14 @@
     },
     {
       "mac": "04:71:4b:00:24:62",
+      "status": "pending"
+    },
+    {
+      "mac": "d6:e2:cb:9e:8e:5e",
+      "status": "pending"
+    },
+    {
+      "mac": "d6:e2:cb:9e:8e:59",
       "status": "pending"
     }
   ],
