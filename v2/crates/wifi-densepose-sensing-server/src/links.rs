@@ -522,7 +522,6 @@ impl LinkTable {
             st.last_seen = now;
             st.frames += 1;
             st.rssi_ema = st.rssi_ema * 0.9 + rssi as f64 * 0.1;
-        st.noise_ema = st.noise_ema * 0.9 + noise_floor as f64 * 0.1;
             st.noise_ema = st.noise_ema * 0.9 + noise_floor as f64 * 0.1;
             st.sparser_skipped += 1;
             return;
