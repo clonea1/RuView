@@ -153,6 +153,8 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         /* Proof that a pending config trial produced a usable network. */
         config_trial_notify_connected();
+        /* Same evidence starts the soak that confirms firmware on trial. */
+        ota_rollback_notify_connected();
     }
 }
 
@@ -424,6 +426,9 @@ void app_main(void)
     /* Before loading config: if the last change is still on trial this arms
      * the revert timer, so settings that cannot associate undo themselves. */
     config_trial_boot_check();
+
+    /* And report whether the bootloader just reverted a failed firmware image. */
+    ota_rollback_boot_check();
 
     nvs_config_load(&g_nvs_config);
 

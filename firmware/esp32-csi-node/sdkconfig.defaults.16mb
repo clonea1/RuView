@@ -14,3 +14,10 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_16mb.csv"
+
+# Firmware rollback. A freshly-OTA'd image boots PENDING_VERIFY and must
+# confirm itself (see ota_rollback_* in ota_update.c) or the bootloader
+# reverts to the previous slot on the next boot. Without this a bad image
+# means a boot loop and a USB cable; config already self-heals, this closes
+# the same hole for firmware.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
