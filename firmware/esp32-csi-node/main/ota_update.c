@@ -51,11 +51,6 @@ static char s_ota_psk[OTA_PSK_MAX_LEN] = {0};
 /** Bytes available in the slot the next update would be written to.
  *  Returns 0 if no OTA partition is available, which fails every size check
  *  closed rather than open. */
-static size_t ota_max_size(void)
-{
-    const esp_partition_t *p = esp_ota_get_next_update_partition(NULL);
-    return (p != NULL) ? (size_t)p->size : 0;
-}
 
 /**
  * ADR-050: Verify the Authorization header contains the correct PSK.
@@ -116,11 +111,11 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
     int len = snprintf(response, sizeof(response),
         "{\"version\":\"%s\",\"date\":\"%s\",\"time\":\"%s\","
         "\"running_partition\":\"%s\",\"next_partition\":\"%s\","
-        "\"max_size\":%d}",
+        "\"max_size\":%lu}",
         app->version, app->date, app->time,
         running ? running->label : "unknown",
         update ? update->label : "none",
-        (int)ota_max_size());
+        (unsigned long)(update ? update->size : 0));
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, response, len);
@@ -142,24 +137,19 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
 
     ESP_LOGI(TAG, "OTA update started, content_length=%d", req->content_len);
 
-    size_t max_size = ota_max_size();
-    if (max_size == 0) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                            "No OTA partition available");
-        return ESP_FAIL;
-    }
-    if (req->content_len <= 0 || (size_t)req->content_len > max_size) {
-        ESP_LOGW(TAG, "OTA rejected: %d bytes offered, slot holds %u",
-                 req->content_len, (unsigned)max_size);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                            "Firmware size outside the OTA partition");
-        return ESP_FAIL;
-    }
-
     const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
     if (update_partition == NULL) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                             "No OTA partition available");
+        return ESP_FAIL;
+    }
+
+    if (req->content_len <= 0 || (size_t)req->content_len > update_partition->size) {
+        ESP_LOGW(TAG, "OTA rejected: content_length=%d exceeds partition '%s' size=%lu",
+                 req->content_len, update_partition->label,
+                 (unsigned long)update_partition->size);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "Invalid firmware size for OTA partition");
         return ESP_FAIL;
     }
 
