@@ -1,38 +1,9 @@
-# ESP32-C6 CSI Node — 16MB flash partition table.
-#
-# Every board in this fleet is a 16MB C6, but the build shipped the 4MB layout,
-# which used 3.75MB and left 12MB unreachable. That is not just waste: the
-# partition table lives at 0x8000 and is NOT an OTA target, so esp_ota can only
-# ever rewrite an app partition. Growing the layout later means a USB flash on
-# every board -- exactly what OTA exists to avoid. Doing it once, before the
-# fleet goes on walls, is the only cheap moment.
-#
-# nvs deliberately keeps its 4MB offset and size (0x9000, 0x6000) so existing
-# provisioning survives a repartition -- a full write_flash touches 0x0, 0x8000,
-# 0xF000 and the app slot, never 0x9000.
-#
-# App slots are 4MB against a ~1MB image. The old 1.86MB slot was already 55%
-# full. Oversizing costs nothing at run time because ota_update.c calls
-# esp_ota_begin() with OTA_WITH_SEQUENTIAL_WRITES, which erases incrementally
-# as it writes rather than erasing the whole slot up front.
-#
-# coredump exists so a panic or a wedged task leaves evidence behind. The
-# ~225 s uplink stall is still unexplained as of 2026-08-30, and a node on a
-# wall cannot be watched over serial; a coredump partition is the only way that
-# state gets captured after the fact.
-#
-# storage is unallocated-but-reserved on purpose. There is no code using it
-# today. It is here because claiming it later is not possible without another
-# nine-board USB trip, and the obvious future uses -- buffering CSI through an
-# uplink stall, staging an OTA image, local logging -- all need somewhere to go.
-# Subtype is `fat` rather than `spiffs` so it can carry a real wear-levelled
-# filesystem and be read off the chip if a board is ever pulled for diagnosis.
-#
-# Name,      Type, SubType,  Offset,    Size,       Flags
-nvs,         data, nvs,      0x9000,    0x6000,
-otadata,     data, ota,      0xF000,    0x2000,
-phy_init,    data, phy,      0x11000,   0x1000,
-ota_0,       app,  ota_0,    0x20000,   0x400000,
-ota_1,       app,  ota_1,    0x420000,  0x400000,
-coredump,    data, coredump, 0x820000,  0x10000,
-storage,     data, fat,      0x830000,  0x7D0000,
+# ESP-IDF Partition Table
+# Name, Type, SubType, Offset, Size, Flags
+nvs,data,nvs,0x9000,24K,
+otadata,data,ota,0xf000,8K,
+phy_init,data,phy,0x11000,4K,
+ota_0,app,ota_0,0x20000,4M,
+ota_1,app,ota_1,0x420000,4M,
+coredump,data,coredump,0x820000,64K,
+storage,data,fat,0x830000,8000K,

@@ -1,0 +1,16 @@
+# Fleet layout: 16 MB flash, two 4 MB OTA slots.
+#
+# The nine-node fleet runs this, NOT the 4 MB default in
+# sdkconfig.defaults.esp32c6 (kept as-is because upstream C6 devkits are
+# commonly 4 MB and must not be silently repartitioned).
+#
+# Apply with:
+#   idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32c6;sdkconfig.defaults.16mb" build
+#
+# Confirm before flashing: every node's /ota/status must report
+# max_size 4194304. A 4 MB table written over a 16 MB node relocates NVS and
+# destroys its provisioning.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_16mb.csv"
