@@ -538,10 +538,17 @@ static esp_err_t config_post_handler(httpd_req_t *req)
         }
         /* Deferred so the response actually reaches the caller -- otherwise
          * the tool sees a dropped connection and cannot tell success from a
-         * crash at the worst possible moment. */
+         * crash at the worst possible moment.
+         *
+         * 3 s, not 1 s: at 1 s, two of three trial pushes to a node under
+         * sendto-ENOMEM congestion returned an empty body. The write had
+         * succeeded and the node rebooted correctly, but the caller could not
+         * tell that from a failure -- and the natural response to an apparent
+         * failure is to push again, which is the worst thing to do to a node
+         * that is mid-trial. */
         const esp_timer_create_args_t a = { .callback = reboot_soon, .name = "cfg_boot" };
         esp_timer_handle_t th;
-        if (esp_timer_create(&a, &th) == ESP_OK) esp_timer_start_once(th, 1000000ULL);
+        if (esp_timer_create(&a, &th) == ESP_OK) esp_timer_start_once(th, 3000000ULL);
     }
     return ESP_OK;
 }

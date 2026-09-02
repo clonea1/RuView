@@ -60,6 +60,19 @@ def call(host, psk, method, body=None, timeout=20):
         return None, str(e)
 
 
+def looks_armed(err):
+    """A trial push that reboots can lose its response on a congested node.
+
+    Observed on real hardware: the write succeeded, the node rebooted and
+    reverted correctly, but curl saw nothing. Reporting that as a failure
+    invites a re-push at exactly the wrong moment -- while a trial is pending
+    and the banked values are still unproven.
+    """
+    e = (err or "").lower()
+    return any(k in e for k in ("timed out", "reset", "aborted",
+                                "expecting value", "remote end closed"))
+
+
 def coerce(text):
     """Numbers stay numbers so the node's type check passes; else a string."""
     try:
@@ -154,6 +167,13 @@ def main():
     for h in hosts:
         r, err = call(h, psk, "POST", body)
         if err:
+            if risky and looks_armed(err):
+                print("%-16s UNCONFIRMED  the reply was lost; the trial has very "
+                      "likely armed." % h)
+                print("%-16s              Do NOT re-push. Wait ~%ds: it either "
+                      "re-associates or reverts itself."
+                      % ("", (a.trial_seconds or 120) + 30))
+                continue
             print("%-16s FAILED    %s" % (h, err))
             fail += 1
             continue
