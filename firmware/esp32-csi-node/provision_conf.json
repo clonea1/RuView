@@ -1,0 +1,8 @@
+{
+  "ssid": "SilverESP",
+  "password_file": "D:/Users/joe.hedgehog/onedrive/SilverESP.txt",
+  "target_ip": "192.168.1.66",
+  "chip": "esp32c6",
+  "edge_tier": 2,
+  "_note": "password_file lives outside the repo on purpose. This profile IS tracked (it holds no credential, only a path) so it cannot be lost; .githooks/pre-push keeps it off the public remote."
+}

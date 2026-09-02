@@ -333,18 +333,23 @@ v2/crates/wifi-densepose-sensing-server/data/
 # (see the crate README); never commit generated artifacts.
 v2/crates/ruview-offaxis/pkg/
 
-# Board identity index — MACs of physical hardware, not secret, but not useful
-# to anyone else and it churns per fleet. Keep it local.
-firmware/esp32-csi-node/board_index.json
+# Board identity index — NOW TRACKED. It maps nine physical boards to node
+# IDs and cannot be regenerated without re-identifying every board by hand.
+# It was ignored as "not useful to anyone else", which protected against
+# publishing it and did nothing to stop it being lost. Durability and privacy
+# are separate problems: it is tracked here, and .githooks/pre-push keeps it
+# off the public remote.
 
 # Generated enclosure meshes — regenerate with case/make_case.py
 firmware/esp32-csi-node/case/*.stl
 
-# Provisioning config: points at a credential file outside the repo.
-# Provisioning profiles: hold an SSID and the PATH to a credential file.
-# Globbed because --net <name> reads provision_conf_<name>.json, and a new
-# profile must not become committable just by being created.
+# Provisioning profiles: an SSID and the PATH to a credential file — never a
+# credential itself. The two in use are tracked so a lost profile does not
+# mean re-deriving the fleet's settings; the glob still catches any NEW
+# profile, so creating one does not silently make it committable.
 firmware/esp32-csi-node/provision_conf*.json
+!firmware/esp32-csi-node/provision_conf.json
+!firmware/esp32-csi-node/provision_conf_silver.json
 
 # Alternate IDF build trees and the derived sdkconfigs that drive them.
 # `build/` alone does not match these. They are reproducible from sdkconfig

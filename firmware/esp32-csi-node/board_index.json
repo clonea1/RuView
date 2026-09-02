@@ -1,0 +1,67 @@
+{
+  "boards": {
+    "9c:cc:01:40:16:84": {
+      "first_seen": "2026-08-30 18:13:53",
+      "label": "",
+      "last_port": "COM7",
+      "last_seen": "2026-08-30 18:42:33",
+      "node_id": 4
+    },
+    "9c:cc:01:40:18:b8": {
+      "first_seen": "2026-08-28 (from live link table)",
+      "label": "peer heard as 40:18:b8",
+      "last_port": "COM4",
+      "last_seen": "2026-08-30 19:16:43",
+      "node_id": 0
+    },
+    "9c:cc:01:40:1a:e8": {
+      "first_seen": "2026-08-30 19:16:40",
+      "label": "",
+      "last_port": "COM10",
+      "last_seen": "2026-08-30 19:16:40",
+      "node_id": 5
+    },
+    "9c:cc:01:40:33:ac": {
+      "first_seen": "2026-08-30 19:16:44",
+      "label": "",
+      "last_port": "COM8",
+      "last_seen": "2026-08-30 19:16:44",
+      "node_id": 6
+    },
+    "e8:f6:0a:fb:4b:e8": {
+      "first_seen": "2026-08-30 19:39:43",
+      "label": "",
+      "last_port": "COM11",
+      "last_seen": "2026-08-30 19:39:43",
+      "node_id": 8
+    },
+    "e8:f6:0a:fc:b2:a8": {
+      "first_seen": "2026-08-28 (from live link table)",
+      "label": "peer heard as fc:b2:a8",
+      "last_port": "COM3",
+      "last_seen": "2026-08-30 18:42:28",
+      "node_id": 2
+    },
+    "e8:f6:0a:fc:bf:a0": {
+      "first_seen": "2026-08-30 19:29:49",
+      "label": "",
+      "last_port": "COM9",
+      "last_seen": "2026-08-30 19:29:49",
+      "node_id": 7
+    },
+    "e8:f6:0a:fc:e6:70": {
+      "first_seen": "2026-08-30 17:12:34",
+      "label": "",
+      "last_port": "COM6",
+      "last_seen": "2026-08-30 18:42:31",
+      "node_id": 3
+    },
+    "e8:f6:0a:fc:fb:6c": {
+      "first_seen": "2026-08-28 (from live link table)",
+      "label": "peer heard as fc:fb:6c",
+      "last_port": "COM5",
+      "last_seen": "2026-08-30 18:42:29",
+      "node_id": 1
+    }
+  }
+}

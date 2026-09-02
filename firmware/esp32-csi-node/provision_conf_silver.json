@@ -1,0 +1,9 @@
+{
+  "_note": "password_file lives outside the repo on purpose. This profile IS tracked (it holds no credential, only a path) so it cannot be lost; .githooks/pre-push keeps it off the public remote.",
+  "ssid": "Silver",
+  "password_file": "D:/Users/joe.hedgehog/onedrive/Silver.txt",
+  "ota_psk_file": "D:/Users/joe.hedgehog/onedrive/ota_psk.txt",
+  "target_ip": "192.168.1.66",
+  "chip": "esp32c6",
+  "edge_tier": 2
+}

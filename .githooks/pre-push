@@ -1,0 +1,45 @@
+#!/bin/sh
+# Refuse to publish house data to a public remote.
+#
+# v2/data/room_config.json holds nine surveyed node positions, the interior
+# dimensions of a private residence, and the MAC address of every WiFi device
+# in it. The contrib/* branches are firmware-only and safe to push; the
+# research branches are not. This makes that distinction enforced rather than
+# remembered, because the failure is irreversible -- once a floor plan is on a
+# public remote it has been fetched, forked and indexed.
+#
+# Override for a deliberate push:  RUVIEW_ALLOW_HOUSE_DATA=1 git push ...
+
+PROTECTED='v2/data/room_config.json
+firmware/esp32-csi-node/board_index.json
+firmware/esp32-csi-node/provision_conf.json
+firmware/esp32-csi-node/provision_conf_silver.json'
+remote_url="$2"
+
+case "$remote_url" in
+    *github.com*) ;;                  # public forge: check
+    *) exit 0 ;;                      # anything else (NAS, private): allow
+esac
+
+[ "$RUVIEW_ALLOW_HOUSE_DATA" = "1" ] && exit 0
+
+status=0
+while read -r localref localsha remoteref remotesha; do
+    [ "$localsha" = "0000000000000000000000000000000000000000" ] && continue
+    for path in $PROTECTED; do
+        if git ls-tree -r --name-only "$localsha" -- "$path" 2>/dev/null | grep -q .; then
+            echo "pre-push: BLOCKED $localref -> $remoteref" >&2
+            echo "  $localref contains $path" >&2
+            echo "  That file carries surveyed node positions, house dimensions" >&2
+            echo "  device MACs or fleet identity. $remote_url is public." >&2
+            status=1
+        fi
+    done
+done
+
+if [ $status -ne 0 ]; then
+    echo "" >&2
+    echo "  Push a contrib/* branch instead (firmware only), or if this is" >&2
+    echo "  deliberate: RUVIEW_ALLOW_HOUSE_DATA=1 git push ..." >&2
+fi
+exit $status
