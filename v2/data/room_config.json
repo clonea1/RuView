@@ -3,52 +3,12 @@
   "depth_m": 10.7696,
   "nodes": [
     {
-      "id": 4,
-      "x": 13.2334,
-      "y": 0.762,
-      "z": 3.2004,
-      "floor": 2,
-      "label": "master"
-    },
-    {
-      "id": 6,
-      "x": 10.250424,
-      "y": 1.350264,
-      "z": 0.508,
-      "floor": 1,
-      "label": "dinning room"
-    },
-    {
-      "id": 8,
-      "x": 0.0,
-      "y": 9.525,
-      "z": 1.0922,
-      "floor": 1,
-      "label": "amys office"
-    },
-    {
       "id": 2,
       "x": 8.8392,
       "y": 8.29056,
       "z": 3.2004,
       "floor": 2,
       "label": "kids room"
-    },
-    {
-      "id": 7,
-      "x": 13.2334,
-      "y": 6.7056,
-      "z": 0.508,
-      "floor": 1,
-      "label": "living room"
-    },
-    {
-      "id": 1,
-      "x": 0.0,
-      "y": 6.858,
-      "z": 3.2004,
-      "floor": 2,
-      "label": "Guest room"
     },
     {
       "id": 3,
@@ -65,6 +25,46 @@
       "z": 0.508,
       "floor": 1,
       "label": "family room"
+    },
+    {
+      "id": 1,
+      "x": 0.0,
+      "y": 6.858,
+      "z": 3.2004,
+      "floor": 2,
+      "label": "Guest room"
+    },
+    {
+      "id": 8,
+      "x": 0.0,
+      "y": 9.525,
+      "z": 1.0922,
+      "floor": 1,
+      "label": "amys office"
+    },
+    {
+      "id": 4,
+      "x": 13.2334,
+      "y": 0.762,
+      "z": 3.2004,
+      "floor": 2,
+      "label": "master"
+    },
+    {
+      "id": 6,
+      "x": 9.1948,
+      "y": 1.350264,
+      "z": 0.508,
+      "floor": 1,
+      "label": "dinning room"
+    },
+    {
+      "id": 7,
+      "x": 13.2334,
+      "y": 6.7056,
+      "z": 0.508,
+      "floor": 1,
+      "label": "living room"
     },
     {
       "id": 0,
@@ -108,179 +108,235 @@
     },
     {
       "level": 1,
+      "x1": -3.683,
+      "y1": 2.999232,
+      "x2": -3.683,
+      "y2": 0.0,
+      "kind": "exterior"
+    },
+    {
+      "level": 1,
+      "x1": 2.54,
+      "y1": 0.0,
+      "x2": 9.1948,
+      "y2": 0.0,
+      "kind": "exterior"
+    },
+    {
+      "level": 1,
+      "x1": 0.0,
+      "y1": 6.9342,
+      "x2": 0.0,
+      "y2": 10.7696,
+      "kind": "exterior"
+    },
+    {
+      "level": 1,
+      "x1": -3.683,
+      "y1": 6.9342,
+      "x2": 0.0,
+      "y2": 6.9342,
+      "kind": "exterior"
+    },
+    {
+      "level": 1,
+      "x1": -3.683,
+      "y1": 2.999232,
+      "x2": -3.683,
+      "y2": 6.9342,
+      "kind": "exterior"
+    },
+    {
+      "level": 2,
+      "x1": 0.0,
+      "y1": 0.0,
+      "x2": 13.2334,
+      "y2": 0.0,
+      "kind": "exterior"
+    },
+    {
+      "level": 2,
+      "x1": 0.0,
+      "y1": 10.7696,
+      "x2": 13.2334,
+      "y2": 10.7696,
+      "kind": "exterior"
+    },
+    {
+      "level": 2,
+      "x1": 0.0,
+      "y1": 0.0,
+      "x2": 0.0,
+      "y2": 10.7696,
+      "kind": "exterior"
+    },
+    {
+      "level": 1,
+      "x1": 9.1948,
+      "y1": 0.0,
+      "x2": 13.2334,
+      "y2": 0.0,
+      "kind": "exterior"
+    },
+    {
+      "level": 1,
+      "x1": 13.2334,
+      "y1": 0.0,
+      "x2": 13.2334,
+      "y2": 4.5974,
+      "kind": "exterior"
+    },
+    {
+      "level": 1,
+      "x1": 9.1948,
+      "y1": 4.5974,
+      "x2": 9.1948,
+      "y2": 0.0,
+      "kind": "interior-2x4-stud-sheetrock-both-faces"
+    },
+    {
+      "level": 1,
+      "x1": 8.661401,
+      "y1": 4.7498,
+      "x2": 13.2334,
+      "y2": 4.7498,
+      "kind": "interior-2x4-stud-sheetrock-both-faces"
+    },
+    {
+      "level": 1,
+      "x1": 13.2334,
+      "y1": 4.7498,
+      "x2": 13.2334,
+      "y2": 10.7696,
+      "kind": "exterior"
+    },
+    {
+      "level": 1,
+      "x1": 13.2334,
+      "y1": 10.7696,
+      "x2": 8.661401,
+      "y2": 10.7696,
+      "kind": "exterior"
+    },
+    {
+      "level": 1,
+      "x1": 8.661401,
+      "y1": 10.7696,
+      "x2": 8.661401,
+      "y2": 4.7498,
+      "kind": "interior-2x4-stud-sheetrock-both-faces"
+    },
+    {
+      "level": 1,
+      "x1": -3.681984,
+      "y1": 4.5974,
+      "x2": 13.2334,
+      "y2": 4.5974,
+      "kind": "interior-2x4-stud-sheetrock-both-faces"
+    },
+    {
+      "level": 1,
       "x1": 2.54,
       "y1": 0.0,
       "x2": 2.54,
-      "y2": 2.999232,
+      "y2": 4.5974,
       "kind": "interior-appliance-wall-double-oven-cooktop-granite-tile-DISPUTED-x-from-244in-but-n5-confirmed-west-of-it"
     },
     {
       "level": 1,
-      "x1": 2.54,
-      "y1": 2.999232,
-      "x2": -3.683,
-      "y2": 2.999232,
-      "kind": "interior-2x4-stud-sheetrock-both-faces"
-    },
-    {
-      "level": 1,
-      "x1": -3.683,
-      "y1": 2.999232,
-      "x2": -3.683,
-      "y2": 0.0,
-      "kind": "exterior"
-    },
-    {
-      "level": 1,
-      "x1": 10.250424,
-      "y1": 0.0,
-      "x2": 13.2334,
-      "y2": 0.0,
-      "kind": "exterior"
-    },
-    {
-      "level": 1,
       "x1": 13.2334,
-      "y1": 0.0,
+      "y1": 4.5974,
       "x2": 13.2334,
-      "y2": 2.999232,
-      "kind": "exterior"
-    },
-    {
-      "level": 1,
-      "x1": 13.2334,
-      "y1": 2.999232,
-      "x2": 10.250424,
-      "y2": 2.999232,
-      "kind": "interior-2x4-stud-sheetrock-both-faces"
-    },
-    {
-      "level": 1,
-      "x1": 10.250424,
-      "y1": 2.999232,
-      "x2": 10.250424,
-      "y2": 0.0,
-      "kind": "interior-2x4-stud-sheetrock-both-faces"
-    },
-    {
-      "level": 1,
-      "x1": 2.54,
-      "y1": 0.0,
-      "x2": 10.250424,
-      "y2": 0.0,
-      "kind": "exterior"
-    },
-    {
-      "level": 1,
-      "x1": 10.250424,
-      "y1": 2.999232,
-      "x2": 2.54,
-      "y2": 2.999232,
-      "kind": "interior-2x4-stud-sheetrock-both-faces"
-    },
-    {
-      "level": 1,
-      "x1": 13.2334,
-      "y1": 2.999232,
-      "x2": 13.2334,
-      "y2": 10.7696,
-      "kind": "exterior"
-    },
-    {
-      "level": 1,
-      "x1": 13.2334,
-      "y1": 10.7696,
-      "x2": 10.250424,
-      "y2": 10.7696,
-      "kind": "exterior"
-    },
-    {
-      "level": 1,
-      "x1": 10.250424,
-      "y1": 10.7696,
-      "x2": 10.250424,
-      "y2": 2.999232,
-      "kind": "interior-2x4-stud-sheetrock-both-faces"
-    },
-    {
-      "level": 1,
-      "x1": -3.683,
-      "y1": 0.0,
-      "x2": 13.2334,
-      "y2": 0.0,
-      "kind": "exterior"
-    },
-    {
-      "level": 1,
-      "x1": 13.2334,
-      "y1": 0.0,
-      "x2": 13.2334,
-      "y2": 10.7696,
+      "y2": 4.7498,
       "kind": "exterior"
     },
     {
       "level": 1,
       "x1": 0.0,
       "y1": 10.7696,
-      "x2": 10.250424,
+      "x2": 8.662416,
       "y2": 10.7696,
       "kind": "exterior"
     },
     {
       "level": 1,
       "x1": 0.0,
-      "y1": 6.7056,
-      "x2": 0.0,
-      "y2": 10.7696,
-      "kind": "exterior"
+      "y1": 6.7818,
+      "x2": 3.683,
+      "y2": 6.7818,
+      "kind": "interior-2x4-stud-sheetrock-both-faces"
     },
     {
       "level": 1,
-      "x1": -3.683,
-      "y1": 6.7056,
-      "x2": 0.0,
-      "y2": 6.7056,
-      "kind": "exterior"
+      "x1": 3.683,
+      "y1": 6.7818,
+      "x2": 3.683,
+      "y2": 7.2644,
+      "kind": "interior-2x4-stud-sheetrock-both-faces"
     },
     {
       "level": 1,
-      "x1": -3.683,
-      "y1": 2.999232,
-      "x2": -3.683,
-      "y2": 6.7056,
-      "kind": "exterior"
+      "x1": 3.683,
+      "y1": 7.2644,
+      "x2": 4.6228,
+      "y2": 7.2644,
+      "kind": "interior-2x4-stud-sheetrock-both-faces"
     },
     {
-      "level": 2,
-      "x1": 0.0,
-      "y1": 0.0,
-      "x2": 13.2334,
-      "y2": 0.0,
-      "kind": "exterior"
-    },
-    {
-      "level": 2,
-      "x1": 13.2334,
-      "y1": 0.0,
-      "x2": 13.2334,
+      "level": 1,
+      "x1": 4.6228,
+      "y1": 7.2644,
+      "x2": 4.6228,
       "y2": 10.7696,
-      "kind": "exterior"
+      "kind": "interior-2x4-stud-sheetrock-both-faces"
     },
     {
-      "level": 2,
+      "level": 1,
       "x1": 0.0,
-      "y1": 10.7696,
-      "x2": 13.2334,
-      "y2": 10.7696,
-      "kind": "exterior"
+      "y1": 6.9342,
+      "x2": 3.683,
+      "y2": 6.9342,
+      "kind": "interior-2x4-stud-sheetrock-both-faces"
     },
     {
-      "level": 2,
-      "x1": 0.0,
-      "y1": 0.0,
-      "x2": 0.0,
-      "y2": 10.7696,
-      "kind": "exterior"
+      "level": 1,
+      "x1": 3.683,
+      "y1": 4.5974,
+      "x2": 3.683,
+      "y2": 5.7658,
+      "kind": "interior-2x4-stud-sheetrock-both-faces"
+    },
+    {
+      "level": 1,
+      "x1": 3.681984,
+      "y1": 5.7658,
+      "x2": 8.662416,
+      "y2": 5.7658,
+      "kind": "interior-closet-volume-stored-contents"
+    },
+    {
+      "level": 1,
+      "x1": 6.1722,
+      "y1": 4.5974,
+      "x2": 6.1722,
+      "y2": 5.7658,
+      "kind": "interior-2x4-stud-sheetrock-both-faces"
+    },
+    {
+      "level": 1,
+      "x1": 8.662416,
+      "y1": 4.596384,
+      "x2": 8.662416,
+      "y2": 4.748784,
+      "kind": "interior-2x4-stud-sheetrock-both-faces"
+    },
+    {
+      "level": 1,
+      "x1": 4.623816,
+      "y1": 6.9342,
+      "x2": 8.662416,
+      "y2": 6.9342,
+      "kind": "interior-2x4-stud-sheetrock-both-faces"
     }
   ],
   "footprint": [
@@ -305,11 +361,11 @@
         ],
         [
           0.0,
-          6.7056
+          6.9342
         ],
         [
           -3.683,
-          6.7056
+          6.9342
         ]
       ]
     },
