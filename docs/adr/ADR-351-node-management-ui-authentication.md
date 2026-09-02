@@ -1,6 +1,7 @@
 # ADR-351: Authenticating the node management UI
 
-- **Status**: Proposed — deferred, revisit before the management UI is exposed
+- **Status**: Accepted risk — mutating UI shipped unauthenticated by explicit
+  decision (Joe, 2026-09-02); PIN to follow
 - **Date**: 2026-09-02
 - **Deciders**: Joe
 - **Owners**: RuView sensing-server and firmware maintainers
@@ -46,12 +47,21 @@ onto the PSK handling that already works (secret by file path, never printed,
 never sent to a browser), and it protects exactly the actions worth protecting
 while leaving diagnostics visible.
 
-## Consequences if deferred
+## Decision
 
-The window of risk opens the moment a mutating control ships in the UI, not
-when this ADR is decided. **Keeping the management UI read-only until then is
-the mitigation**, and is cheap: viewing versions, RSSI, fps and current
-settings carries no such exposure.
+Joe elected to ship the management UI **fully enabled**, including mutating
+controls, and to secure it afterwards (2026-09-02). The read-only mitigation
+below was offered and declined; this is recorded so the exposure is a known
+accepted risk rather than an oversight.
+
+**The window of risk is therefore open now.** Anyone who can reach the
+sensing server's web port can reconfigure, reflash or reboot any node in the
+fleet. On a home LAN with no port forwarding that is a narrow exposure, and it
+is the operator's call to make.
+
+The mitigation that was available, for the record: keeping the UI read-only
+costs little, since versions, RSSI, fps and current settings are the useful
+part and carry no such exposure.
 
 ## Notes for whoever implements it
 

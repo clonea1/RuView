@@ -19,13 +19,19 @@ Keep entries short and dated. Delete them when done — git remembers.
 
 ## Node management UI
 
-- **Stages 2 and 3.** Stage 1 (server learns node IPs from UDP source
-  addresses) is done. Stage 2 is proxy endpoints for config and firmware,
-  which needs `reqwest` added to the sensing server. Stage 3 is the UI tab.
-  (2026-09-02)
-- **ADR-351 must be settled before any mutating control ships in that UI.**
-  Read-only is safe; the moment a button can reconfigure a node, the server's
-  unauthenticated web port becomes the real security boundary. (2026-09-02)
+- **DONE 2026-09-02.** All three stages shipped: the server learns node IPs
+  from UDP source addresses, proxies config and firmware to nodes with the PSK
+  held server-side, and a Nodes tab exposes it. Verified end to end against
+  node 3.
+- **ADR-351 is now an accepted risk, not a pending question.** Joe elected to
+  ship mutating controls unauthenticated and secure them later, so *anyone who
+  can reach the web UI can reconfigure or reflash the fleet today*. The PIN is
+  outstanding work, and its absence is a live exposure rather than a
+  hypothetical one. (2026-09-02)
+- **OTA image upload is not proxied.** The UI reads firmware version, partition
+  and rollback state, but pushing a new image still goes directly to a node
+  with `curl` or `ota_push`. Streaming a 1 MB multipart body through the proxy
+  is a separate piece of work. (2026-09-02)
 
 ## Server updates without the downtime
 
