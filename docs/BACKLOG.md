@@ -80,8 +80,7 @@ Installed **Node v24.20.0 LTS, user scope, no elevation**:
 
   - official portable zip from `nodejs.org/dist`, SHA256 verified against that
     release's `SHASUMS256.txt` before extraction
-  - extracted to `%LOCALAPPDATA%\Programs
-odejs`
+  - extracted to `%LOCALAPPDATA%\Programs\nodejs`
   - added to the **user** PATH only; machine PATH untouched
   - reversible by deleting that one directory and the PATH entry
 
