@@ -9,6 +9,40 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## server-links is the highest-value server PR, and I undersold it
+
+`00fb117e` was filed as a bullet ("subcarrier-grid gate per link, distinct bug
+bundled into links"). It is the single largest measured improvement in the
+whole body of work:
+
+    links        31 -> 137        transmitters   10 -> 32
+    renderable   29 ->  88        illuminators with 2+ receivers: 1 -> 24
+    grids in use: 256 only  ->  64:97, 256:33, 128:7
+
+"No firmware, hardware or network change -- the frames were always arriving."
+
+**The mechanism.** The grid gate locks each NODE to the densest grid it has
+seen. A node associates with one AP and receives HE-SU data from it at 256
+bins, while everything else it merely overhears sends beacons and management at
+64. So the lock always settles on the associated AP's format, and every
+non-associated transmitter is sparser BY CONSTRUCTION -- dropped by a bare
+`continue` before it can become a link. 97 of the 137 links recovered are
+64-bin: precisely the population being discarded.
+
+**Upstream has the identical gate** (main.rs ~1038-1056, ~6754). For them it is
+defensible: it protects the per-node feature path, which genuinely needs one
+grid for smoothing and vitals buffers. The bug only bites once you want
+per-link data from several transmitters, which requires `links.rs`.
+
+**Therefore it does not separate.** It ships as part of `server-links`, and
+that PR should lead with these numbers rather than with "per-link CSI state".
+Grid consistency is a property of the TRANSMITTER, so it belongs on the link,
+not the node -- that one sentence is the whole argument.
+
+**Consequence for sequencing:** the highest-value server contribution sits
+behind the hardest branch to cut (the `links_endpoint` interdependency). Worth
+spending the effort there rather than on easier, lesser branches.
+
 ## Two more from Joe's memory (2026-09-03)
 
 **39. `ui-navigation` -- a topic on no list.** Our nav has grown to 18 flat
