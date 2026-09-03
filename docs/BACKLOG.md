@@ -9,6 +9,79 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## Round 3: two cut, one struck, and the UI onion
+
+### Topic 26 `baseline-tuning` is OBSOLETE -- struck
+
+`BASELINE_SUBTRACTION_FRACTION` was introduced by `7b63ee1e` (0.7 -> 0.95) and
+**removed again** by `e5636cd9`. It exists neither upstream nor in our current
+tree. The surviving baseline constants are byte-identical to upstream:
+
+    BASELINE_EMA_ALPHA = 0.003        BASELINE_WARMUP = 50
+
+There is nothing to contribute. This resolves the "three baseline formulations,
+none reconciled" note: the server's third formulation no longer exists, leaving
+the firmware's `mean + 3*sigma` and the server's EMA, which are the two the
+earlier entry should have named.
+
+### `server-node-management` cut, as two ordered commits
+
+`85ba2092` needed a prerequisite nobody had listed: `bb776437`, which learns
+each node's address from the source address on packets it already sends.
+Nothing else in the server records where a node is on the network -- reaching
+one meant a port scan. That is independently useful and goes first.
+
+`bb776437` itself bundled a `node_macs` registry that needs
+`hardware-sync-packet`; only the address half was taken.
+
+**Correction to an earlier judgement.** This was nearly held back over ADR-351,
+on the grounds that it ships an unauthenticated fleet-reflash. Reading the code
+rather than the ADR: the mutating path **already fails closed**. `node_psk` is
+`None` unless the operator passes `--ota-psk-file`, and without it only
+read-only fleet views are served. The residual risk is narrower and is real --
+once enabled, the server's UI becomes the trust boundary because it holds the
+credential -- and it is stated in the commit message for reviewers. No gate
+needed to be added; one already existed.
+
+Internal docs (`BACKLOG.md`, ADR-351) were excluded: they name the operator,
+and the rationale belongs in the PR description written neutrally.
+
+### `ui-no-fabricated-data` cut -- the highest-value UI fix
+
+`e0237ec0` is a **five-topic bucket**: the fabrication fix, a reconnect race,
+`LinkMeshPanel` (belongs with server-links), a column layout fix, and three
+ground-truth pages (topic 22). Only the first two were taken.
+
+On a dropped socket the client fell back to built-in simulation and rendered
+synthetic values indistinguishable from live ones. Everything downstream --
+which nodes to move, whether a change helped -- was then judged against
+fiction. Simulation is now opt-in, an unreachable server retries rather than
+inventing, and the labels say what they mean: "INVENTED DATA - NOT MEASURED"
+rather than "OFFLINE - CLIENT SIMULATION", which read as a status, not a
+warning.
+
+### Topic 21 `room-builder` is 13 commits and needs its own onion pass
+
+Titles alone announce further splits: "footprint editor, 3D house view,
+illuminator triage" is three; "attribute transmitters by MAC; add illuminator
+roster UI" is two. Two of the 13 (`195f49ea`, `bef4f2ae`) depend on the
+**pended** centroid tier, so they cannot ship before that decision.
+
+None of the 13 touches a `.json` -- the house data lives in separate
+`data(room):` commits which must never travel. Verified, not assumed.
+
+### Verification gap, stated plainly
+
+**`node` is not installed on this machine**, so the UI JavaScript could not be
+syntax-checked. (It is also why the SessionEnd hook errors with
+`node: command not found`.) What was done instead: confirmed no dangling
+imports, confirmed brace/paren/bracket balance, and kept each file either
+verbatim from a commit already running in the browser or `origin/main` plus two
+reviewed lines. That is weaker than a parse and is recorded as such.
+
+**Now 27 branches cut. Remaining: 21 (needs its own pass), 22, 24, 27, 31, and
+25 pended.**
+
 ## `cargo check` is not enough, and onion #3 was a phantom
 
 ### `contrib/hardware-sync-packet` was broken in isolation
