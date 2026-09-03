@@ -9,6 +9,74 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## Both pending decisions resolved (Joe, 2026-09-03)
+
+### Deadband: shipped, but not in the shape the option described
+
+Decision was "ship the deadband fix". Option 2 as I wrote it -- the deadband
+fix *alone* -- turned out not to exist as a diff, and the difference matters:
+
+  - upstream's signal crate DOES have `BvpConfig` with `max_velocity: 2.0` and
+    `n_velocity_bins: 64`, so the 0.0625 m/s bin spacing that makes the bug
+    real is **upstream's own default**
+  - but upstream's `bvp.rs` has no zero-velocity deadband, because that belongs
+    to whatever CONSUMES a BVP and decides how much of it counts as motion
+  - and upstream's server never calls `extract_bvp` at all
+
+So the fix only exists inside the consumer it corrects. Shipped as
+`contrib/server-doppler-deadband`, stacked on `contrib/signal-signed-bvp`:
+sanitized per-node phase retention, the signed Doppler sample with a
+**bin-based** deadband, and the two figures surfaced on `/api/v1/nodes` as
+DIAGNOSTICS. **No position tier is included** -- our own evidence says the
+centroid does not spatially differentiate, so none of that claim ships.
+
+### The test took four attempts, and three of them were worthless
+
+First version asserted a static node reported less moving energy than a moving
+one. It passed with the bug deliberately reintroduced -- because a perfectly
+constant signal leaves nothing after DC removal, so it cannot detect a broken
+deadband either way. Two further fixture designs also passed under the bug.
+
+Rather than guess a fourth time, the values were **measured**:
+
+    modulation        deadband = 0 (bug)   deadband = 2 (fixed)
+    0.05 Hz (static)        19.13                 0.56
+    2.00 Hz (moving)       310.89               122.59
+    static as % of moving    6.2%                0.45%
+
+Both sat under the 50% threshold, which is why it kept passing. The fixtures
+were rebuilt to differ ONLY in rate -- identical modulation depth, so the
+deadband is the only thing that can separate them -- and the bound set at 2%,
+which the correct implementation clears by 4x and the broken one misses by 3x.
+The measured table is in the test's doc comment so the bound is not a magic
+number.
+
+**A regression test that passes in both configurations is not a weak test, it
+is not a test.** Three of these would have shipped as verified.
+
+### Tapper: de-housed to Joe's design, now generic
+
+Rebuilt to Joe's specification: one button per node the server actually
+reports, from `/api/v1/nodes`, labelled "Node 1", "Node 2", sorted by id, built
+dynamically so it fits any fleet size with no editing. Stand near a node, tap
+its button.
+
+Removed: the entire hardcoded floor plan (`EXTRA_PLACES`, room names,
+coordinates, "the mud room sits at x=-12 ft in the west wing"), the dependency
+on `/api/v1/config/room`, and a hardcoded LAN IP in a comment. Two generic
+places remain -- "Elsewhere" and "Outside/away" -- because a fleet never covers
+every space and the gaps need ground truth most.
+
+An unreachable server or empty roster is reported as such rather than guessed
+at: invented node ids would attach marks to nodes that do not exist.
+
+Screened the **whole branch diff**, not the file: zero name, IP, room or
+coordinate hits. Person labels remain role-based. Inline JS parses under
+`node --check`.
+
+**30 branches cut.** Remaining: 21 (room-builder, its own onion pass), 24, 27,
+31, and `server-fusion` still incomplete.
+
 ## PRIVACY: the tapper cannot ship, and history is the reason
 
 Topic 22 was cut as `ui-ground-truth-capture` carrying `mark.html`,
