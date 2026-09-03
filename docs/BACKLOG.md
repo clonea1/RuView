@@ -9,6 +9,48 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## PRIVACY: the tapper cannot ship, and history is the reason
+
+Topic 22 was cut as `ui-ground-truth-capture` carrying `mark.html`,
+`survey.html` and `walk.html` only. **`tapper.html` was deliberately excluded**,
+for two independent reasons.
+
+### 1. A PR carries its history, not just its final state
+
+`c3232c95` introduced the tapper with real names: family first names, "the
+girls", a pet's name, and a description reading "the girls in the mud room at
+19:43" -- a timestamped account of household activity. `9c5759cd` genericised
+all of it to `adult1` / `adult2` / `child1` / `children-together` / `everyone`,
+which is correct and is what the file contains today.
+
+But cherry-picking both commits onto a branch would publish the names anyway,
+because the diff that introduced them travels with the branch. **Checking the
+working tree is not sufficient; the commit range must be checked.** Any branch
+carrying this file must be squashed to a single commit built from the final
+state, never assembled from that history.
+
+### 2. The file hardcodes the house
+
+Independently of names, `tapper.html` embeds the floor plan: room names with
+coordinates, `EXTRA_PLACES`, "the mud room sits at x=-12 ft in the west wing".
+That is household-identifying data regardless of what the occupants are called.
+
+**Before the tapper can be offered upstream it needs its room list driven from
+configuration rather than hardcoded**, which is real work, not a screening pass.
+Pended.
+
+The three pages that did ship were screened for the same things and are clean:
+zero name hits, zero coordinate or room-name hits.
+
+### Screening standard going forward
+
+For any branch touching UI or data files, screen **the commit range**, not the
+files:
+
+    git log -p origin/main..<branch> | grep -inE "<names>|<pet names>|x=-?[0-9]+ ?ft|EXTRA_PLACES"
+
+The final state being clean says nothing about what the branch publishes.
+
 ## Full-suite sweep of every server branch: 2 of 13 were broken
 
 Two branches failed integration tests in a row, so every branch touching the
