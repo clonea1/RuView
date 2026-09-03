@@ -9,6 +9,46 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## HAZARD: contribution branches inherit a WEAKER .gitignore
+
+**Near miss, 2026-09-03.** A `git add -A ui v2` on a contribution branch staged
+**136 CSI diagnostic files** from `v2/data/` into a commit. Caught before it
+left the machine, commit rewritten, all 32 branches re-audited and clean.
+
+### Why it happened, and why it will happen again
+
+Our `main` ignores the capture directories:
+
+    v2/data/recordings/     v2/data/diagnostics/     v2/data/walktest/*
+
+`origin/main` ignores **none** of them. Every contribution branch is cut from
+`origin/main`, so it inherits the weaker rules -- while the working tree still
+holds every capture those directories accumulated. On `main` those files are
+invisible to `git add`. On a contrib branch they are fair game.
+
+This is the same hazard that nearly swept build trees earlier in this
+programme, in a worse form: build trees are noise, CSI captures are the
+category `CLAUDE.md` names explicitly as never-commit.
+
+### The rule
+
+**Never use `git add -A`, `git add .` or `git add <directory>` on a
+contribution branch. Stage explicit file paths, always.**
+
+Two cheap guards, both used to catch this one:
+
+    git show <commit> --name-only --format='' | grep -c '^v2/data/'
+    git diff --name-only origin/main..<branch>       | grep -cE '^v2/data/|\.csv$|\.jsonl$|room_config|board_index|provision_conf|\.env'
+
+Run the second on every branch before any push. It is the check that proved all
+32 clean.
+
+### Worth fixing at the source
+
+The pre-push hook is the durable answer, since it does not depend on
+remembering. Whether the hook currently blocks a `v2/data` path on a branch cut
+from `origin/main` has NOT been verified -- assume it does not until tested.
+
 ## Both pending decisions resolved (Joe, 2026-09-03)
 
 ### Deadband: shipped, but not in the shape the option described
