@@ -9,6 +9,57 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## Round 6: fusion completed, world3d, node-MAC registry
+
+**36 branches.** Only topic 27 (`classification-smoothing`) remains uncut.
+
+### `server-fusion` finished -- it was never fed
+
+Marked PARTIAL for good reason. `/api/v1/fusion` READ `fusion_index` while
+nothing ever wrote to it: no `observe` call existed anywhere. The branch also
+sat directly on `origin/main`, so it had no `rx_seq` to pair on in the first
+place.
+
+Rebased onto `server-wire-v3` and the ingestion wired, running BEFORE the
+per-node grid gate for the same reason the link path does -- pairing is keyed on
+transmission identity, not time, so it must see frames the per-node feature
+path discards.
+
+**Fourth instance of declare-check-never-populate.** The pattern is now
+unmistakable enough to be a checklist item rather than a series of lucky
+catches.
+
+### `world3d` (topic 31) found a real robustness bug
+
+It fetched five endpoints through `Promise.all`, so **any single failure blanked
+the entire scene** -- a server built without the fusion endpoint, or one
+transient 500 on any route, rendered nothing at all rather than the four sources
+that answered.
+
+Rewritten to fetch independently, with failures yielding null and the panel
+naming which sources did not respond. That also removed the need to force a
+messy five-way merge of the links and fusion stacks: the page now degrades
+honestly instead of requiring everything at once.
+
+Guarded every `cfg` dereference while doing it, since a null room config would
+otherwise throw where it previously could not.
+
+### Node-MAC registry cut, and a reminder that commit MESSAGES travel
+
+`66330ff9`'s body contains a real MAC from this deployment. **A commit message
+ships with the branch**, so the message was rewritten from scratch rather than
+reused -- the privacy screen has to cover messages, not only diffs.
+
+The commit was entangled with RTI and room-builder code across five conflict
+blocks, so the topic was rebuilt by hand instead: registry field, populate from
+the sync packet, and attribute by address with the hearing-set heuristic kept
+only for a fleet where nothing has reported a MAC yet.
+
+Its evidence is worth keeping: the heuristic attributed **0 of 32 links** with
+nine nodes in a house, and reported every peer link as infrastructure. A
+misattributed link is still a link, so nothing downstream reported that the
+geometry it received was wrong.
+
 ## Round 5: three branches, and real MACs found in test fixtures
 
 **34 branches.** `ui-room-builder-footprint`, `server-emitter-triage`, plus the
