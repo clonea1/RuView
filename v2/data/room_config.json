@@ -3,6 +3,54 @@
   "depth_m": 10.7696,
   "nodes": [
     {
+      "id": 6,
+      "x": 9.195816,
+      "y": 1.350264,
+      "z": 0.508,
+      "floor": 1,
+      "label": "dinning room"
+    },
+    {
+      "id": 0,
+      "x": 6.7056,
+      "y": 7.720584,
+      "z": 0.508,
+      "floor": 1,
+      "label": "Foyer"
+    },
+    {
+      "id": 7,
+      "x": 13.234416,
+      "y": 6.7056,
+      "z": 0.508,
+      "floor": 1,
+      "label": "living room"
+    },
+    {
+      "id": 8,
+      "x": 0.0,
+      "y": 9.525,
+      "z": 1.0922,
+      "floor": 1,
+      "label": "amys office"
+    },
+    {
+      "id": 1,
+      "x": 0.0,
+      "y": 6.858,
+      "z": 3.2004,
+      "floor": 2,
+      "label": "Guest room"
+    },
+    {
+      "id": 5,
+      "x": 1.709928,
+      "y": 4.300728,
+      "z": 0.508,
+      "floor": 1,
+      "label": "family room"
+    },
+    {
       "id": 2,
       "x": 8.8392,
       "y": 8.29056,
@@ -19,60 +67,12 @@
       "label": "fuzzies room"
     },
     {
-      "id": 5,
-      "x": 1.709928,
-      "y": 4.300728,
-      "z": 0.508,
-      "floor": 1,
-      "label": "family room"
-    },
-    {
-      "id": 1,
-      "x": 0.0,
-      "y": 6.858,
-      "z": 3.2004,
-      "floor": 2,
-      "label": "Guest room"
-    },
-    {
-      "id": 8,
-      "x": 0.0,
-      "y": 9.525,
-      "z": 1.0922,
-      "floor": 1,
-      "label": "amys office"
-    },
-    {
       "id": 4,
       "x": 13.234416,
       "y": 0.762,
       "z": 3.2004,
       "floor": 2,
       "label": "master"
-    },
-    {
-      "id": 6,
-      "x": 9.195816,
-      "y": 1.350264,
-      "z": 0.508,
-      "floor": 1,
-      "label": "dinning room"
-    },
-    {
-      "id": 7,
-      "x": 13.234416,
-      "y": 6.7056,
-      "z": 0.508,
-      "floor": 1,
-      "label": "living room"
-    },
-    {
-      "id": 0,
-      "x": 6.7056,
-      "y": 7.720584,
-      "z": 0.508,
-      "floor": 1,
-      "label": "Foyer"
     }
   ],
   "ap_position": [
@@ -753,8 +753,14 @@
     },
     {
       "mac": "00:23:a7:af:af:84",
-      "label": "TEG2 - unconfirmed 2nd radio of TEG-394 (no position)",
-      "status": "pending"
+      "label": "TEG-394 Powerwall gateway (2nd BSSID, ch 11) - position inherited from af:85",
+      "position": [
+        0.0,
+        9.0922,
+        -0.8636
+      ],
+      "uncertainty_m": 0.3048,
+      "status": "approved"
     },
     {
       "mac": "d4:e2:cb:9d:8e:58",
@@ -770,6 +776,71 @@
     },
     {
       "mac": "d6:e2:cb:9e:8e:59",
+      "label": "neighbour AP Sarahs-Router (-77 dBm ch 11) - Sarah's house, west half (nearer); only 1 dB stronger than its pair, so weakly supported",
+      "position": [
+        26.8224,
+        5.39496,
+        0.9144
+      ],
+      "uncertainty_m": 7.62,
+      "status": "pending"
+    },
+    {
+      "mac": "d8:13:2a:0c:31:01",
+      "label": "ModernFormsFan_0C3100 (ch 1)",
+      "status": "pending"
+    },
+    {
+      "mac": "fc:9c:98:27:d5:4e",
+      "label": "ARLO_VMB base station (ch 2)",
+      "status": "pending"
+    },
+    {
+      "mac": "48:a2:e6:8b:4c:68",
+      "label": "HVP pairing AP (ch 1)",
+      "status": "pending"
+    },
+    {
+      "mac": "72:13:01:5b:33:61",
+      "label": "neighbour AP susan (-73 dBm ch 6) - Susan's house, east half (nearer); 12 dB stronger than its pair, so the split is well supported",
+      "position": [
+        -21.6408,
+        5.39496,
+        0.9144
+      ],
+      "uncertainty_m": 7.62,
+      "status": "pending"
+    },
+    {
+      "mac": "08:36:c9:ea:c4:c1",
+      "label": "neighbour AP Sarah's Netgear (-78 dBm ch 4) - Sarah's house, east half (farther); only 1 dB weaker, weakly supported",
+      "position": [
+        33.528,
+        5.39496,
+        0.9144
+      ],
+      "uncertainty_m": 7.62,
+      "status": "pending"
+    },
+    {
+      "mac": "d0:cb:dd:17:c1:05",
+      "label": "neighbour AP Susan (-85 dBm ch 6) - Susan's house, west half (farther); 12 dB weaker than its pair",
+      "position": [
+        -28.3464,
+        5.39496,
+        0.9144
+      ],
+      "uncertainty_m": 7.62,
+      "status": "pending"
+    },
+    {
+      "mac": "fa:d0:0e:e7:f2:f1",
+      "label": "neighbour AP: Stewarts (ch 6, external)",
+      "status": "pending"
+    },
+    {
+      "mac": "5e:7d:7d:22:42:bb",
+      "label": "neighbour AP: LegallyLori (ch 11, external)",
       "status": "pending"
     }
   ],
