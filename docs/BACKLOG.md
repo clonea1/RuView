@@ -416,6 +416,56 @@ provisioning-tooling, disable-154-radio.
 **Lesson for the remaining work:** verify coverage by SYMBOL, never by
 filename. Three of the fourteen were invisible to a filename check.
 
+## Sensing-server audit, first real pass (2026-09-03)
+
+Symbol-level, not spot-checked. Everything outside `firmware/` and `docs/`.
+
+**Scale: 49 files, 21,334 insertions, 3,437 deletions.** The server delta is
+roughly seven times the firmware's by symbol count.
+
+    507 new symbols   371 functions, 104 constants, 32 types
+
+### Four entirely new modules (3,332 lines)
+
+| module | lines | pub fns | purpose |
+|---|---|---|---|
+| `links.rs` | 1357 | 11 | per-link CSI state, keyed by (receiver, transmitter) |
+| `rti.rs` | 826 | 5 | link-line radio-tomographic position estimation |
+| `phase_diag.rs` | 600 | 12 | phase-channel diagnostics |
+| `fusion.rs` | 549 | 9 | cross-node frame pairing on (transmitter, rx_seq) |
+
+`fusion.rs` is the server half of `contrib/csi-wire-v3`. Those two must be
+sequenced together, receiver first -- see the ADR-138 note above.
+
+### Tests
+
+We added **268 tests** across these files. Upstream's `main.rs` carries 90.
+So the test count in the files we touched is roughly tripled, which is the
+strongest argument available that this work is contributable rather than
+merely local.
+
+| file | tests |
+|---|---|
+| `main.rs` | 196 |
+| `links.rs` | 29 |
+| `rti.rs` | 22 |
+| `fusion.rs` | 13 |
+| `phase_diag.rs` | 8 |
+
+### Other areas, not yet enumerated by symbol
+
+`ui/` (20 files), `v2/data/walktest/` (7 analysis scripts),
+`wifi-densepose-hardware` (2), `wifi-densepose-signal` (1). The UI is the
+largest untouched area and needs the same treatment.
+
+### What this changes about sequencing
+
+The four new modules are natural PR boundaries and are already separated by
+file, unlike the firmware where fourteen topics shared six files. That should
+make server packaging considerably easier than firmware packaging was --
+provided `main.rs` changes can be attributed to the right module, which has not
+been checked yet.
+
 ## Contribution branches: 9 of 14 packaged (2026-09-03)
 
 All nine verified building standalone against `origin/main` in the ESP-IDF v5.4
