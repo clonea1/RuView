@@ -9,6 +9,56 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## `cargo check` is not enough, and onion #3 was a phantom
+
+### `contrib/hardware-sync-packet` was broken in isolation
+
+It adds `node_mac` and `health` to `SyncPacket` but never updates the two
+fixtures that construct one, in `multistatic_bridge.rs:326` and `main.rs:9286`.
+`cargo check` passes because the BINARY compiles; `cargo test` compiles the
+test cfg as well and fails with E0063. The branch had been recorded as
+verified.
+
+**`cargo check -p <crate>` is not a sufficient gate for an extracted branch.
+Run `cargo test`.** Both fixtures are `proto_ver: 1` packets, which legitimately
+carry neither field, so the fix is `node_mac: None` and
+`health: Default::default()` with a comment saying why. Folded into the
+hardware commit; `server-node-health` rebased onto it.
+
+### Onion #3 `mesh-sync-surfacing` does not exist
+
+Derived from `e5636cd9`'s title -- "per-link CSI metrics, mesh sync surfacing,
+nine-node prep" -- without checking the diff. Verified now: our `mesh_endpoint`
+and upstream's are **byte-identical**, and every `sync` match in that commit is
+`std::sync::`, the Rust namespace. The mesh surfacing was already upstream.
+
+The real difference in `NodeSyncSnapshot` is twelve lines of **node health**,
+which is topic 30, not a mesh topic. Struck from the list.
+
+Lesson symmetric to the earlier one: filing work by its title rather than its
+diff invents topics as readily as it mislabels them.
+
+### Topic 30 `node-health-telemetry` cut
+
+`474733d1` spans four areas -- firmware `csi_collector.c`, the hardware crate,
+the server, and `multistatic_bridge.rs`. Only the server half belongs here; the
+hardware half is already `hardware-sync-packet`, and the firmware half is a
+separate topic. Receiver ships before sender, as with wire v3: a node on older
+firmware leaves the reserved bytes zeroed and reports no health.
+
+### An error worth recording
+
+Resolving that rebase, `git checkout --ours <file>` discarded the file's OTHER
+changes, not just the conflicting hunk. The commit became empty and was dropped
+silently -- the 22 lines of actual work vanished while the rebase reported
+success. Recovered from the reflog and redone by resolving only the conflict
+BLOCKS, keeping the rest of the incoming commit.
+
+`--ours`/`--theirs` operate on whole files. When a commit has real content in a
+file that also has a trivial conflict, resolve the block, never the file.
+
+**Now 25 branches cut of 37 topics** (38 less the phantom).
+
 ## PEND FOR DECISION: topic 25 `centroid-position`
 
 **Not cut. Needs Joe's call before it is offered upstream.**
