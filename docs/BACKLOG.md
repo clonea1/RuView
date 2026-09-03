@@ -9,6 +9,53 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## CORRECTION: there IS pending USB work, and a stale sdkconfig
+
+**I said "no pending USB flash". That was wrong.** Joe corrected it: the USB
+requirement was for the RECOVERY path, which cannot go over OTA.
+
+OTA replaces the APP partition only (0x20000). The bootloader lives at 0x0 and
+the partition table at 0x8000; neither is reachable over the air.
+`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` is a BOOTLOADER capability, so a node
+whose bootloader predates it cannot roll back a bad image no matter what the
+app does -- and `ota_rollback_boot_check()` / the `PENDING_VERIFY` handling in
+`ota_update.c` are written expecting it.
+
+What I checked was app-level health reporting, which every node has. That says
+nothing about the bootloader. **The right question was never "is the app
+current" but "which nodes have a rollback-capable bootloader", and that is not
+reported anywhere** -- there is no bootloader version on the wire, so it cannot
+be determined remotely at all.
+
+### The stale sdkconfig, found while building
+
+The working `sdkconfig` did not match the fleet:
+
+    active sdkconfig          fleet / defaults
+    FLASHSIZE 4MB             16MB
+    partitions_4mb.csv        partitions_16mb.csv
+    DYNAMIC_TX_BUFFER_NUM=64  128
+
+Anything built from it would have been a 4MB image with the buffer change
+absent -- i.e. silently NOT the configuration under test.
+
+**It was backed up, not deleted**, before regenerating. The documented build
+command begins `rm -rf build sdkconfig`, which is exactly the pattern that lost
+`partitions_16mb.csv`; `CLAUDE.md` warns about it *even when a README documents
+it*, and that warning earned its place again here.
+
+A second trap: `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` lives in
+`sdkconfig.defaults.16mb`, NOT in `sdkconfig.defaults.esp32c6`. Building from
+`defaults + esp32c6` alone produces a rollback-DISABLED image that looks
+correct in every other respect. The correct combination is
+`sdkconfig.defaults + sdkconfig.defaults.16mb + sdkconfig.defaults.esp32c6`.
+
+### Built and verified
+
+    bootloader.bin        19,696 bytes   ROLLBACK ENABLED
+    esp32-csi-node.bin 1,066,256 bytes   proto v3 counters
+    partition-table.bin    3,072 bytes   16MB, two 4MB OTA slots
+
 ## ALL 37 TOPICS CUT. Final privacy sweep, including commit messages
 
 Topic 27 was the last: `server-classification-stability`, two genuine upstream
