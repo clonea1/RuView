@@ -9,6 +9,59 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## ALL 37 TOPICS CUT. Final privacy sweep, including commit messages
+
+Topic 27 was the last: `server-classification-stability`, two genuine upstream
+fixes.
+
+  - Upstream's `DEBOUNCE_FRAMES: u32 = 4` carries the doc comment
+    "at ~10 FPS = ~0.4s". ESP32-C6 boards run at 48-50 FPS, so the real window
+    is ~0.08 s and a ~1 s motion EMA becomes ~0.2 s. Per-frame noise then flips
+    the reported level almost directly. Fixed by deriving the thresholds from
+    each node's own measured `csi_fps_ema` rather than hardcoding a different
+    fixed rate, which would only move the bug to the next chip that diverges.
+  - `fuse_room` recomputed its plurality vote with no memory of its own, so
+    with per-node confidences near the boundary (44%, 83%, 53% observed
+    simultaneously) whichever two of three agreed could flip the room result
+    while every node's own reading was stable. Everything gating on presence
+    then flapped, and each of those looked like its own separate bug.
+
+### The sweep found four branches carrying identifiers
+
+Run across every branch's DIFF, its FILENAMES, and -- newly -- its COMMIT
+MESSAGES:
+
+| branch | what | fix |
+|---|---|---|
+| `remote-config` | a real node IP in four README and four `config_push.py` examples | `<node-ip>` |
+| `rollback` | a real node IP **inside a commit message**, in a quoted boot log | genericised, provenance line dropped |
+| `server-rti` | a doc comment describing this deployment as the motivation | generalised to any building |
+| `provisioning-tooling` | reviewed, no change: `192.168.1.10` sits beside `"thisismyssid"` and `D:\path	o\...` and is plainly illustrative |
+
+**A commit message ships with the branch.** Screening diffs is not enough, and
+this was found only because the sweep was widened to messages.
+
+One accepted false positive: `rti.rs` asserts `"west wing"` and `"east wing"`
+as labels for two synthetic disjoint polygons at x 0-4 and 8-12. Ordinary
+geometry vocabulary, no relation to any real building. Left as-is -- degrading
+readable test code to satisfy a grep is the wrong trade -- and recorded here so
+the next sweep does not re-investigate it.
+
+### Durability check while in the area
+
+`CLAUDE.md` names `board_index.json`, `partitions_16mb.csv` and `sdkconfig` as
+irreplaceable. Verified on `main`: the first two are **tracked**, so the hole
+that lost `partitions_16mb.csv` is closed. `sdkconfig` remains untracked and
+ignored; it is regenerable through menuconfig, so this is noted rather than
+raised.
+
+The `.gitignore` entries on `provisioning-tooling` are correct FOR UPSTREAM --
+`board_index.json` and `provision_conf*.json` are per-fleet and should not land
+in a shared repository. They do not weaken the local tree, because a
+`.gitignore` rule has no effect on an already-tracked file.
+
+**37 branches, all build-verified, all full-suite green, all screened.**
+
 ## Round 6: fusion completed, world3d, node-MAC registry
 
 **36 branches.** Only topic 27 (`classification-smoothing`) remains uncut.
