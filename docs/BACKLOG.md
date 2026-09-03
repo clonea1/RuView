@@ -240,6 +240,32 @@ that touches `csi_collector.c`, `main.c`, `nvs_config.*` or `provision.py`.
   Note the interaction with the fleet: nodes stream UDP and do not retry, so
   every second of server downtime is sensing data that no longer exists.
 
+## UWB anchors for CSI ground truth (Joe, 2026-09-03)
+
+Both Moto Tags have **UWB**, which changes this from RSSI guesswork to
+centimetre-class ranging. No ESP32 has a UWB radio, so the nodes cannot use it
+-- but the phone can.
+
+**Inverted arrangement:** place the tags at surveyed fixed points as UWB
+*anchors* and carry the phone. That is how UWB positioning is normally built
+(fixed anchors, mobile device), and it makes the phone self-locating to a few
+centimetres. Log that with timestamps and it is continuous, automatic ground
+truth for CSI training -- versus 39 thumb taps, of which only 11 landed inside
+a capture window.
+
+This is the fix for what defeated the PR-1647 test: not a better algorithm, a
+vastly better label set.
+
+**Open question, hardware vs API:** the tags are capable; whether Android's
+`android.uwb` API exposes ranging against Moto Tags to a third-party app, or
+whether it is locked to Google's Find My Device precision-finding flow, is
+unverified. Check that before buying anything or writing code.
+
+Note this makes tags a *labelling instrument*, not worn infrastructure --
+which answers the original objection that nobody wants to carry tech and the
+animals will not wear collars. The tags sit on shelves; only the phone moves,
+and only during a training session.
+
 ## BLE tags as an identity anchor
 
 - **Static-address BLE tags would disambiguate what CSI provably cannot.**
