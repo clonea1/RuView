@@ -292,44 +292,43 @@ and only during a training session.
   airtime -- BLE is a separate radio from WiFi on the C6, but they share an
   antenna path, and the 2.4 GHz band is already at 86% airtime.
 
-## Two independent baselines, and neither knows about the other
+## Baseline handling: what is actually there (corrected 2026-09-03)
 
-Asked 2026-09-03: is the "learn the room for N seconds after plug-in" logic
-firmware or server? **Both, separately, with different constants.**
+An earlier note in this file claimed the firmware uses a latched
+`mean + 3*sigma` threshold and that firmware and server baselines are
+unreconciled. **That was a misreading** -- it described the scheme the code
+explicitly replaced. Corrected here so the wrong version does not outlive it.
 
-| | where | warm-up | rule |
-|---|---|---|---|
-| firmware | `edge_processing.c` | `EDGE_CALIB_FRAMES = 1200` (~60 s at 20 Hz) | threshold = `mean + 3*sigma` of ambient |
-| server | `main.rs` | `BASELINE_WARMUP = 50` frames / `NODE_BASELINE_WARMUP_SECS = 5.0` | EMA `alpha = 0.003`, subtracted at `BASELINE_SUBTRACTION_FRACTION = 0.85` |
+**Firmware (`edge_processing.c`) tracks a leaky minimum.** The
+`EDGE_CALIB_FRAMES` (~60 s) warm-up only *seeds* a plausible starting value; it
+does not latch. Thereafter:
 
-A third timescale exists and is easy to confuse with these: the adaptive
-controller's loops, `fast=200ms med=1000ms slow=30000ms` (the 30 s in the boot
-log).
+    if (motion < s_floor)  s_floor = motion;        // descend instantly
+    else                   s_floor *= EDGE_FLOOR_LEAK;   // climb slowly
 
-**The boot-calibration bug is fixed in our tree, and took two attempts.** The
-firmware comment names it exactly: the old scheme averaged the first
-EDGE_CALIB_FRAMES and latched, so a node "is calibrating in the seconds right
-after a human walked over and plugged it in". History: `53115fb3` (track the
-quiet floor continuously) -> `4c9a22ae` (revert) -> `47731d02` (actually track
-the quiet floor continuously). Per `reference_espectre_lessons`, ESPectre still
-ships the original version of this bug.
+So an empty, calm hour walks the floor down to true quiet and disturbances are
+detected sooner -- the behaviour Joe expected and the code delivers. The design
+note records the measurement behind it: the room's true floor sits ~14x below
+where the animals register, and settling after human activity runs a couple of
+hours, which no one-minute average can resolve.
 
-**Why it still matters.** A node whose floor latched high under-reports
-presence, and the server cannot tell -- it applies its own baseline to numbers
-that were already attenuated on the node. Everything downstream inherits that:
-per-link motion, RTI, and anything the adaptive model was trained on. The model
-is 48.6% accurate on 4 classes and was trained on a house that no longer exists
-(`project_overnight_recorder_and_model_staleness`); a mis-latched node floor is
-one candidate contributor that has never been ruled out.
+The old latching scheme is described in that comment as unfixable by
+construction: the node calibrates in the seconds after a human plugged it in,
+so the window is contaminated and "nobody can leave a room fast enough to fix
+it". History: `53115fb3` -> revert `4c9a22ae` -> `47731d02`. Per
+`reference_espectre_lessons`, ESPectre still ships the original bug.
 
-**Cheap check, no walk or tapper needed.** `POST /calibrate` re-seeds a node's
-floor on demand. Compare a node's motion statistics either side of a
-recalibration: if the floor was sitting too high, the post-recalibration
-distribution shifts. Runs against nodes already up, costs minutes.
+**A fleet re-baseline button exists.** `ui/components/RoomBuilderTab.js:453`
+"Recalibrate All Nodes" posts to `/api/v1/calibrate`, which fans
+`POST /calibrate` out to every node. The leave-the-house-and-press-it workflow
+is built.
 
-Related open item: the server's baseline is SUBTRACTIVE, which is the axis PR
-1647 questions -- see the ratio-vs-subtract entry. Note the firmware uses
-`mean + 3*sigma`, a third formulation again.
+**What remains genuinely open** is narrower than the earlier note claimed: the
+server keeps its own separate baseline (`BASELINE_WARMUP = 50` frames,
+`alpha = 0.003`, subtracted at 0.85) applied on top of the node's already-floored
+output. That layering is real and untested, and it is the thing to control for
+in any retest of the ratio-vs-subtract question -- not a conflict between three
+rival formulations.
 
 ## Solver ignores position uncertainty
 
