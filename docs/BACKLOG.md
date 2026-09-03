@@ -387,7 +387,7 @@ file untouched. Expect the same for the other tangled ones.
 
 Joe asked whether a line-level audit was needed. It was. Everything before this
 was file-level coverage plus spot-checks, and file-level coverage **lies**: it
-reported  "covered" while three distinct topics hid inside
+reported `edge_processing.c` "covered" while three topics hid inside
 it, and reported  covered while the rollback commit sat in no
 branch at all. Joe found two missing topics by memory before the audit found
 three more.
@@ -398,15 +398,15 @@ symbols, 14 new files.
 
 Topics found that were NOT on the branch list:
 
-- **ESP-NOW recovery** -- , ,
-  , . A stall detector and
-  recovery path, wrongly lumped in with beacon scaling; they are separate
-  concerns sharing a file.
-- **CSI wire v3** -- , ,
-  . Carries the 802.11 rx_seq to the server, which is what
+- **ESP-NOW recovery** -- `espnow_recover`, `ESPNOW_STALL_US`,
+  `ESPNOW_MAX_INFLIGHT`, `ESPNOW_FAIL_BEFORE_RECOVERY`. A stall detector and
+  recovery path, wrongly lumped in with beacon scaling; separate concerns
+  sharing a file.
+- **CSI wire v3** -- `CSI_MAGIC_V3`, `CSI_HEADER_SIZE_V3`,
+  `CSI_MAX_FRAME_SIZE`. Carries the 802.11 rx_seq to the server, which is what
   makes cross-node frame pairing possible at all. Upstream is still on v2.
-- **Diagnostics / census** -- , ,
-  , . Opt-in, off by default.
+- **Diagnostics / census** -- `diag_census_record`, `diag_census_dump`,
+  `diag_census_dump_one`, `diag_survey_visible_aps`. Opt-in, off by default.
 
 Full topic list (14): beacon-scaling, espnow-recovery, csi-wire-v3,
 diagnostics-census, adaptive-floor, subcarrier-grids-256, vitals-slots,
