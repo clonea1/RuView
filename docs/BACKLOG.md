@@ -9,6 +9,40 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## e5636cd9 is the largest bucket in the repository -- it splits four ways
+
+Sizing the links topic for packaging found that its base commit,
+"per-link CSI metrics, mesh sync surfacing, nine-node prep", is 4,300 lines
+across seven files and introduces **five independent subsystems**:
+
+| module | lines | topic |
+|---|---|---|
+| `links.rs` | 840 | per-link CSI metrics -- the nominal subject |
+| `main.rs` | 2171 | wiring for all of the below, plus mesh surfacing and nine-node prep |
+| `phase_diag.rs` | 600 | phase diagnostics |
+| `rti.rs` | 473 | radio tomographic imaging |
+| `bvp.rs` | 214 | body velocity profile |
+
+**They are genuinely separable.** Checked at module level: `links.rs`,
+`rti.rs` and `phase_diag.rs` contain **no** `crate::` reference to one another.
+Each is self-contained and meets the others only in `main.rs`, where the wiring
+is per-module. The split is along existing file boundaries, not a refactor.
+
+The title's comma tell was right again, and understated -- it named three
+topics and the commit holds five.
+
+**Revised plan for the links family** (was one branch, now five):
+
+    server-links        links.rs + its wiring + the grid-gate fix 00fb117e
+                        + the four follow-ups 21036fd8 7fb85444 80c62207 2a035fde
+    server-rti          rti.rs
+    server-phase-diag   phase_diag.rs
+    server-bvp          bvp.rs
+    server-mesh-sync    mesh surfacing / nine-node prep from main.rs
+
+`server-links` carries the measured numbers (links 31 -> 137) and should be
+submitted first; the other four are independent and can follow in any order.
+
 ## server-links is the highest-value server PR, and I undersold it
 
 `00fb117e` was filed as a bullet ("subcarrier-grid gate per link, distinct bug
