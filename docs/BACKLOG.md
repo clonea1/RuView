@@ -198,6 +198,26 @@ all need hand-separation.
 
 **Revised estimate: ~37 branches, not 31.**
 
+
+### Two onion topics folded into `server-links`, deliberately
+
+Onion #6 (`subcarrier-grid-gate-per-link`, `00fb117e`) and #7 (`noise-floor`,
+`80c62207` + `2a035fde`) were listed as separate proposals. Both modify
+`links.rs`, which does not exist upstream, so neither can precede
+`server-links` and neither stands alone as a PR.
+
+#6 additionally has no meaning without per-link data -- upstream's per-node
+gate is defensible for the per-node feature path it protects. #7 could in
+principle follow as a second PR, but `links.rs` is new code in this PR, so
+shipping it with the noise floor already present is simpler than adding a
+field to a file the reviewer has only just seen.
+
+Recorded here rather than left silent, because a folded topic that is not
+written down is a topic that gets lost.
+
+Remaining to cut: 21, 22, 23, 24, 25, 26, 27, 30, 31, and onion 3, 4, 5.
+**12 of 38.**
+
 ## THE COMPLETE PR TABLE (2026-09-03)
 
 Status: DONE = cut and build-verified. PARTIAL = cut, known incomplete.
@@ -229,9 +249,9 @@ TODO = identified, not cut.
 | 15 | `server-wire-v3` | DONE | - | parse v2/v3 headers. Receiver half; ships before firmware emits |
 | 16 | `server-node-positions` | DONE | - | **best candidate**: hardcoded `[2.0,0.0,1.5]` for every node. Upstream issues #228/#249/#301 |
 | 17 | `server-fusion` | PARTIAL | wire-v3 | cross-node pairing on (tx, rx_seq). Ingestion absent |
-| 18 | `server-links` | TODO | wire-v3 | per-link CSI state + `mesh.html`, `LinkMeshPanel.js` |
-| 19 | `server-rti` | TODO | - | radio-tomographic estimation. No dependencies at all |
-| 20 | `server-phase-diag` | TODO | - | phase-channel diagnostics |
+| 18 | `server-links` | DONE | wire-v3 | per-link CSI state + `mesh.html`, `LinkMeshPanel.js` |
+| 19 | `server-rti` | DONE | - | radio-tomographic estimation. No dependencies at all |
+| 20 | `server-phase-diag` | DONE | - | phase-channel diagnostics |
 | 21 | `room-builder` | TODO | - | **live/persisted node positions**, storeys, walls + `RoomBuilderTab`, `mesh3d`, `illuminators`. Replaces `--node-positions` |
 | 22 | `ground-truth-marking` | TODO | - | `diag/mark` + `mark`/`survey`/`tapper`/`walk.html` |
 | 23 | `node-management` | TODO | - | server proxies config/firmware to nodes + `NodesTab.js` |
