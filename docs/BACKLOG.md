@@ -435,6 +435,35 @@ container. Each is one topic, applied to upstream's code as it stands.
 
 Stacked branches must SAY SO in the PR description; they will not apply alone.
 
+### csi-wire-v3 answers a stated blocker in upstream ADR-138
+
+Worth leading the PR with this rather than describing the feature.
+
+Upstream **ADR-138** (WiFi-7 MLO LinkGroup / ArrayCoordinator clock-quality
+gating, ruv, 2026-05-28) is *"Accepted -- partial (built + tested building
+block; integration glue pending)"*. Its own limitations section states the
+blocker:
+
+> "Until they land, the coordinator can be tested with synthetic
+> ClockQualityScores but cannot be wired end-to-end. The `mesh_aligned_us`
+> plumbing exists today only in the sensing server, not in a shared FrameMeta."
+
+Upstream's `csi_collector.h` contains **zero** references to `rx_seq`. They
+built the fusion mathematics; nothing produces the per-frame identity it needs.
+
+That is the half this work supplies: CSI wire v3 carrying the 802.11 `rx_seq`,
+pairing on `(tx_mac, rx_seq)`, and the mesh-aligned rate gate.
+
+The gate matters as much as the wire format, and the measurement is the
+argument: with the per-node elapsed gate, two boards side by side heard **72%
+of frames in common but accepted only 25%** (2026-08-30). Carrying `rx_seq`
+without fixing the gate would still have thrown away three quarters of the
+pairing.
+
+So the claim is not "we built this first" -- it is "this answers the blocker
+ADR-138 names". `contrib/mesh-aligned-rate-gate` is already cut and should be
+referenced alongside it.
+
 ### The five still to cut
 
 - **`csi-wire-v3`** (commit `857cc179`). Conflicts in `csi_collector.c/h` AND
