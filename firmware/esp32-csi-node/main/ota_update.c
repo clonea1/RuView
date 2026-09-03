@@ -201,7 +201,7 @@ void ota_rollback_boot_check(void)
         if (nvs_open(OTA_STATE_NS, NVS_READONLY, &h) == ESP_OK) {
             size_t len = sizeof(s_rollback_reason);
             if (nvs_get_str(h, "rb_reason", s_rollback_reason, &len) != ESP_OK) {
-                s_rollback_reason[0] = ' ';
+                s_rollback_reason[0] = '\0';
             }
             nvs_close(h);
         }
@@ -216,7 +216,7 @@ static void rollback_confirm(void *arg)
         s_pending_verify = false;
         ESP_LOGI(TAG, "new image CONFIRMED: networked and stable, rollback cancelled");
         /* The previous failure, if any, is now history. */
-        s_rollback_reason[0] = ' ';
+        s_rollback_reason[0] = '\0';
         rollback_store_reason(NULL);
     } else {
         ESP_LOGE(TAG, "could not mark the image valid; it will roll back on reboot");
@@ -412,6 +412,14 @@ static esp_err_t ota_start_server(httpd_handle_t *out_handle)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = OTA_PORT;
     config.max_uri_handlers = 14;  /* WASM endpoints (ADR-040) + /config. */
+    /* 12 KB, not the 4 KB default: the upload handler runs esp_ota_end() ->
+     * esp_image_verify() on THIS task's stack, which overflows at the very end
+     * of an upload -- the transfer completes, validation panics, and the node
+     * reboots into the old image. Reported upstream as PR #1594 (Juan
+     * Kuscevic) against an S3; we had not hit it on the C6, but the failure is
+     * silent-looking (an OTA that "did not take") and the cost of headroom is
+     * one page of RAM. */
+    config.stack_size = 12288;
     /* Increase receive timeout for large uploads. */
     config.recv_wait_timeout = 30;
 
