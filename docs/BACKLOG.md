@@ -189,6 +189,25 @@ that touches `csi_collector.c`, `main.c`, `nvs_config.*` or `provision.py`.
   Note the interaction with the fleet: nodes stream UDP and do not retry, so
   every second of server downtime is sensing data that no longer exists.
 
+## Solver ignores position uncertainty
+
+- **`uncertainty_m` is stored, validated, round-tripped -- and dropped.**
+  `approved_emitter_positions()` returns `HashMap<[u8;6], [f32;3]>`: position
+  only. So an emitter surveyed to +/-1 ft and one estimated to +/-25 ft carry
+  identical weight once approved.
+
+  Found 2026-09-03 while adding the two neighbouring houses as exterior
+  illuminators. Their positions are known to roughly a house-width, which is
+  useful as *directional* evidence -- something to the west lit up -- and
+  useless as a trilateration anchor. With no weighting there is no way to say
+  that, so they are recorded as `pending` with positions attached: the data is
+  captured, the solver cannot use it.
+
+  Worth fixing, because exterior illuminators are geometry no internal emitter
+  can produce (links crossing the outer walls and the full width of the house),
+  and 6 of 9 nodes are illuminator-blind to the NW. Until the solver weights by
+  uncertainty, that geometry stays unusable.
+
 ## Fleet health, unexplained
 
 - **Node 8 sits at -90 dBm**, worst in the fleet, despite notes recording it as
