@@ -15,87 +15,77 @@ Priorities below are by *dependency and risk*, not by size. Two items solve
 the same problem and one of them is better; two others are blocked until a
 third lands. Reasoning is stated so it can be argued with.
 
-### P0 — durability, and the keystone that unblocks the rest
+### P0 — the keystone
 
-- **P0.1 Fix the full-disk backup.** It is failing. Everything else in this
-  list assumes the work still exists tomorrow. Five days of tape survey, house
-  geometry and firmware live on one disk on a path called `C:\temp`. Nothing
-  else on this list matters if that disk goes.
+- **P0.1 Fix the full-disk backup. DONE 2026-09-02** — daily images restored,
+  running at 09:45.
 
-- **P0.2 Separate site-specific data from the repo.** This is the keystone: it
-  independently unblocks P1, P2 and P3, and it closes a live privacy exposure.
+- **P0.2 Make the server installable independently of the repo.** This is the
+  keystone: it unblocks the product install, the backup layout, and removes
+  the reason house data sits in a source tree.
 
-  Today `v2/data/room_config.json` is tracked and holds nine surveyed node
-  positions, the interior dimensions of a private residence, and 57 device MAC
-  addresses. `.githooks/pre-push` stops it reaching a public remote, but that
-  is a guard bolted onto a design problem: site data should not be in a source
-  repo at all.
+  **The scale of the problem, measured 2026-09-02:** the repo is **76 GB**, of
+  which `v2/target/` is **37 GB**. The actual runtime payload is the server
+  binary (9 MB) plus `ui/` (3.8 MB) — about **13 MB**. A delivered product is
+  0.02% of what currently has to be present for the server to start.
 
-  Target (Windows production convention): site collateral under
-  `C:\ProgramData\RuView\` — room config, emitter roster, node identity,
-  provisioning profiles, captures, models. The repo keeps only code, and a
-  *sample* room config so the thing is runnable from a clean clone.
+  **Why it cannot run outside the repo today**, both concrete and small:
+  - `data_dir` is hardcoded to a relative `"data"` (main.rs, `let data_dir =
+    PathBuf::from("data")`) with no CLI argument, so it resolves against the
+    working directory.
+  - `ui_path` defaults to `"../ui"`, i.e. the repo's UI folder seen from `v2/`.
 
-  Doing this first means the OneDrive move carries no house data, the install
-  has a defined data directory rather than "next to the exe", and the upstream
-  contribution stops needing a guard to be safe.
+  So the fix is two arguments and their defaults, not a rearchitecture:
+  `--data-dir` (new) and a sane `--ui-path` default beside the binary.
 
-### P1 — upstream, mostly done
+### P1 — the product layout (Joe, 2026-09-02)
 
-- **P1.1 Fork and open the five PRs.** `contrib/*` branches are cut from
+Three locations, three purposes:
+
+| path | holds | backed up |
+|---|---|---|
+| `C:\Program Files\RuView\` | the delivered product: exe + `ui/` + sample config | no (reinstallable) |
+| `C:\ProgramData\RuView\` | site collateral: room config, emitters, node identity, provisioning profiles, captures, models | yes |
+| `C:\src\RuView\` | the repo (development only) | yes, excluding `target/` |
+
+- **P1.1 Ship an installable payload**: binary, `ui/`, a sample room config, and
+  a config file instead of a fifteen-argument command line. Run as a service or
+  scheduled task rather than a hand-started process.
+- **P1.2 Move site data to `C:\ProgramData\RuView\`.** Retires
+  `.githooks/pre-push` as load-bearing: that guard exists only because house
+  data (nine surveyed positions, interior dimensions, 57 device MACs) lives in
+  a source repo at all.
+- **P1.3 Move the repo off `C:\temp` to `C:\src\RuView`.**
+
+- **P1.4 Backup by scheduled robocopy, not live sync.**
+  `C:\src\RuView` -> `OneDrive\src\RuView`, excluding `target/` — robocopy
+  supports `/XD`, which is precisely what OneDrive selective sync cannot do
+  inside a synced folder. `C:\ProgramData\RuView` -> `OneDrive\RuView`.
+  A scheduled snapshot never holds a lock on a file cargo or git is rewriting,
+  which was the objection to syncing the working tree; it does not apply here.
+
+### P2 — upstream, mostly done
+
+- **P2.1 Fork and open the five PRs.** `contrib/*` branches are cut from
   `origin/main`, firmware-only, verified to build standalone. Needs a GitHub
   fork; `gh` is not installed and `origin` is upstream itself.
-- **P1.2 Finish and document remaining firmware work** before submitting, so
-  the PRs land as a coherent set rather than a trickle.
+- **P2.2 Finish and document remaining firmware work** first, so the PRs land
+  as a coherent set rather than a trickle.
 
-### P2 — drift audit for the sensing server
+### P3 — drift audit for the sensing server
 
-- **P2.1 Establish what has drifted.** `main` is 91 commits ahead of
+- **P3.1 Establish what has drifted.** `main` is 91 commits ahead of
   `origin/main` and 0 behind, but nobody has audited *what upstream changed in
-  the server* while we diverged. The firmware merge to 0.8.8 was done
-  deliberately and carefully; the server has had no equivalent pass.
-  Deliverable: a list of upstream server changes, each marked take / skip /
-  conflicts-with-ours, in the same style as the firmware merge.
+  the server* while we diverged. The firmware got a careful 0.8.8 merge; the
+  server has had no equivalent pass. Deliverable: a list of upstream server
+  changes marked take / skip / conflicts-with-ours.
 
-### P3 — behave like a product, not a startup
+### P4 — side-by-side binary swap
 
-- **P3.1 Install the sensing server properly on Windows.** Today it runs out
-  of `v2/target/release/` with the repo as its working directory, which is why
-  a relative `data/mesh` argument works at all. Target: binary under
-  `C:\Program Files\RuView\`, data under `C:\ProgramData\RuView\`, a
-  service or scheduled task rather than a hand-started process, and a config
-  file instead of a fifteen-argument command line.
-  **Blocked on P0.2** — an install with no defined data directory just moves
-  the problem.
-  Linux/Docker keep their own conventions; this is a Windows packaging concern.
-
-- **P3.2 Adopt the side-by-side binary swap** (see the section below). Already
-  partially proven: renaming the running exe before `cargo build` let the
-  server serve continuously through two full compiles on 2026-09-02.
-
-### Contested: moving the repo to OneDrive
-
-Joe proposed moving the whole repo to OneDrive. **Recommend not doing this as
-stated**, because it solves the durability problem worse than P0.1 does and
-introduces new failure modes:
-
-- `v2/target/` is multi-gigabyte and rewritten on every build. OneDrive will
-  attempt to sync all of it, continuously.
-- OneDrive cannot exclude a subfolder of a synced folder except by unlinking
-  it; there is no `.gitignore` equivalent. So the churn cannot be filtered.
-- OneDrive holds file locks while uploading. Git and cargo both rewrite files
-  in place, and the known result is sync conflicts and occasional corruption
-  in `.git/`.
-
-**Better shape:** fix the backup (P0.1) so durability is solved properly, move
-*site data* to `C:\ProgramData` (P0.2) and back that up — it is small, changes
-rarely, and is the genuinely irreplaceable part. If the repo should also leave
-`C:\temp`, move it to a normal path such as `C:\src\RuView`, which addresses
-the "temp means disposable" problem without inviting a sync engine into a
-build tree.
-
-If OneDrive is still wanted for the repo, the workable version is to sync a
-*bare mirror* pushed to OneDrive on a schedule, not the working tree.
+- Already partially proven: renaming the running exe before `cargo build` let
+  the server serve continuously through two full compiles on 2026-09-02
+  (health returned 200 throughout). The remaining work is a supervisor that
+  stages, verifies and swaps — the same shape as the firmware OTA rollback.
 
 ## Blocked on a decision or an action outside the repo
 
