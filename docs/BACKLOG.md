@@ -9,6 +9,51 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## Onion pass: seven further subdivisions found (2026-09-03)
+
+Applying the mesh.html exercise to all 31 proposals. The tell is a commit title
+containing "and" or a comma, and a bundle spanning more than one crate.
+
+### Topics in OTHER CRATES that appeared on no list
+
+1. **`signal-signed-bvp`** -- `wifi-densepose-signal/src/bvp.rs`, 214 lines.
+   Extracts a SIGNED Body Velocity Profile from complex CSI, preserving Doppler
+   direction. The existing `extract_bvp` takes amplitude-only input, and a real
+   signal's FFT magnitude is mathematically symmetric about zero
+   (`|X(-f)| == |X(f)|`), so **no post-processing on that path can ever recover
+   direction** -- it is not a tunable shortcut, it is information that was
+   already destroyed. Self-contained, in a crate nobody else touched, and it
+   fixes a limitation rather than adding a feature. Strong candidate.
+
+2. **`hardware-sync-packet`** -- `wifi-densepose-hardware/src/sync_packet.rs`,
+   192 lines. Parses the ESP-NOW sync packet including the thermal/health
+   fields. Pairs with the firmware side.
+
+### Topics hidden inside bundles
+
+3. **`mesh-sync-surfacing`** -- `/api/v1/mesh` and `NodeSyncSnapshot`, buried in
+   `e5636cd9` whose title says "per-link CSI metrics, mesh sync surfacing,
+   nine-node prep" -- three topics announced in one title.
+4. **`ap-position`** -- from `c811a6b9` ("Doppler-weighted centroid position
+   tier + AP position"). Treating the AP as a positioned emitter is separate
+   from centroid estimation.
+5. **`bvp-deadband-fix`** -- from `b441d70a` ("BVP zero-velocity deadband +
+   attach_positions diagnostic"). Belongs with (1), not with centroid work.
+6. **`subcarrier-grid-gate-per-link`** -- `00fb117e`. Keying the grid gate per
+   link rather than per node is a distinct bug, bundled into the links work.
+7. **`noise-floor`** -- `80c62207` + `2a035fde`. Carries the reported noise
+   floor and settles the AGC question; a data addition, not a links refinement.
+
+### The reason the server resists cherry-picking
+
+`e5636cd9` is **4,300 lines across 7 files** and creates `links.rs`,
+`phase_diag.rs` AND `rti.rs` in one commit, plus 2,171 lines of `main.rs`
+wiring and 214 lines in a different crate. Three of the proposed PRs were born
+in a single commit, which is why none of them can be lifted by cherry-pick and
+all need hand-separation.
+
+**Revised estimate: ~37 branches, not 31.**
+
 ## THE COMPLETE PR TABLE (2026-09-03)
 
 Status: DONE = cut and build-verified. PARTIAL = cut, known incomplete.
