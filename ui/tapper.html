@@ -12,7 +12,7 @@
   Written 2026-09-01. Every open question this week is starved of labels, not
   of data: the fleet records 165 links continuously, and almost none of it is
   attached to a known place. The two labelled events we did get that evening
-  (a circle of the dining table at 19:33, the girls in the mud room at 19:43)
+  (a circuit of one room, then two occupants together in another)
   were worth more than the preceding hour of unlabelled polling.
 
   Three things are recorded per tap, and all three matter for different reasons:
@@ -43,8 +43,8 @@
 <style>
   :root{
     --bg:#0d1117; --fg:#e6edf3; --dim:#8b949e; --line:#30363d; --card:#161b22;
-    --move:#2ea043; --still:#d29922; --me:#388bfd; --girls:#a371f7; --all:#db6d28;
-    --amy:#e85aad; --kid:#2bb3c0;
+    --move:#2ea043; --still:#d29922; --adult1:#388bfd; --children:#a371f7; --all:#db6d28;
+    --adult2:#e85aad; --child1:#2bb3c0;
     --warn:#f85149;
   }
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
@@ -72,16 +72,16 @@
     border-radius:10px;border:1px solid var(--line);background:var(--card);
     color:var(--dim);cursor:pointer}
   .seg button[aria-pressed="true"]{color:#fff;border-color:transparent}
-  #who button[aria-pressed="true"][data-v="me"]{background:var(--me)}
-  #who button[aria-pressed="true"][data-v="girls"]{background:var(--girls)}
+  #who button[aria-pressed="true"][data-v="adult1"]{background:var(--adult1)}
+  #who button[aria-pressed="true"][data-v="children-together"]{background:var(--children)}
   #who button[aria-pressed="true"][data-v="everyone"]{background:var(--all)}
-  #who button[aria-pressed="true"][data-v="amy"]{background:var(--amy)}
-  #who button[aria-pressed="true"][data-v="kid"]{background:var(--kid)}
+  #who button[aria-pressed="true"][data-v="adult2"]{background:var(--adult2)}
+  #who button[aria-pressed="true"][data-v="child1"]{background:var(--child1)}
   #who2{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:6px}
   #who2 button{font:inherit;font-size:13px;font-weight:700;padding:13px 4px;
     border-radius:10px;border:1px solid var(--line);background:var(--card);
     color:var(--dim);cursor:pointer}
-  #who2 button[aria-pressed="true"][data-v="girls"]{background:var(--girls);color:#fff;border-color:transparent}
+  #who2 button[aria-pressed="true"][data-v="children-together"]{background:var(--children);color:#fff;border-color:transparent}
   #who2 button[aria-pressed="true"][data-v="everyone"]{background:var(--all);color:#fff;border-color:transparent}
 
   #motion{display:grid;grid-template-columns:1fr 1fr;gap:6px}
@@ -97,7 +97,7 @@
     border-radius:11px;border:1px solid var(--line);background:var(--card);
     color:var(--fg);cursor:pointer;min-width:0;text-align:left;line-height:1.25}
   #rooms button:active{filter:brightness(1.3)}
-  #rooms button.on{background:var(--me);border-color:transparent;color:#fff}
+  #rooms button.on{background:var(--adult1);border-color:transparent;color:#fff}
   #rooms button .fl{display:block;font-size:10px;color:var(--dim);font-weight:400}
   #rooms button.on .fl{color:rgba(255,255,255,.85)}
   #rooms button.nonode{border-style:dashed}
@@ -124,12 +124,12 @@
 
 <div class="lbl">who</div>
 <div class="seg" id="who">
-  <button data-v="me" aria-pressed="true">me</button>
-  <button data-v="amy" aria-pressed="false">amy</button>
-  <button data-v="kid" aria-pressed="false">kid</button>
+  <button data-v="adult1" aria-pressed="true">adult 1</button>
+  <button data-v="adult2" aria-pressed="false">adult 2</button>
+  <button data-v="child1" aria-pressed="false">child 1</button>
 </div>
 <div id="who2">
-  <button data-v="girls" aria-pressed="false">girls (together)</button>
+  <button data-v="children-together" aria-pressed="false">children together</button>
   <button data-v="everyone" aria-pressed="false">everyone</button>
 </div>
 
@@ -179,7 +179,7 @@ const KEY = 'ruview.tapper.v1';
 let marks = [];
 let queue = [];
 let cur = null;
-let who = 'me', motion = 'moving';
+let who = 'adult1', motion = 'moving';
 
 try { marks = JSON.parse(localStorage.getItem(KEY) || '[]'); } catch (e) { marks = []; }
 try { queue = JSON.parse(localStorage.getItem(KEY + '.q') || '[]'); } catch (e) { queue = []; }
@@ -211,7 +211,7 @@ async function flush() {
 function stamp(place) {
   const now = new Date();
   // '_' not '.', because the server's mark sink keeps only [A-Za-z0-9-_] to
-  // stay CSV-safe: dots were silently stripped, so 'me.upstairs-bath.moving'
+  // stay CSV-safe: dots were silently stripped, so 'adult1.upstairs-bath.moving'
   // landed as 'meupstairs-bathmoving'. Slugs use '-' internally, so '_' stays
   // an unambiguous field separator. The sink also truncates at 64 chars.
   const label = [who, slug(place.label), motion].join('_');
@@ -265,7 +265,7 @@ function seg(id, set) {
 }
 
 // "who" spans two rows -- individuals above, groupings below. They are one
-// choice, not two, so selecting Amy has to release "girls (together)".
+// choice, not two, so selecting one adult has to release "children together".
 // Getting this wrong would let a tap record two identities at once, and a
 // mislabelled identity is worse than no label: it would place one person in
 // two rooms and quietly corrupt exactly the multi-object test this exists for.
