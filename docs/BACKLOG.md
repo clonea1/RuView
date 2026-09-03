@@ -9,6 +9,62 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## Full-suite sweep of every server branch: 2 of 13 were broken
+
+Two branches failed integration tests in a row, so every branch touching the
+sensing server, hardware or signal crates was re-verified with the **full**
+`cargo test`, not `cargo check` and not unit tests alone.
+
+**Result: 11 pass, 2 fail.** Both failures are now fixed.
+
+### `server-phase-diag` -- `--http-port` stopped existing
+
+All 7 `auth_wiring` integration tests failed. The extraction inserted the
+`phase_diagnostics` fields BETWEEN `#[arg(long, default_value = "8080")]` and
+the `http_port` field it belonged to, so clap applied that attribute to the new
+field and `http_port` became a **positional** argument. The server then rejected
+`--http-port` and never started.
+
+Same failure mode as the missing `CSI_MAGIC_V1`: a slice landing on the wrong
+side of an attribute/doc-comment boundary. Unit tests all passed; only an
+integration test that actually launches the binary caught it.
+
+Verified against pristine `origin/main` first (7 passed) so the failure was
+attributed to our branch rather than assumed pre-existing.
+
+### `server-csi-clock` -- a test pinning the behaviour the commit removes
+
+`mesh_timestamp_replaces_skewed_host_arrival_time` asserted the mesh clock
+REPLACES host arrival. The commit's whole purpose is to stop trusting the mesh
+clock, so the test was asserting the opposite of the change and upstream CI
+would have failed on the first run.
+
+Reading the code rather than just fixing the test confirmed the design is
+coherent and only the test was stale:
+
+  - **single frame** -- nothing to validate a lone mesh timestamp against, and
+    an unconverged node returns one that is briefly WRONG rather than absent,
+    so host arrival is the only defensible basis
+  - **cohort** -- the spread across nodes IS checkable, so mesh time is kept
+    and used only when it passes the guard interval
+
+`mesh_time_allows_fusion_despite_udp_arrival_skew` and
+`incoherent_mesh_timestamps_fall_back_to_host_arrival_for_the_cycle` both still
+pass and pin the cohort half. The stale test was rewritten to pin the new
+single-frame intent, with the reasoning in its doc comment.
+
+### `server-fusion` remains INCOMPLETE
+
+Does not compile: `missing field fusion_index in initializer of AppStateInner`.
+Already known and recorded; not a new finding.
+
+### Method
+
+`cargo check` gates the binary. Unit tests gate library logic. **Only an
+integration test that launches the built binary catches a CLI regression**, and
+that is precisely what a mis-sliced `#[arg]` produces. All three are now the
+standard for every branch.
+
 ## Round 3: two cut, one struck, and the UI onion
 
 ### Topic 26 `baseline-tuning` is OBSOLETE -- struck
