@@ -416,6 +416,53 @@ provisioning-tooling, disable-154-radio.
 **Lesson for the remaining work:** verify coverage by SYMBOL, never by
 filename. Three of the fourteen were invisible to a filename check.
 
+## Server branches complete so far
+
+- **`contrib/server-wire-v3`** -- parses v2/v3 headers. Foundation for links
+  and fusion. `cargo check` clean.
+- **`contrib/server-node-positions`** -- 1 file, 19 insertions, cherry-picked
+  cleanly with no hand-separation, `cargo check` clean. **The strongest PR
+  candidate in the entire set**: it fixes a live upstream bug that emits a
+  hardcoded `[2.0, 0.0, 1.5]` for every node regardless of `--node-positions`,
+  and the commit already cites upstream issues #228, #249 and the #301 "same
+  output regardless of position" symptom class. Small, obviously correct, and
+  someone over there has already reported the symptom.
+
+  Verified the fix is complete: four literals remain in `main.rs`, and the two
+  that are NOT wired to configured positions are `simulated_data_task` and
+  `sample_node` -- synthetic data and a test fixture, where a fallback is
+  correct.
+
+### UI ships with the API it consumes
+
+Established by mapping all 20 changed UI files to their endpoints:
+
+| API | UI |
+|---|---|
+| `links` | `mesh.html`, `LinkMeshPanel.js` |
+| `nodes` | `NodesTab.js` |
+| `config/room` | `RoomBuilderTab.js`, `illuminators.html`, `mesh3d.html` |
+| `diag/mark` | `mark.html`, `survey.html`, `tapper.html`, `walk.html` |
+| all of them | `world3d.html` -- ships last, consumes every server topic |
+
+**`diag/mark` is a topic that was missing from the list**: the ground-truth
+marking feature with four UI pages. Count is ~30 branches total, not 29.
+
+`app.js`, `index.html`, `router.js` and `style.css` are shared glue -- no API
+calls, but every UI feature touches them for tab registration and routing.
+They will conflict between stacked PRs; whoever merges second rebases.
+
+### Room Builder is ONE PR, not several
+
+Its five commits are increments of one feature (config API, then storeys and
+walls, then elevation, then the round-trip fix). Split, they ship a half-built
+model; and the API without the UI is unusable while the UI without the API does
+not work.
+
+**Trap:** commit `ba454775` ("model storeys and walls") also carries firmware
+`edge_processing.c/h` -- the adaptive-floor change riding on a room-geometry
+commit. Already extracted to `contrib/adaptive-floor`; must not travel twice.
+
 ## Server packaging: where it stands, and the wall hit (2026-09-03)
 
 ### Done
