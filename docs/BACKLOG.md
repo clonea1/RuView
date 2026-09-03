@@ -9,6 +9,57 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## RESUME HERE (state at 2026-09-03, end of session)
+
+`main` is clean and contains everything. Nothing is uncommitted.
+
+**The five existing `contrib/*` branches are STALE and must be re-cut.** They
+were cut before the de-personalisation (commits 1c5234e3, 32c00370) and before
+the upstream adoptions (16e37318, b8dc73df). `contrib/remote-config` still
+contains a hardcoded personal OneDrive path in config_push.py -- verified
+present in that branch. Do not submit any of them as they stand.
+
+**Re-cut eight, each one topic, each from `origin/main`, each built standalone
+before submitting** (that check is what caught the thermal.c and /calibrate
+collisions last time):
+
+    wifi-retry-watchdog   espnow-beacon-scaling   mesh-aligned-rate-gate
+    disable-unused-154-radio   remote-config
+    thermal   rollback   provisioning-tooling      <- these three are new
+
+Exclude from every branch: `board_index.json`, `provision_conf*.json`,
+`partitions_16mb.csv`, `sdkconfig.defaults.16mb`, `case/`.
+
+**Still to execute from the PR sweep** (verdicts agreed with Joe):
+- **1760** -- merge their chip-identity binding, keep our secrets-removal on
+  top. They still write the WiFi passphrase into the state file; we do not.
+  Conflicts in provision.py, so this is a real merge, not a cherry-pick.
+- **1593** -- BSSID telemetry for roam detection. Check its airtime cost first:
+  it emits a 32-byte packet per node every ~30 s plus on every roam, and the
+  2.4 GHz band was at 86% airtime.
+
+**Node 3 is on OLD firmware** (pre-16e37318). It is on USB at COM6 at desk
+height. The adopted fixes -- 12 KB httpd stack, 128 TX buffers, auth cleanup --
+are built but NOT flashed to any node.
+
+**The 128-TX-buffer change is UNVALIDATED.** Node 3's ENOMEM flood vanished when
+it moved from -84 to -70 dBm, so there is no symptom left to test against.
+**Node 7 is now at -85 dBm** and is the natural reproducer; alternatively put
+node 3 back on the floor for ten minutes. Do not claim the change works until
+it is measured against a real symptom.
+
+**The channel split has happened** (family room AP -> ch 1, sensors pinned to
+2nd floor on ch 11). First measurement: links 178 -> 147, transmitters 38 -> 33,
+fleet-wide illuminators 4 -> 2. RSSI moved hard both ways -- nodes 0/1/8 gained
+16-23 dB, nodes 2/7 lost 22-24 dB. **That is a single snapshot and has not been
+confirmed.** Re-measure after it settles. Before-snapshot saved at
+`scratchpad/links_before_chansplit.json`.
+
+**PR 1647 ratio-normalisation was tested and did not help** (RAW 9%, SUBTRACT
+27%, RATIO 18%, majority-class null 50%). n=11 of 28 marks -- underpowered, so
+this is "no evidence it helps", not "it does not help". A proper test needs a
+tapper session run concurrently with a capture, 40+ marks spread across rooms.
+
 ## Programme: repo, install, and upstream (Joe, 2026-09-02)
 
 Priorities below are by *dependency and risk*, not by size. Two items solve
