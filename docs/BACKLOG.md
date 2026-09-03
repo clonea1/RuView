@@ -9,6 +9,62 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## Round 5: three branches, and real MACs found in test fixtures
+
+**34 branches.** `ui-room-builder-footprint`, `server-emitter-triage`, plus the
+collapsed geometry work.
+
+### `e2a7a9e4` split three ways, cleanly by file
+
+| file | lines | topic |
+|---|---|---|
+| `RoomBuilderTab.js` | 388 | footprint editor -- storeys become polygons |
+| `world3d.html` | 649 | **topic 31**, which was hiding in here |
+| `illuminators.html` | 291 | emitter triage, topic 24 |
+
+Topic 31 was listed as a separate future item; it was inside this commit all
+along.
+
+### PRIVACY: real MACs and a neighbour's name in Rust test fixtures
+
+The emitter tests carried, in `main.rs`:
+
+  - three real MACs from this deployment, including the utility gateway
+  - a variable literally named `sue`, and a label reading `"Sue's house"` --
+    a NEIGHBOUR, not even a member of the household
+  - a label `"TEG-394 (basement)"`, naming a real device and its location
+
+All replaced with locally-administered example MACs (`02:00:00:00:00:0x`) and
+generic labels (`neighbour AP`, `utility gateway`). Also removed a set of
+`ap_mac` tests that belonged to a different topic AND carried another real MAC.
+
+**The lesson is where these were.** Every screen so far had been aimed at UI
+files, HTML and docs -- the places house data was expected to live. These were
+in Rust test fixtures, and they would have passed every check run to date.
+
+**Screen `.rs` fixtures too, not just UI and docs.** The pattern
+`([0-9a-f]{2}:){5}[0-9a-f]{2}` finds MACs in any language, and variable names
+deserve a look as much as string literals: `let mut sue = ...` is a person's
+name in code, and no MAC-shaped regex would ever have found it.
+
+### Emitter triage depends on two stacks
+
+`illuminators.html` calls `/api/v1/config/room` (room-builder) AND
+`/api/v1/links/inventory` (server-links) -- two independent stacks. They merge
+cleanly, so the branch carries an explicit merge commit rather than pretending
+one depends on the other.
+
+### Dead-wiring caught twice more, proactively
+
+`excluded_emitters` was declared and checked at ingestion while nothing
+populated it. Populated on config save -- and then found still missing at
+STARTUP, which would have meant a restart silently re-admitting every emitter
+already judged as moving. Both wired, with the reasoning in comments.
+
+This is the third instance of declare-check-never-populate. It is worth
+treating as a standard question rather than a lucky catch: **what writes to
+this, and when?**
+
 ## Do not introduce a thing and then fix it (Joe, 2026-09-03)
 
 I wrote the rule for the deadband -- *a fix to code that does not exist
