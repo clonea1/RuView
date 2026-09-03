@@ -9,6 +9,54 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## PEND FOR DECISION: topic 25 `centroid-position`
+
+**Not cut. Needs Joe's call before it is offered upstream.**
+
+Three topics collapse into one here. None of `node_doppler_weight`,
+`motion_weighted_centroid`, `attach_positions`, `BVP_HOP_SIZE` or `extract_bvp`
+exists upstream, so topic 25, onion #4 (`ap-position`) and onion #5
+(`bvp-deadband-fix`) are all parts of a single new subsystem, not a feature
+plus two fixes. **General rule: a fix to code that does not exist upstream is
+not a separate PR -- it is the initial implementation being correct.**
+
+### Why it is pended rather than cut
+
+The deadband bug is real and well-diagnosed: `BVP_ZERO_VELOCITY_DEADBAND_MPS`
+was 0.05 m/s while the default `BvpConfig` bin spacing is 0.0625 m/s
+(2.0 * 2 / 64), so the deadband was narrower than one bin. It excluded only the
+exact-zero bin, and the Hann-windowed STFT's DC leakage into adjacent bins
+counted as motion by construction -- the metric sat at ~2.5-2.6 of 3.0
+constantly, including while a sensor was covered by hand.
+
+But `b441d70a`'s own body records that after the fix `total_weight` "stayed
+elevated (still saturated, just less so) while the live dot rarely showed."
+So the fix improved a metric that still does not discriminate.
+
+### What is NOT in question
+
+The falsified work is correctly contained. The **bistatic phase-Doppler** tier
+is default-off, enforced by `bistatic_tier_is_disabled_by_default` and
+announced in the logs. `doppler_weighted_centroid` is amplitude-BVP based, so
+the phase falsification does not apply to it, and both centroids are already
+documented in-tree as "heuristics, not calibrated".
+
+### The decision
+
+Offering upstream a position tier our own logs describe as still saturated is
+the kind of claim this repository forbids without a `MEASURED` reproducer.
+Options:
+
+1. **Hold it.** Keep it local until the saturation is understood.
+2. **Submit the deadband fix only**, framed as a metric-correctness fix with
+   the bin-spacing arithmetic as the evidence, and say plainly that the metric
+   remains saturated afterwards.
+3. **Submit the whole tier** labelled CLAIMED, not MEASURED, with the
+   saturation stated as a known limitation.
+
+Option 2 is the honest minimum and the arithmetic stands on its own. It needs
+Joe's decision either way.
+
 ## Correction, and a silent bug the extraction introduced
 
 **Correction to the entry below.** It presents a five-way split as pending
