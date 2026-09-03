@@ -292,6 +292,45 @@ and only during a training session.
   airtime -- BLE is a separate radio from WiFi on the C6, but they share an
   antenna path, and the 2.4 GHz band is already at 86% airtime.
 
+## Two independent baselines, and neither knows about the other
+
+Asked 2026-09-03: is the "learn the room for N seconds after plug-in" logic
+firmware or server? **Both, separately, with different constants.**
+
+| | where | warm-up | rule |
+|---|---|---|---|
+| firmware | `edge_processing.c` | `EDGE_CALIB_FRAMES = 1200` (~60 s at 20 Hz) | threshold = `mean + 3*sigma` of ambient |
+| server | `main.rs` | `BASELINE_WARMUP = 50` frames / `NODE_BASELINE_WARMUP_SECS = 5.0` | EMA `alpha = 0.003`, subtracted at `BASELINE_SUBTRACTION_FRACTION = 0.85` |
+
+A third timescale exists and is easy to confuse with these: the adaptive
+controller's loops, `fast=200ms med=1000ms slow=30000ms` (the 30 s in the boot
+log).
+
+**The boot-calibration bug is fixed in our tree, and took two attempts.** The
+firmware comment names it exactly: the old scheme averaged the first
+EDGE_CALIB_FRAMES and latched, so a node "is calibrating in the seconds right
+after a human walked over and plugged it in". History: `53115fb3` (track the
+quiet floor continuously) -> `4c9a22ae` (revert) -> `47731d02` (actually track
+the quiet floor continuously). Per `reference_espectre_lessons`, ESPectre still
+ships the original version of this bug.
+
+**Why it still matters.** A node whose floor latched high under-reports
+presence, and the server cannot tell -- it applies its own baseline to numbers
+that were already attenuated on the node. Everything downstream inherits that:
+per-link motion, RTI, and anything the adaptive model was trained on. The model
+is 48.6% accurate on 4 classes and was trained on a house that no longer exists
+(`project_overnight_recorder_and_model_staleness`); a mis-latched node floor is
+one candidate contributor that has never been ruled out.
+
+**Cheap check, no walk or tapper needed.** `POST /calibrate` re-seeds a node's
+floor on demand. Compare a node's motion statistics either side of a
+recalibration: if the floor was sitting too high, the post-recalibration
+distribution shifts. Runs against nodes already up, costs minutes.
+
+Related open item: the server's baseline is SUBTRACTIVE, which is the axis PR
+1647 questions -- see the ratio-vs-subtract entry. Note the firmware uses
+`mean + 3*sigma`, a third formulation again.
+
 ## Solver ignores position uncertainty
 
 - **`uncertainty_m` is stored, validated, round-tripped -- and dropped.**
