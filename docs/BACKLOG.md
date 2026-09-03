@@ -416,6 +416,57 @@ provisioning-tooling, disable-154-radio.
 **Lesson for the remaining work:** verify coverage by SYMBOL, never by
 filename. Three of the fourteen were invisible to a filename check.
 
+## Contribution branches: 9 of 14 packaged (2026-09-03)
+
+All nine verified building standalone against `origin/main` in the ESP-IDF v5.4
+container. Each is one topic, applied to upstream's code as it stands.
+
+| branch | files | stacked on |
+|---|---|---|
+| `contrib/disable-unused-154-radio` | 1 | - |
+| `contrib/mesh-aligned-rate-gate` | 1 | - |
+| `contrib/adaptive-floor` | 2 | - |
+| `contrib/subcarrier-grids-256` | 1 | - |
+| `contrib/thermal` | 6 | - |
+| `contrib/remote-config` | 10 | - |
+| `contrib/provisioning-tooling` | 5 | - |
+| `contrib/rollback` | 10 | `remote-config` |
+| `contrib/wifi-retry-watchdog` | 11 | `thermal` |
+
+Stacked branches must SAY SO in the PR description; they will not apply alone.
+
+### The five still to cut
+
+- **`csi-wire-v3`** (commit `857cc179`). Conflicts in `csi_collector.c/h` AND
+  `v2/.../main.rs`. The server conflict is inherent, not a mistake -- a wire
+  format needs both ends, so this branch legitimately spans firmware and
+  server. Biggest of the five. Highest value: rx_seq is what makes cross-node
+  frame pairing possible, and upstream is still on v2.
+- **`espnow-recovery`** and **`espnow-beacon-scaling`**. Both live in
+  `c6_sync_espnow.c`, and commit `3a6018a6` contains BOTH ("stop the ESP-NOW
+  queue wedge and size the beacon to the gate"). Needs hand-separation like
+  `adaptive-floor` got: stall detection/recovery is one concern, beacon period
+  derivation is another.
+- **`vitals-slots`** (`EDGE_VITALS_SLOTS_MAGIC`, `edge_processing.c/h`).
+- **`diagnostics-census`** (`diag_census_*`, `diag_survey_visible_aps`;
+  `csi_collector.c` + `main.c`). Opt-in and off by default, so lowest value of
+  the five.
+
+### Method that worked
+
+Every conflict so far was an unrelated topic riding along in a shared file --
+`CSI_SEQ_DIAG` into thermal, `thermal.c` into remote-config,
+`edge_processing.h` into rollback, `CSI_GATE_MESH_ALIGNED` into the watchdog,
+enclosure STLs into provisioning. Not one was a real disagreement about the
+same code. Resolve by keeping only the hunk belonging to the branch's topic,
+then verify by grepping the branch for the OTHER topic's marker.
+
+Two traps hit while doing this, both worth avoiding on the remaining five:
+`git add <directory>` on a branch whose `.gitignore` has been reduced will
+evaluate build trees; and `git reset` to undo it silently unstages real work
+(it unstaged the provision.py secrets removal, which was only noticed by
+checking the tree rather than trusting the commit).
+
 ## Nice-to-offer, low priority (Joe, 2026-09-03)
 
 Neither is worth holding up the fourteen contribution topics.
