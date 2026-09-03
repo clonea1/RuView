@@ -17,8 +17,8 @@ So this does the whole sequence and then VERIFIES it off the boot log rather
 than trusting that each step worked. A board that does not print the expected
 lines is reported as not ready.
 
-    python bringup.py --net silver --tdm-total 9
-    python bringup.py --net silver --tdm-total 9 --port COM7   # just one
+    python bringup.py --net home --tdm-total 9
+    python bringup.py --net home --tdm-total 9 --port COM7   # just one
 """
 
 import argparse

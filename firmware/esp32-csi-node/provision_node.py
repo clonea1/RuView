@@ -62,9 +62,9 @@ def load_conf(net=None):
         sys.exit(
             "no %s.\n\nCreate it with:\n"
             '  {\n'
-            '    "ssid": "SilverESP",\n'
-            '    "password_file": "D:\\\\path\\\\to\\\\SilverESP.txt",\n'
-            '    "target_ip": "192.168.1.66",\n'
+            '    "ssid": "YourNetwork",\n'
+            '    "password_file": "D:\\\\path\\\\to\\\\wifi-password.txt",\n'
+            '    "target_ip": "192.168.1.10",\n'
             '    "ota_psk_file": "D:\\\\path\\\\to\\\\ota_psk.txt",\n'
             '    "chip": "esp32c6",\n'
             '    "edge_tier": 2\n'
@@ -165,7 +165,7 @@ def main():
                     help="override the id from board_index.json")
     ap.add_argument("--net",
                     help="network profile name; reads provision_conf_<name>.json "
-                         "instead of provision_conf.json (e.g. --net silver)")
+                         "instead of provision_conf.json (e.g. --net home)")
     ap.add_argument("--no-auto-reset", action="store_true",
                     help="board is ALREADY in the bootloader (BOOT held, "
                          "RESET tapped). Some units have a non-functional "

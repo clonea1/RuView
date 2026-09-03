@@ -1,23 +1,23 @@
-# Fleet layout: 16 MB flash, two 4 MB OTA slots.
+# ESP32-C6 CSI Node - 16MB Flash SDK Configuration
+# For boards with 16MB flash (e.g. ESP32-C6 DevKitC-1 N16).
 #
-# The nine-node fleet runs this, NOT the 4 MB default in
-# sdkconfig.defaults.esp32c6 (kept as-is because upstream C6 devkits are
-# commonly 4 MB and must not be silently repartitioned).
+# Layered on top of sdkconfig.defaults.esp32c6, which keeps a 4MB layout
+# because 4MB C6 devkits are the common case and must not be silently
+# repartitioned by inheriting this.
 #
-# Apply with:
+# Build:
 #   idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32c6;sdkconfig.defaults.16mb" build
 #
-# Confirm before flashing: every node's /ota/status must report
-# max_size 4194304. A 4 MB table written over a 16 MB node relocates NVS and
-# destroys its provisioning.
+# Confirm before flashing a deployed node: /ota/status must report
+# max_size 4194304. Writing a smaller table over a 16MB node relocates NVS
+# and destroys its provisioning.
+
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_16mb.csv"
 
-# Firmware rollback. A freshly-OTA'd image boots PENDING_VERIFY and must
-# confirm itself (see ota_rollback_* in ota_update.c) or the bootloader
-# reverts to the previous slot on the next boot. Without this a bad image
-# means a boot loop and a USB cable; config already self-heals, this closes
-# the same hole for firmware.
+# Firmware rollback: an OTA'd image boots PENDING_VERIFY and must confirm
+# itself, or the bootloader reverts on the next boot. See ota_rollback_* in
+# ota_update.c for when confirmation happens and why.
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
