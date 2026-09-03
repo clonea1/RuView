@@ -416,6 +416,48 @@ provisioning-tooling, disable-154-radio.
 **Lesson for the remaining work:** verify coverage by SYMBOL, never by
 filename. Three of the fourteen were invisible to a filename check.
 
+## Server packaging: where it stands, and the wall hit (2026-09-03)
+
+### Done
+
+- **`contrib/server-wire-v3`** -- COMPLETE, `cargo check` clean, one file.
+  Named constants for v1/v2/v3, magic dispatch, `source_mac` and `rx_seq` as
+  `Option` on `Esp32Frame`. This is the receiver half and the prerequisite for
+  everything else. Ships first, before any firmware emits v2/v3.
+
+- **`contrib/server-fusion`** -- INCOMPLETE by design, says so in its own commit
+  message. `fusion.rs` plus six of seven wiring points; the ingestion is absent
+  because it needs the parser above.
+
+### The wall: the endpoint layer is interdependent
+
+`links.rs` itself is self-contained, but `links_endpoint` in `main.rs` has grown
+to call `rti_from_links()` (RTI topic), read `node_macs` (node-identity topic)
+and call `attribute_transmitter()` (emitter-attribution topic). Lifting the
+endpoint pulls in three other topics; lifting the module without the endpoint
+produces something that compiles and is invisible.
+
+**This differs from the firmware**, where every conflict was an unrelated topic
+merely sharing a file and could be separated by dropping hunks. Here the
+topics genuinely call each other. Splitting them means either:
+
+  a. shipping them as ONE larger PR (per-link CSI + RTI + node identity +
+     emitter attribution), which is honest but big; or
+  b. writing reduced endpoints per branch that do not call across topics,
+     which means writing code that exists in no commit and was never run.
+
+**(a) is probably right** -- these features genuinely arrived together and use
+each other. Forcing four PRs out of them would produce four things nobody ran.
+
+### Remaining server topics: 12
+
+Of these, `rti`, `node identity`, `emitter triage` and `per-link CSI` are the
+interdependent cluster above. The rest -- baseline tuning, classification and
+smoothing, CSI timestamp clock, broadcast rate limiting, node health telemetry,
+room-builder config API, centroid position, node management UI -- are
+`main.rs`-only and have no new file to anchor on, so each needs the same
+hand-lift treatment with no guarantee they separate any better.
+
 ## Server packaging: method proven, one structural finding
 
 **Cherry-picking does not work here.** `main.rs` is 15k lines with changes from
