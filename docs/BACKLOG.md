@@ -9,6 +9,54 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## Correction, and a silent bug the extraction introduced
+
+**Correction to the entry below.** It presents a five-way split as pending
+work. Three of the five were already cut: `contrib/server-rti`,
+`contrib/server-phase-diag` and `contrib/signal-signed-bvp` exist and hold
+their modules. Only `server-links` itself needed building. The split finding
+stands; the remaining-effort framing did not.
+
+`contrib/server-links` was a literal duplicate of `contrib/server-wire-v3` --
+the same single commit, no `links.rs` -- which is why it misrepresented itself.
+
+**The dependency is real and one-directional.** `noise_floor` exists upstream
+(wire v1, byte 17) but `source_mac` does not; it arrives with wire v2. There is
+no such thing as a link until a transmitter MAC is parsed, so `server-links`
+stacks on `server-wire-v3`. The "empty shell" was the foundation.
+
+### A dead match arm, found by compiling the branch in isolation
+
+`contrib/server-wire-v3` did not carry `const CSI_MAGIC_V1`. The extraction
+sliced mid-doc-comment and took the V2 and V3 constants but not V1, leaving an
+orphaned comment line.
+
+The parser dispatches `match magic { CSI_MAGIC_V1 => .., CSI_MAGIC_V2 => .. }`.
+Those are constant patterns **only while the constants are in scope**. With V1
+absent the arm degrades into an irrefutable BINDING that matches every value:
+the v2 and v3 arms become dead code, `source_mac` is `None` for every frame,
+and the whole links feature is inert. rustc reports `unreachable_pattern` -- a
+warning, not an error.
+
+The branch compiled, all 531 tests passed, and the feature would have done
+nothing. The tests passed because **the wire parser had no test at all**; that
+absence is why the bug was silent.
+
+Fixed at the root (V1 restored, wire commit amended, `server-links` rebased)
+and pinned with `csi_wire_v2_v3_tests`: v1 carries no identity, v2 yields the
+MAC, v3 yields MAC and rx_seq, an unknown magic is still rejected.
+
+**Negative control run, because a regression test that does not fail is
+worthless.** Re-breaking the arm fails three of the four with the diagnostic
+naming the cause; deleting the constant now fails the *build*, since the test
+module references it by name. Either way the failure is loud.
+
+**Method note.** File-level coverage lied twice before. This is a third mode:
+the content was present, compiled and tested green, and was still functionally
+dead. Only building each branch **in isolation** exposed it -- on `main` the
+constant exists a few thousand lines away and everything works. Every extracted
+branch needs its own compile, not a diff review.
+
 ## e5636cd9 is the largest bucket in the repository -- it splits four ways
 
 Sizing the links topic for packaging found that its base commit,
