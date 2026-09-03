@@ -62,15 +62,19 @@ def load_conf(net=None):
         sys.exit(
             "no %s.\n\nCreate it with:\n"
             '  {\n'
-            '    "ssid": "YourNetwork",\n'
-            '    "password_file": "D:\\\\path\\\\to\\\\wifi-password.txt",\n'
+            '    "ssid": "thisismyssid",\n'
+            '    "password_file": "D:\\\\secrets\\\\thisismyssid.txt",\n'
             '    "target_ip": "192.168.1.10",\n'
-            '    "ota_psk_file": "D:\\\\path\\\\to\\\\ota_psk.txt",\n'
+            '    "ota_psk_file": "D:\\\\secrets\\\\ota_psk.txt",\n'
             '    "chip": "esp32c6",\n'
             '    "edge_tier": 2\n'
             '  }\n\n'
-            "password_file holds the passphrase and nothing else. Keep it "
-            "outside this repo." % CONF)
+            "password_file holds ONLY the passphrase, on one line. A file\n"
+            "containing just:\n\n"
+            "    password123!\n\n"
+            "Keep it outside this repo, and keep it out of any backup that\n"
+            "syncs somewhere shared. This JSON references paths, never\n"
+            "secrets, so it is safe to keep beside the scripts." % CONF)
     with open(CONF, "r", encoding="utf-8") as fh:
         return json.load(fh)
 
