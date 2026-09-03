@@ -318,7 +318,7 @@ static esp_err_t recv_body(httpd_req_t *req, char **out)
 
 static esp_err_t config_get_handler(httpd_req_t *req)
 {
-    if (!ota_auth_check(req)) {
+    if (!ota_check_auth(req)) {
         httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
                             "Authentication required. Use: Authorization: Bearer <psk>");
         return ESP_FAIL;
@@ -358,7 +358,7 @@ static void reboot_soon(void *arg)
 
 static esp_err_t config_post_handler(httpd_req_t *req)
 {
-    if (!ota_auth_check(req)) {
+    if (!ota_check_auth(req)) {
         ESP_LOGW(TAG, "config write rejected: authentication failed");
         httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
                             "Authentication required. Use: Authorization: Bearer <psk>");

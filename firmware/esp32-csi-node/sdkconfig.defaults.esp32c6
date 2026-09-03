@@ -96,3 +96,16 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=160
 # both transports and the 15.4 branch is #ifdef-gated on this symbol, so the
 # working ESP-NOW path keeps setting it.
 CONFIG_C6_TIMESYNC_ENABLE=n
+
+# ── Wi-Fi dynamic TX buffers ──────────────────────────────────────────────
+# Upstream PR #1142 raised this to 128 in sdkconfig.defaults as the fix for
+# the sendto-ENOMEM tight loop (#1135), then deliberately pinned the C6 back
+# to 64 because the fix was hardware-verified on the S3 only, noting:
+# "Re-tune here if the C6 ever needs it."
+#
+# The C6 needs it. Nine C6 nodes on a 2.4 GHz channel measured at 86% airtime
+# (2026-09-02) emit continuous "sendto ENOMEM -- backing off", the fleet frame
+# rate swings between 10 and 55 fps, and a node at -84 dBm could not complete
+# a 1 MB OTA at all. Layered here rather than in the base so only the C6
+# changes, and this file is loaded after sdkconfig.defaults.
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=128

@@ -12,7 +12,7 @@
 #include <stdbool.h>
 
 #include "esp_err.h"
-#include "esp_http_server.h"  /* httpd_req_t, for ota_auth_check() */
+#include "esp_http_server.h"  /* httpd_req_t, for ota_check_auth() */
 
 /**
  * Initialize the OTA update HTTP server.
@@ -40,8 +40,11 @@ esp_err_t ota_update_init_ex(void **out_server);
  * Shared with config_api.c so remote configuration is gated by exactly the
  * same secret and the same comparison as firmware upload -- a second
  * implementation would be a second place for the check to rot.
+ *
+ * Exposed by dropping `static` rather than by adding a wrapper, following
+ * upstream PR #1683 (closed unmerged), which is the tidier of the two.
  */
-bool ota_auth_check(httpd_req_t *req);
+bool ota_check_auth(httpd_req_t *req);
 
 /**
  * Inspect the OTA image state at boot.
