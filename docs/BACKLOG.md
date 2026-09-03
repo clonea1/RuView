@@ -330,6 +330,92 @@ output. That layering is real and untested, and it is the thing to control for
 in any retest of the ratio-vs-subtract question -- not a conflict between three
 rival formulations.
 
+## Contribution branches: eleven topics, not eight
+
+Cut fresh from `origin/main` on 2026-09-03 after the earlier five were found
+stale. Joe caught two topics missing from the list and a third branch acting as
+a bucket; the audit below is content-level, because **file-level coverage lies**
+-- it hid the rollback gap earlier the same evening (`ota_update.c` appeared
+"covered" while the rollback commit was in no branch at all).
+
+### Cut and verified
+
+| branch | state |
+|---|---|
+| `contrib/disable-unused-154-radio` | clean, 1 file |
+| `contrib/mesh-aligned-rate-gate` | clean, 1 file |
+| `contrib/thermal` | clean, 6 files, **builds standalone** |
+| `contrib/adaptive-floor` | hand-separated, build pending |
+
+### Cut but conflicted -- need individual resolution
+
+| branch | conflicts in |
+|---|---|
+| `contrib/wifi-retry-watchdog` | `Kconfig.projbuild` (stacks on `contrib/thermal`, it edits `thermal.c`) |
+| `contrib/remote-config` | `CMakeLists.txt`, `ota_update.c` |
+| `contrib/rollback` | `main.c`, `ota_update.c/h`, `sdkconfig.defaults.16mb` (needs `remote-config` beneath it) |
+| `contrib/provisioning-tooling` | `.gitignore` -- which should not travel with it at all |
+
+### MUST BE SPLIT -- `contrib/espnow-beacon-scaling` is a bucket
+
+It carries three unrelated topics. Verified content-level: none of the three
+exists upstream.
+
+1. **ESP-NOW beacon scaling** -- the actual subject of the branch.
+2. **256-bin HE20 subcarrier grids** (`EDGE_MAX_SUBCARRIERS 256`, C6/C5).
+   Possibly the most broadly useful contribution in the whole set: upstream
+   caps at 128, which silently truncates HE20 CSI on any C6 or C5. Anyone
+   running this firmware on newer silicon loses half their subcarriers and has
+   no indication of it.
+3. **Vitals slots packet** (`EDGE_VITALS_SLOTS_MAGIC 0xC5110009`).
+
+### Deliberately excluded from every branch
+
+`board_index.json`, `provision_conf*.json`, `partitions_16mb.csv`,
+`sdkconfig.defaults.16mb`, `case/`.
+
+### Method note
+
+The adaptive-floor branch could not be cherry-picked. Its history is
+`53115fb3` (introduce) -> `4c9a22ae` (revert) -> re-introduced inside
+`ba454775`, a commit titled "model storeys and walls" -- a firmware fix that
+rode in on a room-geometry commit. It was rebuilt by hand from upstream's file
+plus only the floor hunks, leaving the 256-bin and vitals changes in the same
+file untouched. Expect the same for the other tangled ones.
+
+### Full symbol audit, 2026-09-03 -- fourteen topics, not eight
+
+Joe asked whether a line-level audit was needed. It was. Everything before this
+was file-level coverage plus spot-checks, and file-level coverage **lies**: it
+reported  "covered" while three distinct topics hid inside
+it, and reported  covered while the rollback commit sat in no
+branch at all. Joe found two missing topics by memory before the audit found
+three more.
+
+Method: enumerate every  and function signature added to
+ between  and . 71 new
+symbols, 14 new files.
+
+Topics found that were NOT on the branch list:
+
+- **ESP-NOW recovery** -- , ,
+  , . A stall detector and
+  recovery path, wrongly lumped in with beacon scaling; they are separate
+  concerns sharing a file.
+- **CSI wire v3** -- , ,
+  . Carries the 802.11 rx_seq to the server, which is what
+  makes cross-node frame pairing possible at all. Upstream is still on v2.
+- **Diagnostics / census** -- , ,
+  , . Opt-in, off by default.
+
+Full topic list (14): beacon-scaling, espnow-recovery, csi-wire-v3,
+diagnostics-census, adaptive-floor, subcarrier-grids-256, vitals-slots,
+led-runtime-control, remote-config, rollback, thermal, wifi-retry-watchdog,
+provisioning-tooling, disable-154-radio.
+
+**Lesson for the remaining work:** verify coverage by SYMBOL, never by
+filename. Three of the fourteen were invisible to a filename check.
+
 ## Solver ignores position uncertainty
 
 - **`uncertainty_m` is stored, validated, round-tripped -- and dropped.**
