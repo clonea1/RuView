@@ -416,6 +416,37 @@ provisioning-tooling, disable-154-radio.
 **Lesson for the remaining work:** verify coverage by SYMBOL, never by
 filename. Three of the fourteen were invisible to a filename check.
 
+## Server packaging: method proven, one structural finding
+
+**Cherry-picking does not work here.** `main.rs` is 15k lines with changes from
+most of the fourteen topics interleaved, so every pick conflicts there -- even
+when only the server half of a commit is wanted.
+
+**The method that does work** (as used for `contrib/adaptive-floor`): a new
+module is a new file, so `git checkout main -- <module>.rs` is clean. Then
+hand-wire its `main.rs` touchpoints, which are few and greppable. For
+`fusion.rs` there were seven: the `mod` declaration, an `AppStateInner` field,
+two constructors, two endpoint fns, two routes, and the ingestion call.
+
+**Structural finding: `fusion.rs` cannot ship alone.** Its ingestion is gated on
+`frame.rx_seq`, which exists only once the wire-v3 parser is present. The wire
+work is a THREE-part set:
+
+    contrib/csi-wire-v3     firmware: emit rx_seq on the wire
+    (server) v3 parser      server: parse it into frame.rx_seq   <- not yet cut
+    contrib/server-fusion   server: pair frames on (tx, rx_seq)
+
+Sequenced receiver-before-sender: parser, then fusion, then firmware emits.
+
+**`contrib/server-fusion` exists but is INCOMPLETE and marked so in its own
+commit message** -- six of seven wiring points, ingestion deliberately absent.
+Merged alone its endpoints compile and always return empty. Do not submit until
+the parser topic is cut.
+
+**Remaining server topics to package: 13.** The four new modules should each go
+the way fusion did. `main.rs`-only topics (baseline tuning, classification,
+clock, broadcast rate) have no new file to anchor on and will be harder.
+
 ## PENDING YOUR DECISION -- server PRs that overlap our work
 
 None of these block packaging; they change what we adopt, not what we cut.
