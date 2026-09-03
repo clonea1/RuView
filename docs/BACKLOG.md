@@ -416,6 +416,23 @@ provisioning-tooling, disable-154-radio.
 **Lesson for the remaining work:** verify coverage by SYMBOL, never by
 filename. Three of the fourteen were invisible to a filename check.
 
+## Nice-to-offer, low priority (Joe, 2026-09-03)
+
+Neither is worth holding up the fourteen contribution topics.
+
+- **16 MB partition layout.** Already written in upstream's own style
+  (`partitions_16mb.csv`, `sdkconfig.defaults.16mb`), documenting which boards
+  it is for and why the 4 MB and display layouts do not substitute. Offer as an
+  additional option alongside their existing ones, never as a default -- a
+  smaller table written over a deployed 16 MB node relocates NVS and destroys
+  its provisioning.
+
+- **Enclosure.** Offer the two print files for this specific board and nothing
+  else -- no parametric generator, no build system. **Attribute the original
+  maker**: the shipped case derives from a downloaded STEP model, not from
+  `case/make_case.py`, which is superseded and unprintable. Confirm the
+  attribution before publishing anything.
+
 ## Solver ignores position uncertainty
 
 - **`uncertainty_m` is stored, validated, round-tripped -- and dropped.**
