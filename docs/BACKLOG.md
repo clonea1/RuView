@@ -416,6 +416,46 @@ provisioning-tooling, disable-154-radio.
 **Lesson for the remaining work:** verify coverage by SYMBOL, never by
 filename. Three of the fourteen were invisible to a filename check.
 
+## PENDING YOUR DECISION -- server PRs that overlap our work
+
+None of these block packaging; they change what we adopt, not what we cut.
+
+| PR | what it does | merges | the question |
+|---|---|---|---|
+| **1726** | fuse only coherent frame cohorts | CLEAN | We wrote `fusion.rs` (549 lines) for cross-node pairing. Theirs works on `multistatic_bridge.rs`. Do these compose, or are they two answers to one problem? |
+| **1774** | expose multistatic cohort quality | CLEAN | Adds a quality metric to the same bridge. Adopt alongside ours, or is our per-link quality enough? |
+| **1529** | ESP32 node lifecycle + calibration persistence | conflicts `main.rs`, `multistatic.rs` | Overlaps our calibration work. Theirs persists calibration; ours tracks a leaky floor continuously. Possibly complementary, possibly redundant. |
+| **1717** | live-CSI presence/motion tuning | conflicts `main.rs` | Directly overlaps our presence path and the baseline-subtraction tuning (0.7 -> 0.95 -> 0.85). |
+| **1568** | fail closed on weak adaptive models | conflicts `main.rs`, `engine_bridge.rs` | Bears on the 48.6%-accuracy model trained on a house that no longer exists. Might be exactly the guard that situation needs. |
+| **1728** | wire the ADR-302 OOD gate into the live path | conflicts `main.rs` | Out-of-distribution gating. Unknown whether it duplicates our confidence work. |
+
+Two are free to take (1726, 1774 merge clean). Four need reading before a
+decision, and 1568 is the one most likely to matter given the model staleness
+already on record.
+
+## Server topics, for packaging (36 commits -> ~14 topics)
+
+| topic | commits |
+|---|---|
+| room-builder config API | `f5373a30` `a3b99077` `ba454775` `d758d9ae` `3ff89106` |
+| per-link CSI (`links.rs`) | `e5636cd9` `21036fd8` `7fb85444` `80c62207` `2a035fde` `00fb117e` |
+| cross-node fusion (`fusion.rs`) | `38b889ee` `bce00eb4` |
+| RTI (`rti.rs`) | `9660c094` `66330ff9` `6c5ed284` |
+| emitter triage | `cf50ae1a` |
+| centroid position estimate | `9526f363` `c811a6b9` `7037050b` `b441d70a` |
+| baseline-subtraction tuning | `7b63ee1e` `664541f1` |
+| classification + smoothing | `27c6309d` `d29d9fb0` `bfa78710` |
+| CSI timestamp clock | `d4d4615e` |
+| node identity + address | `d34d76c5` `952e9465` `bb776437` |
+| broadcast rate limiting | `23a54920` |
+| node health telemetry | `474733d1` |
+| node management UI + proxy | `85ba2092` |
+| phase diagnostics (`phase_diag.rs`) | (within `e5636cd9`) |
+
+The four new modules are one-topic-per-file, so they should package far more
+easily than firmware did. `main.rs` is the hard part: 15k lines with changes
+from most of these topics interleaved.
+
 ## Server PR sweep (2026-09-03)
 
 Same method as firmware: fetch every `refs/pull/*/head`, drop anything already
