@@ -70,14 +70,32 @@ roster UI" is two. Two of the 13 (`195f49ea`, `bef4f2ae`) depend on the
 None of the 13 touches a `.json` -- the house data lives in separate
 `data(room):` commits which must never travel. Verified, not assumed.
 
-### Verification gap, stated plainly
+### Verification gap CLOSED -- node installed
 
-**`node` is not installed on this machine**, so the UI JavaScript could not be
-syntax-checked. (It is also why the SessionEnd hook errors with
-`node: command not found`.) What was done instead: confirmed no dangling
-imports, confirmed brace/paren/bracket balance, and kept each file either
-verbatim from a commit already running in the browser or `origin/main` plus two
-reviewed lines. That is weaker than a parse and is recorded as such.
+Node was absent from this machine entirely, which blocked syntax-checking the
+UI JavaScript and was also the cause of the `SessionEnd` hook's
+`node: command not found`.
+
+Installed **Node v24.20.0 LTS, user scope, no elevation**:
+
+  - official portable zip from `nodejs.org/dist`, SHA256 verified against that
+    release's `SHASUMS256.txt` before extraction
+  - extracted to `%LOCALAPPDATA%\Programs
+odejs`
+  - added to the **user** PATH only; machine PATH untouched
+  - reversible by deleting that one directory and the PATH entry
+
+Note: already-running shells inherit the pre-change environment, so a session
+started before the install needs `export PATH=...` per invocation. New terminals
+and new sessions pick it up automatically.
+
+All 8 JavaScript files across `ui-no-fabricated-data` and
+`server-node-management` now **parse as ES modules** (`node --check`). The
+earlier balance-and-imports check has been replaced by a real parse.
+
+This also makes the harness validation matrix in CLAUDE.md runnable for the
+first time (`npm ci --ignore-scripts`, `npm test`, `brain:verify`,
+`manifest:verify`), which had been silently un-runnable.
 
 **Now 27 branches cut. Remaining: 21 (needs its own pass), 22, 24, 27, 31, and
 25 pended.**
