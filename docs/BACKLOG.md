@@ -9,6 +9,58 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## Do not introduce a thing and then fix it (Joe, 2026-09-03)
+
+I wrote the rule for the deadband -- *a fix to code that does not exist
+upstream is not a separate PR, it is the initial implementation being correct*
+-- and then immediately broke it building the Room Builder stack, which
+introduced the feature and then fixed it. Joe caught it.
+
+Upstream has never seen the Room Builder, so a commit reading "the round trip
+loses storey data" describes a bug that, from their side, never existed. It
+also reads badly: it tells a reviewer the thing being handed to them was
+broken.
+
+### Audit of all 32 branches
+
+Six had a `fix` commit in a stack. **Three were legitimate** -- verified by
+checking that upstream actually has the bug:
+
+| branch | fixes | upstream evidence |
+|---|---|---|
+| `wifi-retry-watchdog` | WiFi gives up permanently | `main.c:62` `#define MAX_RETRY 10` |
+| `rollback` | httpd stack too small for OTA validation | `HTTPD_DEFAULT_CONFIG()` in their `ota_update.c` |
+| `ui-room-builder` | hardcoded node position | `[2.0, 0.0, 1.5]` in three places |
+
+Each of those sits at the BOTTOM of its stack, which is the right order: fix
+the upstream bug, then build on it.
+
+**Three were self-fixes and were collapsed:**
+
+  - `ui-room-builder-geometry` -- 4 commits into 1. Storeys, walls and AP
+    placement introduced already serving every persisted field.
+  - `remote-config` -- 3 commits into 1, folding in both a self-fix and a chore
+    correcting its own default. `rollback` rebased onto it.
+  - `server-doppler-deadband` -- retitled from `fix` to `feat`. The commit
+    introduces `node_doppler_sample`, so it cannot be fixing it. The bin-vs-m/s
+    arithmetic is kept as design rationale rather than bug history, since it is
+    the part a reviewer should check.
+
+### Squashes verified to preserve content
+
+History rewriting must not change what ships:
+
+  - `remote-config`: tree hash IDENTICAL before and after (`fcba125d`).
+  - `ui-room-builder-geometry`: 136 files differ, ALL of them under `v2/data/`
+    -- exactly the CSI captures removed by the earlier correction, and nothing
+    else.
+
+### The tell
+
+A `fix` commit whose subject names something introduced in the same stack. Ask
+of every one: **does upstream have this bug?** If not, it is not a fix, and the
+introduction should simply be correct.
+
 ## HAZARD: contribution branches inherit a WEAKER .gitignore
 
 **Near miss, 2026-09-03.** A `git add -A ui v2` on a contribution branch staged
