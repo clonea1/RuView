@@ -9,6 +9,68 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## THE COMPLETE PR TABLE (2026-09-03)
+
+Status: DONE = cut and build-verified. PARTIAL = cut, known incomplete.
+TODO = identified, not cut.
+
+### Firmware -- 14 of 14 DONE, every one built standalone in ESP-IDF v5.4
+
+| # | branch | files | stacked on | what it fixes |
+|---|---|---|---|---|
+| 1 | `disable-unused-154-radio` | 1 | - | 802.15.4 radio started but never received |
+| 2 | `mesh-aligned-rate-gate` | 1 | - | nodes accept disjoint frames; 72% heard vs 25% paired |
+| 3 | `subcarrier-grids-256` | 1 | - | edge pipeline dies silently on C6/C5 (HE20 = 256 bins) |
+| 4 | `adaptive-floor` | 2 | - | boot calibration latches a contaminated floor forever |
+| 5 | `espnow-recovery` | 2 | - | ESP-NOW wedges permanently on a lost send callback |
+| 6 | `vitals-slots` | 2 | - | per-slot vitals discarded at the wire |
+| 7 | `diagnostics-census` | 2 | - | opt-in CSI census + AP survey |
+| 8 | `espnow-beacon-scaling` | 4 | - | fixed beacon period floods a nine-node fleet |
+| 9 | `provisioning-tooling` | 5 | - | WiFi passphrase written to disk in cleartext |
+| 10 | `thermal` | 6 | - | no thermal monitoring or radio throttling at all |
+| 11 | `wifi-retry-watchdog` | 8 | thermal | WiFi gives up permanently; no uplink watchdog |
+| 12 | `csi-wire-v3` | 8 | thermal | no transmitter or transmission identity on the wire |
+| 13 | `remote-config` | 10 | - | config changes require USB |
+| 14 | `rollback` | 10 | remote-config | a bad OTA means a boot loop and a cable |
+
+### Server -- 2 DONE, 1 PARTIAL, ~13 TODO
+
+| # | branch | state | stacked on | what it is |
+|---|---|---|---|---|
+| 15 | `server-wire-v3` | DONE | - | parse v2/v3 headers. Receiver half; ships before firmware emits |
+| 16 | `server-node-positions` | DONE | - | **best candidate**: hardcoded `[2.0,0.0,1.5]` for every node. Upstream issues #228/#249/#301 |
+| 17 | `server-fusion` | PARTIAL | wire-v3 | cross-node pairing on (tx, rx_seq). Ingestion absent |
+| 18 | `server-links` | TODO | wire-v3 | per-link CSI state + `mesh.html`, `LinkMeshPanel.js` |
+| 19 | `server-rti` | TODO | - | radio-tomographic estimation. No dependencies at all |
+| 20 | `server-phase-diag` | TODO | - | phase-channel diagnostics |
+| 21 | `room-builder` | TODO | - | **live/persisted node positions**, storeys, walls + `RoomBuilderTab`, `mesh3d`, `illuminators`. Replaces `--node-positions` |
+| 22 | `ground-truth-marking` | TODO | - | `diag/mark` + `mark`/`survey`/`tapper`/`walk.html` |
+| 23 | `node-management` | TODO | - | server proxies config/firmware to nodes + `NodesTab.js` |
+| 24 | `emitter-triage` | TODO | - | four-state emitter approval, enforced exclusion |
+| 25 | `centroid-position` | TODO | - | motion- and Doppler-weighted position tiers |
+| 26 | `baseline-tuning` | TODO | - | baseline-subtraction fraction 0.7 -> 0.95 -> 0.85 |
+| 27 | `classification-smoothing` | TODO | - | real per-node confidence, rate-scaled smoothing, debounce |
+| 28 | `csi-timestamp-clock` | TODO | - | stop trusting the mesh-synced clock for CSI timestamps |
+| 29 | `broadcast-rate-limit` | TODO | - | rate-limit ESP32 broadcasts to tick_ms |
+| 30 | `node-health-telemetry` | TODO | - | node health over the network, not to a console |
+| 31 | `world3d` | TODO | everything | integrated 3D view. Consumes every server topic; ships last |
+
+### Adopted FROM upstream (not ours to submit)
+
+| PR | what | status |
+|---|---|---|
+| 1594 | httpd stack too small for OTA validation | adopted into firmware |
+| 1142 | C6 dynamic TX buffers 64 -> 128 | adopted, UNVALIDATED |
+| 1683 | expose `ota_check_auth` by dropping `static` | technique adopted |
+| 1510 | axum 0.7 `:id` path syntax | adopted, merged to main |
+| 1734 | MAC filter before rate gate | already had it independently |
+| 1159 | ESP-NOW backoff | already had it |
+
+### Awaiting your decision
+
+1726, 1774 (merge clean), 1529, 1717, 1568, 1728 (conflict). 1568 most likely
+to matter -- fail closed on weak adaptive models, bearing on the 48.6% model.
+
 ## RESUME HERE (state at 2026-09-03, end of session)
 
 `main` is clean and contains everything. Nothing is uncommitted.
