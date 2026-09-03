@@ -9,6 +9,94 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## Programme: repo, install, and upstream (Joe, 2026-09-02)
+
+Priorities below are by *dependency and risk*, not by size. Two items solve
+the same problem and one of them is better; two others are blocked until a
+third lands. Reasoning is stated so it can be argued with.
+
+### P0 — durability, and the keystone that unblocks the rest
+
+- **P0.1 Fix the full-disk backup.** It is failing. Everything else in this
+  list assumes the work still exists tomorrow. Five days of tape survey, house
+  geometry and firmware live on one disk on a path called `C:\temp`. Nothing
+  else on this list matters if that disk goes.
+
+- **P0.2 Separate site-specific data from the repo.** This is the keystone: it
+  independently unblocks P1, P2 and P3, and it closes a live privacy exposure.
+
+  Today `v2/data/room_config.json` is tracked and holds nine surveyed node
+  positions, the interior dimensions of a private residence, and 57 device MAC
+  addresses. `.githooks/pre-push` stops it reaching a public remote, but that
+  is a guard bolted onto a design problem: site data should not be in a source
+  repo at all.
+
+  Target (Windows production convention): site collateral under
+  `C:\ProgramData\RuView\` — room config, emitter roster, node identity,
+  provisioning profiles, captures, models. The repo keeps only code, and a
+  *sample* room config so the thing is runnable from a clean clone.
+
+  Doing this first means the OneDrive move carries no house data, the install
+  has a defined data directory rather than "next to the exe", and the upstream
+  contribution stops needing a guard to be safe.
+
+### P1 — upstream, mostly done
+
+- **P1.1 Fork and open the five PRs.** `contrib/*` branches are cut from
+  `origin/main`, firmware-only, verified to build standalone. Needs a GitHub
+  fork; `gh` is not installed and `origin` is upstream itself.
+- **P1.2 Finish and document remaining firmware work** before submitting, so
+  the PRs land as a coherent set rather than a trickle.
+
+### P2 — drift audit for the sensing server
+
+- **P2.1 Establish what has drifted.** `main` is 91 commits ahead of
+  `origin/main` and 0 behind, but nobody has audited *what upstream changed in
+  the server* while we diverged. The firmware merge to 0.8.8 was done
+  deliberately and carefully; the server has had no equivalent pass.
+  Deliverable: a list of upstream server changes, each marked take / skip /
+  conflicts-with-ours, in the same style as the firmware merge.
+
+### P3 — behave like a product, not a startup
+
+- **P3.1 Install the sensing server properly on Windows.** Today it runs out
+  of `v2/target/release/` with the repo as its working directory, which is why
+  a relative `data/mesh` argument works at all. Target: binary under
+  `C:\Program Files\RuView\`, data under `C:\ProgramData\RuView\`, a
+  service or scheduled task rather than a hand-started process, and a config
+  file instead of a fifteen-argument command line.
+  **Blocked on P0.2** — an install with no defined data directory just moves
+  the problem.
+  Linux/Docker keep their own conventions; this is a Windows packaging concern.
+
+- **P3.2 Adopt the side-by-side binary swap** (see the section below). Already
+  partially proven: renaming the running exe before `cargo build` let the
+  server serve continuously through two full compiles on 2026-09-02.
+
+### Contested: moving the repo to OneDrive
+
+Joe proposed moving the whole repo to OneDrive. **Recommend not doing this as
+stated**, because it solves the durability problem worse than P0.1 does and
+introduces new failure modes:
+
+- `v2/target/` is multi-gigabyte and rewritten on every build. OneDrive will
+  attempt to sync all of it, continuously.
+- OneDrive cannot exclude a subfolder of a synced folder except by unlinking
+  it; there is no `.gitignore` equivalent. So the churn cannot be filtered.
+- OneDrive holds file locks while uploading. Git and cargo both rewrite files
+  in place, and the known result is sync conflicts and occasional corruption
+  in `.git/`.
+
+**Better shape:** fix the backup (P0.1) so durability is solved properly, move
+*site data* to `C:\ProgramData` (P0.2) and back that up — it is small, changes
+rarely, and is the genuinely irreplaceable part. If the repo should also leave
+`C:\temp`, move it to a normal path such as `C:\src\RuView`, which addresses
+the "temp means disposable" problem without inviting a sync engine into a
+build tree.
+
+If OneDrive is still wanted for the repo, the workable version is to sync a
+*bare mirror* pushed to OneDrive on a schedule, not the working tree.
+
 ## Blocked on a decision or an action outside the repo
 
 - **Fork the repo and open the upstream PRs.** Five `contrib/*` branches are
