@@ -189,6 +189,32 @@ that touches `csi_collector.c`, `main.c`, `nvs_config.*` or `provision.py`.
   Note the interaction with the fleet: nodes stream UDP and do not retry, so
   every second of server downtime is sensing data that no longer exists.
 
+## BLE tags as an identity anchor
+
+- **Static-address BLE tags would disambiguate what CSI provably cannot.**
+  The recurring blocker is not "is something moving" -- that works -- it is
+  "how many, and which one": Joe vs Amy vs a child, one person or two, a
+  person or the rabbit. CSI cannot answer that, and the cross-receiver
+  approach was closed after an empty house scored higher than an occupied one.
+
+  The ESP32-C6 has Bluetooth 5.3 LE and can scan advertisements passively with
+  no pairing. **Phones are useless for this** -- iOS and Android rotate their
+  BLE address roughly every 15 minutes precisely to defeat it, as upstream
+  ADR-341 states plainly. Cheap BLE tags do not rotate, so one per person and
+  one on the rabbit's collar gives a persistent, unambiguous identity signal.
+
+  **RSSI is not position**, so this is identity evidence, not localisation.
+  Actual BLE ranging needs Bluetooth 6 Channel Sounding, which no ESP32 can
+  do -- ADR-341 routes that through an external companion radio over UART.
+
+  Value even so: labelled ground truth without a phone tapper, a way to score
+  every existing capture retrospectively, and a hard answer to "was that one
+  person or two" that no amount of CSI processing has produced.
+
+  Cost to check: a handful of tags and a BLE scan task on one node. Watch the
+  airtime -- BLE is a separate radio from WiFi on the C6, but they share an
+  antenna path, and the 2.4 GHz band is already at 86% airtime.
+
 ## Solver ignores position uncertainty
 
 - **`uncertainty_m` is stored, validated, round-tripped -- and dropped.**
