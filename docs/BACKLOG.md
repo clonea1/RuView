@@ -416,6 +416,44 @@ provisioning-tooling, disable-154-radio.
 **Lesson for the remaining work:** verify coverage by SYMBOL, never by
 filename. Three of the fourteen were invisible to a filename check.
 
+## Server PR sweep (2026-09-03)
+
+Same method as firmware: fetch every `refs/pull/*/head`, drop anything already
+an ancestor of `origin/main`, diff the rest against our server files.
+**24 unmerged PRs touch the sensing server.**
+
+### Adopted
+
+- **PR 1510 (fallen-pc, open since 2026-08-03) -- ADOPTED, merged to main.**
+  `axum 0.7` uses `:id`, not `{id}`; the latter compiles and registers a
+  literal path segment, so the route silently 404s. Upstream had the bug in
+  four routes (`/api/v1/models/{id}` get and delete, `/api/v1/recording/{id}`,
+  the recording download path) and **we inherited all of them** -- no commit of
+  ours touched those lines. Fixed in our tree now.
+
+  Worth noting: this is the identical mistake made independently while writing
+  the node-management proxy tonight, caught there only by calling the endpoint.
+  A compiler cannot see it.
+
+### Already resolved, no action
+
+- **PR 1443 / 1447** (two independent fixes for issue #1442, presence
+  contradicting motion_level). `classify_vitals` is already present on
+  `origin/main` AND on ours, carrying 1447's comment verbatim. Nothing to do.
+
+### Still to examine
+
+`1774` multistatic cohort quality, `1728` ADR-302 OOD gate, `1726` fuse only
+coherent frame cohorts, `1720` rufield honesty, `1717` live-CSI presence tuning,
+`1696` BLE, `1683` security boundaries, `1669` mqtt, `1647` centroid
+localisation (tested, no benefit at n=11), `1629` cross-platform build, `1593`
+BSSID telemetry, `1568` fail closed on weak adaptive models, `1531`, `1529` node
+lifecycle + calibration persistence, `1511` pose_stats confidence, `1447`,
+`1445`, `1443`, `1439`.
+
+`1726` and `1774` are the most likely to overlap `fusion.rs`; `1529` overlaps
+the calibration work; `1568` overlaps the adaptive-model concerns.
+
 ## Sensing-server audit, first real pass (2026-09-03)
 
 Symbol-level, not spot-checked. Everything outside `firmware/` and `docs/`.
