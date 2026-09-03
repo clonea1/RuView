@@ -362,6 +362,11 @@ static esp_err_t ota_start_server(httpd_handle_t *out_handle)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = OTA_PORT;
     config.max_uri_handlers = 14;  /* WASM endpoints (ADR-040) + /config. */
+    /* 12 KB, not the 4 KB default: the upload handler runs esp_ota_end() ->
+     * esp_image_verify() on THIS task's stack, which overflows at the end of
+     * an upload -- the transfer completes, validation panics, and the node
+     * reboots into the old image. Reported upstream as PR #1594. */
+    config.stack_size = 12288;
     /* Increase receive timeout for large uploads. */
     config.recv_wait_timeout = 30;
 
