@@ -9,6 +9,34 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## Two more from Joe's memory (2026-09-03)
+
+**39. `ui-navigation` -- a topic on no list.** Our nav has grown to 18 flat
+entries (10 tabs plus 8 links), and three pages are reachable only by typing
+the URL: `world3d.html`, `illuminators.html`, `tapper.html`. Wants a Tools
+grouping plus the orphans added. Upstream's nav is 10 flat entries with no
+Tools menu, so this is additive.
+
+**The flicker fix has a much better justification than "reduces traffic".**
+`23a54920` (already listed as #29 broadcast-rate-limit) is the fix Joe
+remembers as "the epilepsy issue from the C6's higher clock". Its own commit
+body confirms it:
+
+- `udp_receiver_task` broadcast a full sensing_update on EVERY incoming CSI
+  frame -- ~48-50 FPS per node -- ignoring `--tick-ms`, unlike every other
+  source which was already tick-gated. Clients repainted at raw hardware rate.
+- Once throttled, a pre-existing keepalive task on its own independent
+  `tick_ms` timer produced **"a visible, regular beat pattern"** -- two
+  unsynchronised timers at the same nominal rate. Fixed by moving the
+  timestamp to shared state so both paths see it.
+
+That is a photosensitivity concern, not a performance one, and the PR should
+lead with it. A UI repainting at 50 Hz with an irregular beat is a genuine
+accessibility problem, and it appears specifically on the C6 because it
+produces frames far faster than the S3 the code was written against.
+
+**Running total: 39 topics.**
+
 ## Onion pass: seven further subdivisions found (2026-09-03)
 
 Applying the mesh.html exercise to all 31 proposals. The tell is a commit title
