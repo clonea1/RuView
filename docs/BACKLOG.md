@@ -64,6 +64,57 @@ Three locations, three purposes:
   A scheduled snapshot never holds a lock on a file cargo or git is rewriting,
   which was the objection to syncing the working tree; it does not apply here.
 
+### P2 — upstream: reconcile with open PRs BEFORE submitting
+
+**Method matters here.** A first pass asked the GitHub API how many PRs were
+open and was told 5, none touching firmware. The real number is **556 open**,
+and Joe found a firmware one by hand within a minute. The reliable method is
+git, not a summarised API page:
+
+    git fetch origin "refs/pull/*/head:refs/remotes/pr/*"
+    # for each ref: skip if merge-base --is-ancestor <sha> origin/main
+    # then: git diff --name-only origin/main...<sha> -- <our files>
+
+That found 40+ unmerged PRs touching `firmware/`, and a dozen touching our
+exact files. Findings so far:
+
+- **PR 1760 — OPEN, competing, and we each have the better half.**
+  `fix(provision): owner-only state files, chip-identity binding, and
+  --ota-psk`. Conflicts with ours in `provision.py`.
+  *They* bind provisioning state to the board's MAC via `esptool read-mac`,
+  which we do not do inline. *We* remove secrets from the state file entirely;
+  1760 still lists `password` and `seed_token` in `MERGEABLE_ATTRS`, so it
+  makes owner-only a file that still holds the WiFi passphrase in cleartext.
+  **Decision (Joe, 2026-09-03): build on 1760, keep their identity binding,
+  layer our secrets-removal on top.** Both improve, and it removes work from
+  our side.
+
+- **PR 1734 — OPEN, complementary, merges clean.** Moves the MAC filter above
+  the CSI rate gate. Tested: merges cleanly with our mesh-aligned gate, and
+  the combined order (filter, then bucket-gate) is correct. Their fix is
+  arguably a *prerequisite* for ours: our gate takes the first frame in a
+  shared window, so a foreign frame claiming the bucket would reproduce the
+  starvation they fix. Say so in our PR; it supports theirs.
+
+- **PR 1683 — CLOSED, unmerged.** Did what our remote-config branch does for
+  auth, but cleaner: makes `ota_check_auth` public by dropping `static`,
+  rather than our wrapper indirection. **Adopt the technique even though the
+  PR is dead.** Note also that 1683 tried to stop provisioning credentials
+  leaking into command lines and local storage and was closed without
+  merging -- that problem is still open upstream, and our secrets work
+  addresses it.
+
+- **PR 1696 — OPEN but stale** (created and last touched 2026-08-24, no
+  activity since). Large opt-in BLE fusion path, compile-time disabled by
+  default. Conflicts with us in `nvs_config.h`, `stream_sender.c`,
+  `provision.py`, but they are additive collisions -- both sides appending --
+  so whoever merges second resolves mechanically. Not a blocker.
+
+**Still unexamined**, all unmerged and touching our files: 1717, 1647, 1605,
+1594, 1593, 1498, 1418, 1391, 1292, 1288, 1286, 1193, 1159, 1150, 1142, 1129
+and roughly twenty more. Check state and overlap before submitting anything
+that touches `csi_collector.c`, `main.c`, `nvs_config.*` or `provision.py`.
+
 ### P2 — upstream, mostly done
 
 - **P2.1 Fork and open the five PRs.** `contrib/*` branches are cut from
