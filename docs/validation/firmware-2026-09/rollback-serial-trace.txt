@@ -1,0 +1,30 @@
+ESP32-C6 firmware rollback: hardware evidence, 2026-09-02
+=========================================================
+
+Node 3 (ESP32-C6, 16MB, CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y).
+An image built to abort() 15 s after boot -- inside the 60 s
+confirmation soak -- was pushed by OTA. The bootloader reverted it
+and the node recovered on its own, with no USB intervention.
+
+Serial console, filtered to the lifecycle lines:
+
+    I (165790) ota_update: OTA update started, content_length=1066368
+    I (225300) ota_update: OTA update successful! Rebooting to partition 'ota_0'...
+    rst:0xc (SW_CPU),boot:0xc (SPI_FAST_FLASH_BOOT)
+    W (598) ota_update: new image on trial (ota_0): must reach the network and survive 60 s or the bootloader reverts
+    I (3238) main: Got IP: 192.168.1.112
+    I (3238) ota_update: image on trial reached the network; confirming in 60 s
+    I (3388) ota_update: OTA PSK loaded from NVS (64 chars) — authentication enabled
+    I (3398) ota_update: OTA HTTP server started on port 8032
+    I (3408) ota_update:   GET  /ota/status — firmware version info
+    I (3418) ota_update:   POST /ota        — upload new firmware binary
+    I (3428) ota_update:   POST /calibrate  — clear and re-seed the adaptive floor
+    abort() was called at PC 0x4201ec43 on core 0
+    rst:0xc (SW_CPU),boot:0xc (SPI_FAST_FLASH_BOOT)
+    E (598) ota_update: FIRMWARE ROLLBACK: ota_0 image 0.8.8 was aborted; recovered via panic
+    I (4788) main: Got IP: 192.168.1.112
+    I (4948) ota_update: OTA PSK loaded from NVS (64 chars) — authentication enabled
+    I (4958) ota_update: OTA HTTP server started on port 8032
+    I (4958) ota_update:   GET  /ota/status — firmware version info
+    I (4968) ota_update:   POST /ota        — upload new firmware binary
+    I (4968) ota_update:   POST /calibrate  — clear and re-seed the adaptive floor
