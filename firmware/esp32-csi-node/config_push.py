@@ -31,12 +31,16 @@ one typo means a ladder and a USB cable for every node.
 The PSK is read from a file and never printed, logged, or passed on argv.
 """
 import argparse
+import os
 import json
 import sys
 import urllib.error
 import urllib.request
 
-PSK_DEFAULT = "D:/Users/joe.hedgehog/onedrive/ota_psk.txt"
+# No default path: a secret location is site-specific, and baking one in
+# means shipping somebody's directory layout to everyone else. Set
+# RUVIEW_OTA_PSK_FILE once, or pass --psk-file.
+PSK_DEFAULT = os.environ.get("RUVIEW_OTA_PSK_FILE")
 PORT = 8032
 
 # The onboard WS2812 defaults to a 40 Hz square-wave gamma stimulus at full
@@ -94,7 +98,9 @@ def main():
     ap.add_argument("--set", nargs="+", metavar="KEY=VALUE", default=None)
     ap.add_argument("--trial-seconds", type=int, default=None,
                     help="how long a node may take to re-associate before reverting")
-    ap.add_argument("--psk-file", default=PSK_DEFAULT)
+    ap.add_argument("--psk-file", default=PSK_DEFAULT,
+                    help="file holding the fleet OTA PSK; defaults to "
+                         "$RUVIEW_OTA_PSK_FILE")
     ap.add_argument("--no-reboot", action="store_true",
                     help="write the values but leave the node running the old "
                          "ones; config is only read at boot, so nothing takes "
@@ -106,6 +112,10 @@ def main():
     if not a.get and not a.set:
         ap.error("choose --get or --set")
 
+    if not a.psk_file:
+        print("no PSK file: pass --psk-file or set RUVIEW_OTA_PSK_FILE",
+              file=sys.stderr)
+        return 2
     try:
         psk = open(a.psk_file).read().strip()
     except OSError as e:
