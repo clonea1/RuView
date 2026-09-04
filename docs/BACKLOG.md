@@ -357,6 +357,36 @@ The 43.2 GB of captures in `v2/data`, plus the fleet baselines at
 `c:/temp/ruview/fleet-baselines`, currently live on the machine that is about to
 stop being always-on. That is irreplaceable measurement data on the box that is
 going away. It should move to TERRY before the desktop becomes occasional-use.
+## Bootloader rollback capability CAN be determined remotely
+
+Earlier in this file I recorded that it could not, and that a USB pass was the
+only way to know which nodes have a rollback-capable bootloader. **That was
+wrong**, and the seq-gate experiment showed it by accident.
+
+`GET /ota/status` reports `pending_verify`. After an OTA:
+
+  - `pending_verify: true`  -> the bootloader armed a rollback trial, so
+    `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` is present
+  - `pending_verify: false` -> no trial was armed, so the bootloader predates it
+
+Observed 2026-09-03, same image pushed to both nodes minutes apart:
+
+| node | firmware before | after OTA | rollback bootloader |
+|---|---|---|---|
+| 3 | 0.8.9 | `pending_verify: true`, cleared at ~30 s | **yes** |
+| 7 | 0.8.4 | `pending_verify: false` | **no** |
+
+So the USB list can be built without a cable: push an app-only OTA and read
+`pending_verify` within the soak window. A node that never arms needs the USB
+bootloader pass; one that arms does not.
+
+The reasoning that led to the wrong claim was that no bootloader VERSION is on
+the wire, which is true. What that missed is that the bootloader's *behaviour*
+is observable through a field the app already reports.
+
+**Next**: sweep the remaining seven nodes this way rather than assuming all
+eight non-node-3 boards need the pass. On this evidence some will and some
+may not.
 
 ## OPEN: USB pass for the recovery bootloader
 
