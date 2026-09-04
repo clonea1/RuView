@@ -9,6 +9,57 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## OPEN: USB pass for the recovery bootloader
+
+**Blocked on physical access, one board at a time. Not urgent, not optional.**
+
+`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` is a BOOTLOADER capability. OTA
+replaces the app partition (`0x20000`) only, so this cannot be deployed over
+the air on any board. The bootloader sits at `0x0` and the partition table at
+`0x8000`.
+
+Until a board has it, `ota_rollback_boot_check()` and the `PENDING_VERIFY`
+handling in `ota_update.c` are inert on that board: a bad OTA there does NOT
+self-revert, and recovery means a cable.
+
+**Which boards already have it is unknown and cannot be determined remotely.**
+No bootloader version is reported on the wire. The sync packet carries app
+health, not bootloader capability. Answering this from `/api/v1/mesh` health
+data was tried on 2026-09-03 and was wrong.
+
+### The pass
+
+Per board, with `firmware/esp32-csi-node/RUNBOOK.md` open:
+
+    python -m esptool --chip esp32c6 -b 460800       --before default_reset --after hard_reset write_flash       --flash_mode dio --flash_size 16MB --flash_freq 80m       0x0     build/bootloader/bootloader.bin       0x8000  build/partition_table/partition-table.bin       0xf000  build/ota_data_initial.bin       0x20000 build/esp32-csi-node.bin
+
+`0x9000` is untouched, so SSID, password and `node_id` survive.
+
+**Record which boards have been done.** That list is the only place the answer
+will exist.
+
+### Do it once, get both
+
+The TX-path counters (proto v3, `send_fail` / `rate_skip` / `early_drop`) are
+app-only and CAN ship by OTA. But since every board needs a USB visit for the
+bootloader anyway, flashing v0.8.8 in the same pass covers both and avoids a
+second round.
+
+If the counters are wanted sooner: OTA them to one node, soak, then the fleet.
+Safe on an old bootloader -- `ota_rollback_boot_check()` is guarded on
+`esp_ota_get_state_partition()` returning `PENDING_VERIFY`, which simply never
+happens there, so it no-ops. The caveat is that there is no rollback net on
+those boards, so a bad image needs a cable.
+
+### Ready to flash
+
+    bootloader.bin        19,696 bytes   rollback ENABLED
+    esp32-csi-node.bin 1,066,256 bytes   v0.8.8, proto v3 counters
+    partition-table.bin    3,072 bytes   16MB, two 4MB OTA slots
+
+All fourteen firmware topics verified present in the image. Backout is intact:
+`_revert_backup/ota_1_production.bin` (v0.8.4) and `_revert_backup/otadata.bin`.
+
 ## CORRECTION: there IS pending USB work, and a stale sdkconfig
 
 **I said "no pending USB flash". That was wrong.** Joe corrected it: the USB
