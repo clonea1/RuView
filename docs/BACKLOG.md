@@ -9,6 +9,74 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## PLANNED: move the sensing server to the NAS (Docker)
+
+**Decided 2026-09-03 (Joe). Not started — filed deliberately rather than built.**
+
+### Why the NAS, and why it is better than the desktop
+
+TerraMaster **F6-424 Max**, `TERRY` at `192.168.1.27`, always on regardless.
+Confirmed by `lscpu -e`: **Intel i5-1235U**, a HYBRID part.
+
+| CPUs | max MHz | type |
+|---|---|---|
+| 0,1,2,3 | 4400 | 2 P-cores, hyperthreaded |
+| 4..11 | 3300 | 8 E-cores |
+
+The sensing server is **effectively single-threaded**: measured 2026-09-03, one
+thread at **94.3%** of an i7-7700K core with every other thread idle, and only
+54 MB resident. So the whole question is which core that thread lands on:
+
+  - **P-core** (Golden Cove, ~1.4x the i7 per clock): ~67% of one core. Fits,
+    with headroom for growth past nine nodes.
+  - **E-core** (Gracemont at 3.3 GHz, ~0.78x): ~120% of one core. **Would never
+    keep up** — and nodes stream UDP without retry, so falling behind loses
+    frames rather than delaying them.
+
+**Therefore the container MUST be pinned to the P-cores.** `cpuset: "0-3"` in
+compose, or `--cpuset-cpus="0-3"`. Do not rely on the scheduler; a NAS kernel
+may lack Intel thread-director support. Verify once running with
+`ps -o pid,psr,pcpu,comm -T -p $(pgrep sensing-server)` — `psr` must show 0-3.
+
+### It also fixes a defect rather than only relocating
+
+`docker/docker-compose.yml` records that on **Docker Desktop for Windows**,
+multi-source UDP collapses to one source IP at the WSL/Hyper-V boundary, so all
+but one node's frames are silently dropped (issues #374, #386). Native Linux
+does not have this. Containerising on Windows would have hit it; the NAS does
+not.
+
+### What exists already
+
+`docker/Dockerfile.rust` (multi-stage, builds sensing-server with the `mqtt`
+feature) and `docker/docker-compose.yml`. No cross-compile config, but building
+inside the container makes that unnecessary.
+
+### The pipeline Joe asked for, not yet built
+
+Requirement: automate deployment on every stack build. Intended shape, mirroring
+the two staged-swap mechanisms already proven here (firmware OTA rollback, and
+the rename-then-build binary swap):
+
+1. build the image on the desktop from `docker/Dockerfile.rust`
+2. ship it — `docker save | ssh clone@TERRY 'docker load'` avoids needing a
+   registry and keeps the tree off any remote, which matters because this repo
+   must not be pushed anywhere public
+3. retag the running image `:previous` before swapping
+4. `docker compose up -d` with `cpuset: "0-3"`
+5. health-check `/api/v1/mesh`; on failure retag `:previous` back and restart
+
+**Prerequisite not yet met:** there are no SSH keys on this workstation
+(`~/.ssh` is empty — no `id_ed25519`, no `known_hosts`). Key-based auth to
+`clone@TERRY` has to be set up before any of this can be non-interactive.
+
+### Open question that decides how much headroom there is
+
+The 94% single-thread cost has never been profiled. ~450 frames/second at
+roughly 9 million cycles each is high enough to be worth understanding before
+scaling past nine nodes. On a P-core it fits either way; the profiling decides
+whether there is room to grow.
+
 ## OPEN: USB pass for the recovery bootloader
 
 **Blocked on physical access, one board at a time. Not urgent, not optional.**
