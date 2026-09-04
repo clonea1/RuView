@@ -357,6 +357,61 @@ The 43.2 GB of captures in `v2/data`, plus the fleet baselines at
 `c:/temp/ruview/fleet-baselines`, currently live on the machine that is about to
 stop being always-on. That is irreplaceable measurement data on the box that is
 going away. It should move to TERRY before the desktop becomes occasional-use.
+## STOPPED: the seq gate is INERT as written (2026-09-04)
+
+The A/B/A experiment was launched and killed after ~10 minutes: the gate is not
+filtering anything.
+
+### Evidence
+
+`CONFIG_CSI_SEQ_GATE=y` / `PERIOD=4` confirmed in the generated
+`build/config/sdkconfig.h`, so the code IS compiled in, and all four nodes
+report `0.8.10-seqgate`. Yet with the EMA settled over ~300k samples:
+
+    gated   (n0,n3,n7,n8)  18.3 fps mean
+    control (n1,n2,n4,n5)  21.8 fps mean   (n6 excluded, just remounted)
+    ratio 0.84
+
+A 1-in-4 gate must cut transmitted frames by ~75%, i.e. a ratio near 0.25.
+0.84 is not a weak effect; it is no effect.
+
+### Likely cause -- NOT confirmed
+
+    if ((info->rx_seq % (uint16_t)CONFIG_CSI_SEQ_GATE_PERIOD) != 0) return;
+
+802.11's Sequence Control field is 16 bits: **bits 0-3 are the fragment number,
+bits 4-15 the sequence number.** If ESP-IDF's `wifi_csi_info_t.rx_seq` carries
+the raw field, every unfragmented frame has `rx_seq = seq << 4` -- always a
+multiple of 16, hence of 4 -- so the test is always true and nothing is dropped.
+
+The IDF header (`esp_wifi_types_native.h:129`) says only
+`uint16_t rx_seq; /**< rx sequence number of the wifi packet */`, which does not
+distinguish the two readings.
+
+If correct, the fix shifts off the fragment nibble:
+
+    ((info->rx_seq >> 4) % CONFIG_CSI_SEQ_GATE_PERIOD) != 0
+
+**Do not apply blind.** It is a hypothesis that fits the evidence, not a
+diagnosis.
+
+### How to confirm
+
+Raw `rx_seq` is exposed nowhere: `/api/v1/fusion` keys on it but reports only
+aggregates, and the `seq` column in `phase_raw_*.csv` is the NODE's own frame
+counter (values in the millions), not the 802.11 field. Either cable a node and
+read the existing ADR-345 probe (it logs `mac` and `rx_seq` per frame), or add a
+short-lived server-side histogram of `rx_seq % 16`.
+
+### Why it matters beyond the experiment
+
+`contrib/mesh-aligned-rate-gate` is already submitted upstream and is
+unaffected. But the seq-gate commit's headline claim -- that disjoint frame
+selection is why multistatic alignment never works, and that four upstream
+issues misdiagnose it -- **has never been tested**, because the implementation
+meant to test it does nothing. The claim is neither supported nor refuted. It is
+untested, and the commit reads as though it were settled.
+
 ## DECISION: recovery bootloader is OPPORTUNISTIC, not a scheduled pass
 
 **Joe, 2026-09-04.** Supersedes the earlier framing of a USB pass as scheduled
