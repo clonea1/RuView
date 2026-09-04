@@ -357,6 +357,42 @@ The 43.2 GB of captures in `v2/data`, plus the fleet baselines at
 `c:/temp/ruview/fleet-baselines`, currently live on the machine that is about to
 stop being always-on. That is irreplaceable measurement data on the box that is
 going away. It should move to TERRY before the desktop becomes occasional-use.
+## DECISION: recovery bootloader is OPPORTUNISTIC, not a scheduled pass
+
+**Joe, 2026-09-04.** Supersedes the earlier framing of a USB pass as scheduled
+work.
+
+  - Deploying recovery proactively costs **one USB trip per node, guaranteed**.
+  - Not deploying it costs **one trip only for a node that actually fails** --
+    and that trip installs recovery while you are there, so a second is never
+    needed for that board.
+
+Recovery therefore never saves the FIRST trip. It only prevents the SECOND, and
+you only need it after already having gone to the node once. Reactive is
+strictly cheaper in expectation unless OTA failures are common, and tonight
+argues they are not: seven nodes took the same image cleanly, and the one that
+looked like a failure had in fact written it correctly and simply had not
+rebooted yet.
+
+**Policy: bundle recovery with the next USB visit a node needs for some other
+reason. Do not make a special trip.**
+
+The `pending_verify` test makes this cheap to hold -- capability is checkable
+remotely, so the boards lacking recovery can be identified and treated more
+carefully before any OTA of consequence, without visiting anything.
+
+### State as of 2026-09-04
+
+| node | version | recovery |
+|---|---|---|
+| 3 | 0.8.10-seqgate | **yes** -- armed and cleared on OTA |
+| 6 | 0.8.9 | **yes** -- USB flashed, then proven by an OTA arming afterwards |
+| 7 | 0.8.10-seqgate | **no** -- OTA never armed |
+| 0, 1, 2, 4, 5, 8 | mixed | unknown -- survey with `pending_verify` |
+
+Node 6 was done only because it was already cabled for diagnosis. That is
+exactly the opportunism this policy describes.
+
 ## Bootloader rollback capability CAN be determined remotely
 
 Earlier in this file I recorded that it could not, and that a USB pass was the
