@@ -9,6 +9,62 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## Repository audit (2026-09-03): one branch holds stranded work
+
+Ran after the PR wave. `main` is clean, 156 ahead of `origin/main` and 0 behind,
+working tree clean apart from a deliberate `sdkconfig` backup.
+
+**Twelve non-contrib local branches. Eleven are fully contained in `main`** --
+`backup/pre-upstream-merge-20260902`, `chore/prepare-firmware-for-upstream`,
+`chore/track-local-state`, `feat/firmware-rollback`, `feat/node-management-gui`,
+`feat/remote-config`, `fix/config-trial-response-flush`,
+`fix/restore-16mb-partition-table`, `link-sensing-and-nine-node-prep`,
+`merge/upstream-0.8.8`, `phase3-adaptive-calibration`. Nothing would be lost by
+removing them; not removed, per the standing rule that branches are not deleted
+without asking.
+
+`contrib/server-grid-gate-per-link` is empty (0 commits) and redundant since the
+gate fix folded into `server-links`. Same rule applies.
+
+### `phase2-rxseq-fusion` -- ONE commit, not in main, and worth reading
+
+`1822108a` (2026-08-30) adds `CONFIG_CSI_SEQ_GATE`, default off, 58 lines across
+`Kconfig.projbuild` and `csi_collector.c`.
+
+Its argument: the time-based rate gate has **independent phase on every node**,
+so two nodes hearing the same transmitter keep DIFFERENT subsets of its frames
+-- node A at t=0,20,40 ms while node B is at 7,27,47. Harmless per-node, fatal
+for fusion, because nothing common survives to combine.
+
+It then claims this is likely why multistatic alignment has never worked on this
+hardware for anyone: four upstream reports (#1049, #1374, #1703, #1710) attribute
+it to timestamp spread and reach for guard intervals and tighter sync, but the
+guard is not the binding constraint -- our sync is already ~40x better than the
+soft guard asks and we were still demoted 58% of the time. **Frames that were
+never mutually selected cannot be aligned by any amount of clock discipline.**
+
+`CSI_SEQ_GATE` keeps a frame only when its 802.11 sequence number is divisible by
+a period, so every node independently selects the same frames with no
+coordination and no clocks at all.
+
+### Why this matters and what to do
+
+`main` shipped the OTHER solution: `CONFIG_CSI_GATE_MESH_ALIGNED`, which aligns
+the time buckets using mesh time. That works, and is what
+`contrib/mesh-aligned-rate-gate` submits. But it still depends on clock
+agreement, whereas the sequence gate removes the dependency entirely.
+
+**Unverified claim, deliberately not acted on.** Nobody has measured the two
+against each other on this fleet. The commit's reasoning is strong and the
+upstream-issue reading is checkable, but "very likely the real reason ... for
+anyone" is a CLAIMED result, not a MEASURED one.
+
+Next step if pursued: build with `CSI_SEQ_GATE=y` on two nodes, compare pairing
+yield against the mesh-aligned gate over the same window. That is a direct
+experiment and the `/api/v1/fusion` pairing statistics already exist to score it.
+If it wins, it is a stronger contribution than `mesh-aligned-rate-gate` and
+speaks to four open upstream issues at once.
+
 ## SUBMITTED: first wave of upstream PRs (2026-09-03)
 
 Fork: `https://github.com/clonea1/RuView` (public). **All 37 contribution
