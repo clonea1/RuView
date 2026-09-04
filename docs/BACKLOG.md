@@ -9,6 +9,30 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+
+### Correction: #1795 was a bucket PR, caught by Joe
+
+Raised as "retry WiFi forever, and add an uplink watchdog" — one commit's worth
+of subject. It actually delivered **563 lines across 8 files**, because the
+branch sits on `contrib/thermal` and carried its two commits: `thermal.c` (210
+lines), `thermal.h` (46) and 128 lines of Kconfig. A reviewer opening it for a
+retry fix would have been handed a thermal subsystem.
+
+Exactly the bucket problem this whole packaging effort exists to avoid, and I
+shipped one anyway on the first night.
+
+Fixed by raising `contrib/thermal` as **#1797**, retitling #1795 to declare the
+dependency, and opening its body with a note that the diff currently includes
+#1797's commits and reduces once that merges.
+
+**Audited the other six for the same defect: none.** Each holds only its own
+commits. Check used: compare `git rev-list --count origin/main..<branch>` against
+what the PR body claims to change.
+
+**Standing rule going forward: before opening a PR for a stacked branch, name
+the base PR in the title and open with the dependency.** The branch structure
+was correct throughout; the presentation was not.
+
 ## Repository audit (2026-09-03): one branch holds stranded work
 
 Ran after the PR wave. `main` is clean, 156 ahead of `origin/main` and 0 behind,
@@ -76,7 +100,8 @@ branches pushed.** Six PRs opened against `ruvnet/RuView:main`:
 | [#1792](https://github.com/ruvnet/RuView/pull/1792) | `subcarrier-grids-256` | `EDGE_MAX_SUBCARRIERS 128` truncates 256-bin HE20 on C6/C5, silently |
 | [#1793](https://github.com/ruvnet/RuView/pull/1793) | `server-classification-stability` | their own doc says "at ~10 FPS"; C6 delivers 48-50 |
 | [#1794](https://github.com/ruvnet/RuView/pull/1794) | `ui-no-fabricated-data` | client renders simulation indistinguishably from live data |
-| [#1795](https://github.com/ruvnet/RuView/pull/1795) | `wifi-retry-watchdog` | `MAX_RETRY 10` then never reconnects; cost 7.5 h here |
+| [#1795](https://github.com/ruvnet/RuView/pull/1795) | `wifi-retry-watchdog` | `MAX_RETRY 10` then never reconnects; cost 7.5 h here — **stacked on #1797** |
+| [#1797](https://github.com/ruvnet/RuView/pull/1797) | `thermal` | no thermal monitoring at all; a hot node's RSSI falls at both ends and reads as an obstruction |
 | [#1796](https://github.com/ruvnet/RuView/pull/1796) | `disable-unused-154-radio` | 802.15.4 started but never received; costs coexistence airtime |
 
 **Every claim was checked against `origin/main` before being written into a
