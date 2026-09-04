@@ -198,6 +198,166 @@ roughly 9 million cycles each is high enough to be worth understanding before
 scaling past nine nodes. On a P-core it fits either way; the profiling decides
 whether there is room to grow.
 
+## DECIDED: TERRY becomes the whole dev environment; the desktop stops running 24/7
+
+**Decided 2026-09-03 (Joe). Not started. Extends the NAS entry above, which
+covers only the sensing server -- this covers where the development work runs.**
+
+### The cost being removed
+
+The desktop (i7-7700K, GTX 1080, 64 GB) is powered 24/7 for one reason: so Joe
+can reach Claude Code from his phone while at work, and from a laptop in the
+evening. Nothing else requires it to be on. That is a gaming rig idling all day
+to serve a text session.
+
+### The desktop is genuinely doing the work, not just relaying it
+
+MEASURED 2026-09-03 from the session transcripts under
+`~/.claude/projects/c--temp-ruview-RuView/`:
+
+  - All 7 session transcripts for this repo carry `bridgeSessionId` records, so
+    remote-driving is the normal mode, not an exception. Two sessions are heavy
+    (826 and 783 bridged records).
+  - Every record carries `"entrypoint":"claude-vscode"`. The executing process
+    is the VS Code extension on `DESKTOP`; the phone and laptop are control
+    surfaces only.
+  - Real builds ran during a bridged session that evening: cargo release
+    artifacts written 20:53-21:05 (7 crates, incremental), and
+    `firmware/esp32-csi-node/build` written at 22:49 (ESP-IDF in Docker).
+
+So relocating the always-on host relocates the builds. That is the constraint
+that decided the rest.
+
+### Repository footprint, MEASURED 2026-09-03
+
+| Chunk | Size | Notes |
+|---|---|---|
+| Tracked working tree | **106 MB** / 3,415 files | the actual repo |
+| `v2/target` | 50.9 GB | regenerable, gitignored |
+| `v2/data` | 43.2 GB in 175 files | raw CSI, gitignored at `.gitignore:46`; single files to 5.3 GB |
+| `.git` | 15.3 GB | history; worth investigating separately |
+| `firmware/.../build*` | 0.6 GB | three build dirs, regenerable |
+| `espressif/idf:v5.4` image | 10.4 GB | |
+
+The headline: a dev host needs ~106 MB of source, not 110 GB. Disk capacity was
+never the real constraint on any candidate machine.
+
+### What was chosen
+
+Consolidate on `TERRY` (F6-424 Max, i5-1235U, **64 GB RAM** confirmed by Joe).
+
+  - sensing server container: `cpuset: "0-3"` (P-cores), per the entry above
+  - dev/build container: `cpuset: "4-11"` (8 E-cores) plus a `mem_limit`
+  - VS Code Remote-SSH into TERRY; the editor UI stays on whatever screen Joe is
+    at, the extension host and toolchain execute on TERRY
+  - build volume on the M.2 NVMe, **not** the HDD array -- cargo writes ~51 GB of
+    `target/` through small random I/O, the worst case for a spinning array
+
+64 GB is what made this safe: the standing objection to putting dev work on the
+NAS was a runaway build OOM-ing the box that also serves storage and sensing.
+A container memory cap plus 64 GB makes that a managed risk.
+
+Reachability MEASURED 2026-09-03: TERRY answers ping; ports 22, 80, 443 and 8181
+open; Docker API 2375 correctly closed. The SSH service is already running.
+
+### Two alternatives considered and rejected
+
+**A dedicated mini as the always-on host (i3-4010U, 8 GB as 2x4, 54 GB SSD).**
+Adequate as a pure control plane -- SSH and Claude Code need ~2-3 GB -- but it
+cannot build: 2 cores at a fixed 1.7 GHz with no turbo, ESTIMATED 4-5x slower
+than the 7700K on a parallel build. It is also 4th-gen Intel, so it cannot run a
+supported Windows (below the Win11 floor; Win10 consumer ESU expires 2026-10),
+making Linux mandatory. Rejected by Joe on the sound principle that a second
+headless device to maintain is not worth adding when the NAS can do the job.
+If it is ever revived, the RAM spec is DDR3L PC3L-12800S SODIMM (1.35 V) -- plain
+1.5 V DDR3 fits the slot and will not work on Haswell ULV.
+
+**A Windows guest running Visual Studio on the TOS hypervisor.** Rejected for
+three reasons:
+
+  1. It weakens the guarantee the whole NAS plan rests on. Docker `cpuset` pins
+     to named physical cores; a VM's vCPUs are host-scheduled, and pinning them
+     to P-cores on a hybrid part through a NAS hypervisor is not dependable.
+     If the server slips to an E-core the failure mode is **lost UDP frames, not
+     latency**.
+  2. Cost: ~16 GB allocated, 4+ vCPUs, a ~50 GB install, and a licence, versus a
+     few hundred MB for a dev container.
+  3. It does not enable the one thing that would justify it. MEASURED by grep:
+     exactly one crate in the workspace has Windows-only code --
+     `wifi-densepose-wifiscan`, the `wlanapi.dll` FFI for ADR-022's Tier 2 scan
+     (`src/adapter/wlanapi_native.rs:103`), and its manifest excludes it from
+     non-Windows targets. Native WLAN scanning needs a **physical radio**, which
+     a NAS guest does not have. That work stays on the desktop or laptop.
+
+The ESP32 CSI path -- sensing server, fleet, firmware -- has no Windows
+dependency at all.
+
+### Out-of-band access: already solved, one gap
+
+If TERRY becomes storage, sensing server and dev host, a wedge while Joe is at
+work must not lock him out. Today it would: the bridged sessions above route
+through Claude's own infrastructure, not the LAN, so **if Claude Code dies there
+is no other door**.
+
+The answer is already in the rack. The gateway at 192.168.1.1 is a UniFi device
+(`unifi.localdomain`, 443/8443 open), always on, and Joe already runs an
+established WireGuard tunnel into it from his personal laptop.
+
+**Gap:** WireGuard peers are per-device. The phone is the device used from work
+and needs its own peer added. Do this before the migration, not after.
+
+### Prerequisites, in order
+
+1. add a WireGuard peer for the phone and verify SSH to TERRY over it
+2. generate an SSH keypair and install it for `clone@TERRY` (`~/.ssh` does not
+   exist on the desktop at all -- still the blocker named in the entry above)
+3. provision the dev container on `cpuset 4-11` with a memory cap, NVMe volume,
+   toolchain inside the container so TOS updates cannot disturb it
+4. clone with `git clone --filter=blob:none` to skip most of the 15.3 GB history
+5. move the sensing server per the entry above
+
+Install nothing into TOS itself; it is a NAS OS and its updates can disrupt
+system-level changes.
+
+### Acceptance test
+
+Not "it builds." Run a full `cargo` build in the dev container while the sensing
+server is live, and confirm both:
+
+  - `ps -o pid,psr,pcpu,comm -T -p $(pgrep sensing-server)` still shows `psr` in
+    0-3, and
+  - the CSI frame rate does not dip during the compile.
+
+`cpuset` pins CPU but does not isolate I/O or interrupts, and the nodes stream
+UDP without retry, so contention would appear as dropped frames rather than lag.
+This is the test that decides whether the consolidation is actually safe.
+
+### One session per working tree
+
+Two Claude sessions ran against this checkout on 2026-09-03 and the branch moved
+underneath one of them (`experiment/seq-gate` -> `main`), leaving its view of
+HEAD stale. **Different topics give no protection**: the shared resource is the
+working tree, not the subject. Git keeps one HEAD and one index per checkout, so
+a branch switch in either session moves both, and uncommitted state is common
+ground.
+
+Use `git worktree add` per concurrent session. Each gets its own HEAD, index and
+dirty state while sharing the 15.3 GB object store, so a second working tree
+costs ~106 MB of checkout rather than a second clone.
+
+Consequence for sizing TERRY's NVMe: `target/` is NOT shared between worktrees.
+Each concurrent worktree that builds costs its own ~51 GB, so two or three live
+sessions means 100-150 GB of build output alone. Size for the number of sessions
+actually wanted, or accept that a shared `CARGO_TARGET_DIR` serialises builds
+behind cargo's lock.
+
+### Related, surfaced by this decision
+
+The 43.2 GB of captures in `v2/data`, plus the fleet baselines at
+`c:/temp/ruview/fleet-baselines`, currently live on the machine that is about to
+stop being always-on. That is irreplaceable measurement data on the box that is
+going away. It should move to TERRY before the desktop becomes occasional-use.
+
 ## OPEN: USB pass for the recovery bootloader
 
 **Blocked on physical access, one board at a time. Not urgent, not optional.**
