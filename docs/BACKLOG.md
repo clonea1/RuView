@@ -9,6 +9,46 @@ designs belong in `docs/adr/`; this file is for *work items*.
 
 Keep entries short and dated. Delete them when done — git remembers.
 
+## SUBMITTED: first wave of upstream PRs (2026-09-03)
+
+Fork: `https://github.com/clonea1/RuView` (public). **All 37 contribution
+branches pushed.** Six PRs opened against `ruvnet/RuView:main`:
+
+| PR | branch | the defect, verified in upstream's own source |
+|---|---|---|
+| [#1791](https://github.com/ruvnet/RuView/pull/1791) | `server-node-positions` | `[2.0, 0.0, 1.5]` hardcoded at **four** sites; every node reports the same position |
+| [#1792](https://github.com/ruvnet/RuView/pull/1792) | `subcarrier-grids-256` | `EDGE_MAX_SUBCARRIERS 128` truncates 256-bin HE20 on C6/C5, silently |
+| [#1793](https://github.com/ruvnet/RuView/pull/1793) | `server-classification-stability` | their own doc says "at ~10 FPS"; C6 delivers 48-50 |
+| [#1794](https://github.com/ruvnet/RuView/pull/1794) | `ui-no-fabricated-data` | client renders simulation indistinguishably from live data |
+| [#1795](https://github.com/ruvnet/RuView/pull/1795) | `wifi-retry-watchdog` | `MAX_RETRY 10` then never reconnects; cost 7.5 h here |
+| [#1796](https://github.com/ruvnet/RuView/pull/1796) | `disable-unused-154-radio` | 802.15.4 started but never received; costs coexistence airtime |
+
+**Every claim was checked against `origin/main` before being written into a
+public PR body.** That mattered once: the backlog asserted issues #228/#249/#301
+were about the hardcoded position. In fact #228 is closed and about
+documentation, #301 is a "Known Issues" page, and only **#249** is a genuine
+symptom match ("shows the same thing regardless of position"). #1791 cites it as
+consistent-with rather than as a diagnosis, because the root cause of that
+reporter's problem cannot be confirmed from here.
+
+### Privacy audit after the push
+
+Zero pushed branches contain `room_config.json`, `board_index.json` or
+`provision_conf*.json`. The fork's `main` came from upstream, not from this
+tree. Names, real MACs and LAN IPs were scrubbed from **diffs and commit
+messages** before any push. The pre-push hook was exercised beforehand and
+correctly returns 1 for a branch carrying house data and 0 for a `contrib/*`
+branch.
+
+### Held back deliberately
+
+The 31 remaining branches are pushed but unopened. The stacked families
+(`server-wire-v3` -> `server-links` -> `server-emitter-triage`, and the
+room-builder chain) only make sense reviewed in dependency order, and 37 PRs
+from a new contributor at once is not a reviewable proposition. The first wave
+also answers whether the maintainer engages at all, which decides how much
+effort the rest deserve.
+
 ## PLANNED: move the sensing server to the NAS (Docker)
 
 **Decided 2026-09-03 (Joe). Not started — filed deliberately rather than built.**
