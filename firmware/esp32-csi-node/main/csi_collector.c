@@ -327,9 +327,6 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
 {
     (void)ctx;
 
-    if ((s_cen_rx.seen % 1000u) == 0u) {
-    }
-
     /* ADR-060: MAC address filtering — drop frames from non-matching sources.
      * Uses defensively-copied s_filter_mac instead of g_nvs_config (which can
      * be corrupted by wifi_init_sta — same root cause as the node_id clobber).
@@ -379,10 +376,52 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
      * 50 Hz, which is fine for a bench capture and not for a soak. */
 
     /* Early rate gate: drop excess callbacks to ~50 Hz to prevent
-     * SPI flash cache crash in WiFi ISR (wDev_ProcessFiq). */
+     * SPI flash cache crash in WiFi ISR (wDev_ProcessFiq).
+     *
+     * HOW the rate is limited decides whether cross-node fusion is possible.
+     *
+     * The original gate is "at least 20 ms since MY last accept". Each node
+     * therefore has an independent phase: node A can accept at t=0,20,40 ms
+     * while node B accepts at 7,27,47. Both are perfectly healthy and both hit
+     * 50 Hz, yet they accept disjoint frames and nothing can be paired.
+     *
+     * MEASURED 2026-08-30, two boards side by side: they HEARD the same
+     * transmissions 72% of the time but only 25% of accepted frames were
+     * common. The frames were there; the gate was throwing away the pairing.
+     *
+     * So gate on a bucket of the MESH-ALIGNED epoch instead: every node takes
+     * the first frame it hears in the same absolute 20 ms window. Two nodes
+     * that heard the same frame now both accept it. Mesh sync is good to
+     * roughly 490 us against a 20 ms bucket -- about 2.5% of a window -- so
+     * boundary disagreements are rare.
+     *
+     * Falls back to the original elapsed-time gate whenever mesh sync is not
+     * valid (no leader heard yet, or a node that just booted), because an
+     * unsynced epoch would otherwise gate on a meaningless number. A node
+     * running unsynced simply gets the old behaviour rather than no gate.
+     *
+     * The half-interval floor below keeps the crash protection honest: bucket
+     * gating alone could accept at the end of one window and the start of the
+     * next, back to back. The floor bounds that to ~100 Hz for a single pair
+     * while the average stays at 50 Hz. Do not remove it; the gate exists for
+     * a crash, not for tidiness. */
     int64_t now_us = esp_timer_get_time();
     bool take;
+#ifdef CONFIG_CSI_GATE_MESH_ALIGNED
+    if (c6_sync_espnow_is_valid()) {
+        uint64_t bucket = c6_sync_espnow_get_epoch_us()
+                        / (uint64_t)CSI_MIN_PROCESS_INTERVAL_US;
+        take = (bucket != s_last_gate_bucket)
+            && ((now_us - s_last_process_us) >= CSI_MIN_PROCESS_INTERVAL_US / 2);
+        if (take) {
+            s_last_gate_bucket = bucket;
+        }
+    } else {
+        take = (now_us - s_last_process_us) >= CSI_MIN_PROCESS_INTERVAL_US;
+    }
+#else
     take = (now_us - s_last_process_us) >= CSI_MIN_PROCESS_INTERVAL_US;
+#endif
     if (!take) {
         s_early_drop++;
         return;
@@ -887,6 +926,20 @@ uint16_t csi_collector_get_send_fail_count(void)
 {
     uint32_t f = s_send_fail;
     return (f > 0xFFFFu) ? 0xFFFFu : (uint16_t)f;
+}
+
+/* The gate here is fixed at compile time (mesh-aligned bucketing, falling
+ * back to elapsed time when unsynced), so there is no mode or period to
+ * report. Return the explicit sentinel rather than a number that reads as
+ * a real setting. */
+uint8_t csi_collector_get_gate_mode(void)
+{
+    return CSI_GATE_NOT_CONFIGURABLE;
+}
+
+uint8_t csi_collector_get_gate_seq_period(void)
+{
+    return CSI_GATE_NOT_CONFIGURABLE;
 }
 
 /* ---- ADR-029: Channel hopping ---- */
