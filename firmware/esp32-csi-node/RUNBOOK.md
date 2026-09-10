@@ -16,11 +16,51 @@ below was learned by getting it wrong at least once.
 MSYS_NO_PATHCONV=1 docker run --rm \
   -v "$(pwd)/firmware/esp32-csi-node:/project" -w /project \
   espressif/idf:v5.4 bash -c \
-  "cat sdkconfig.defaults sdkconfig.defaults.16mb sdkconfig.defaults.esp32c6 \
+  "cat sdkconfig.defaults sdkconfig.defaults.esp32c6 sdkconfig.defaults.16mb \
      > sdkconfig.defaults.build && \
    SDKCONFIG_DEFAULTS='sdkconfig.defaults.build' idf.py set-target esp32c6 && \
    idf.py build"
 ```
+
+### CORRECTED 2026-09-10 — the order of the last two files was wrong
+
+This command previously read `... sdkconfig.defaults.16mb sdkconfig.defaults.esp32c6`,
+and **it produced the 4MB image this runbook exists to prevent.** In a single
+concatenated file the *last* assignment wins, and the three files disagree:
+
+| file | sets |
+|---|---|
+| `sdkconfig.defaults` | `FLASHSIZE "8MB"`, `partitions_display.csv` |
+| `sdkconfig.defaults.16mb` | `FLASHSIZE "16MB"`, `partitions_16mb.csv`, `BOOTLOADER_APP_ROLLBACK_ENABLE=y` |
+| `sdkconfig.defaults.esp32c6` | `FLASHSIZE "4MB"`, `partitions_4mb.csv` |
+
+With `.esp32c6` last it overrode `.16mb`, so the build came out 4MB with
+`partitions_4mb.csv`. Only the rollback flag survived, because `.esp32c6` does
+not set it -- which is exactly why this was hard to spot: the one symptom the
+old text warned about (missing rollback) was the one symptom that *didn't*
+appear.
+
+**MEASURED both ways, 2026-09-10**, same worktree, same container, only the
+order changed:
+
+```
+.16mb then .esp32c6  ->  FLASHSIZE "4MB"   partitions_4mb.csv    ROLLBACK=y
+.esp32c6 then .16mb  ->  FLASHSIZE "16MB"  partitions_16mb.csv   ROLLBACK=y
+```
+
+`.16mb` must come **last** because it is the override layer: it is the only
+file that describes the fleet's actual flash geometry, and every earlier file
+is a more general default.
+
+### OPEN: `DYNAMIC_TX_BUFFER_NUM` is 64 here, but the fleet is documented at 128
+
+Even with the corrected order the build yields
+`CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=64`. Only `sdkconfig.defaults` sets it
+(to 64) and neither other file overrides it, so **no combination of these three
+files produces 128.** Either 128 arrives from somewhere not yet found, or the
+"fleet runs 128" claim is wrong. Do not "fix" this by editing a defaults file
+until that is settled -- read it off a running node first. The verification
+grep below therefore expects 64 today, not 128.
 
 Takes ~3 minutes cold, well under a minute incremental.
 
