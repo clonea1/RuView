@@ -52,6 +52,19 @@ order changed:
 file that describes the fleet's actual flash geometry, and every earlier file
 is a more general default.
 
+**This is not a new theory -- it restores what the file always said.**
+`sdkconfig.defaults.16mb` documents the correct order in its own header:
+
+```
+# Build:
+#   idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32c6;sdkconfig.defaults.16mb" build
+```
+
+So there are two independent confirmations: the A/B measurement above, and the
+file's own docstring. The runbook's `cat` simply had the last two arguments
+transposed relative to the instructions sitting inside the file it was
+concatenating.
+
 ### OPEN: `DYNAMIC_TX_BUFFER_NUM` is 64 here, but the fleet is documented at 128
 
 Even with the corrected order the build yields
