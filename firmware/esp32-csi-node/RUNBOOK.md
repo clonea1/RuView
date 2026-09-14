@@ -10,7 +10,10 @@ below was learned by getting it wrong at least once.
 
 ## 1. Build
 
-**One command. Copy it.** From the **repository root**, not this directory:
+**Pick the command for your board's flash size, then copy it.** Run from the
+**repository root**, not this directory.
+
+### 16MB boards
 
 ```bash
 MSYS_NO_PATHCONV=1 docker run --rm \
@@ -22,10 +25,40 @@ MSYS_NO_PATHCONV=1 docker run --rm \
    idf.py build"
 ```
 
-### CORRECTED 2026-09-10 — the order of the last two files was wrong
+### 4MB and 8MB C6 dev boards
 
-This command previously read `... sdkconfig.defaults.16mb sdkconfig.defaults.esp32c6`,
-and **it produced the 4MB image this runbook exists to prevent.** In a single
+**Omit `sdkconfig.defaults.16mb` entirely.** `sdkconfig.defaults.esp32c6`
+already carries 4MB geometry, so with the 16MB layer absent the target overlay
+is the last word and no override is needed:
+
+```bash
+MSYS_NO_PATHCONV=1 docker run --rm \
+  -v "$(pwd)/firmware/esp32-csi-node:/project" -w /project \
+  espressif/idf:v5.4 bash -c \
+  "cat sdkconfig.defaults sdkconfig.defaults.esp32c6 \
+     > sdkconfig.defaults.build && \
+   SDKCONFIG_DEFAULTS='sdkconfig.defaults.build' idf.py set-target esp32c6 && \
+   idf.py build"
+```
+
+That yields `FLASHSIZE "4MB"` with `partitions_4mb.csv` -- two 1.875 MB OTA
+slots against a roughly 978 KB binary, so OTA has ample headroom.
+
+**One behavioural difference to know about.** `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`
+is set *only* in `sdkconfig.defaults.16mb`. A 4MB build therefore has no
+automatic rollback: an OTA'd image does not boot PENDING_VERIFY and the
+bootloader will not revert a bad image on the next boot. Nothing about 4MB
+flash forces that -- `partitions_4mb.csv` has an `otadata` partition and two
+OTA slots -- it is simply which layer the flag currently lives in. Treat a 4MB
+OTA as unguarded until that is changed deliberately, and keep a serial recovery
+path available.
+
+### CORRECTED 2026-09-10 — why order matters on the 16MB path
+
+The 16MB command previously read
+`... sdkconfig.defaults.16mb sdkconfig.defaults.esp32c6`, and **it silently produced a
+4MB image on 16MB hardware** -- not a broken build, just the wrong one, which is
+why it survived so long. In a single
 concatenated file the *last* assignment wins, and the three files disagree:
 
 | file | sets |
