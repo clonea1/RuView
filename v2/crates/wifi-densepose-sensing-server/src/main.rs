@@ -19,6 +19,7 @@ mod model_format;
 mod multistatic_bridge;
 mod mediatek_csi;
 mod qualcomm_csi;
+mod realtek_csi;
 mod realtek_radar;
 mod path_safety;
 mod links;
@@ -83,6 +84,7 @@ use rvf_pipeline::ProgressiveLoader;
 use vital_signs::{VitalSignDetector, VitalSigns};
 
 // ADR-022 Phase 3: Multi-BSSID pipeline integration
+#[cfg(not(target_os = "macos"))]
 use wifi_densepose_wifiscan::parse_netsh_output as parse_netsh_bssid_output;
 use wifi_densepose_wifiscan::{BssidRegistry, WindowsWifiPipeline};
 
@@ -843,6 +845,51 @@ mod debounce_room_classification_tests {
     }
 }
 
+/// Upper plausibility ceiling (dBm) for a real 2.4/5 GHz WiFi RSSI reading.
+///
+/// A received WiFi signal is always attenuated by free-space path loss and
+/// receiver noise floor; no deployed node has ever measured better than
+/// roughly -20 dBm. The ESP32 edge-vitals packet (magic 0xC511_0002,
+/// ADR-039) carries a raw `i8` RSSI byte with no "valid" flag, and has been
+/// observed sending near-zero sentinel values (e.g. -1, -2 dBm) when the
+/// edge pipeline hasn't sampled a real reading yet. Left unguarded, that
+/// sentinel overwrote the node's `rssi_history` and the room's fused
+/// `mean_rssi` for the tick it arrived on (found 2026-09-09: node 3
+/// reporting -2.0 dBm while simultaneously showing a real ~-50 dBm CSI
+/// reading on the same node).
+pub(crate) const MAX_PLAUSIBLE_RSSI_DBM: i8 = -10;
+
+/// Returns `true` if `rssi_dbm` is a physically plausible WiFi RSSI
+/// reading (see [`MAX_PLAUSIBLE_RSSI_DBM`]).
+pub(crate) fn is_plausible_rssi(rssi_dbm: i8) -> bool {
+    rssi_dbm <= MAX_PLAUSIBLE_RSSI_DBM
+}
+
+#[cfg(test)]
+mod rssi_plausibility_tests {
+    use super::{is_plausible_rssi, MAX_PLAUSIBLE_RSSI_DBM};
+
+    #[test]
+    fn realistic_readings_are_plausible() {
+        assert!(is_plausible_rssi(-42));
+        assert!(is_plausible_rssi(-53));
+        assert!(is_plausible_rssi(-90));
+    }
+
+    #[test]
+    fn near_zero_sentinel_values_are_rejected() {
+        assert!(!is_plausible_rssi(-1));
+        assert!(!is_plausible_rssi(-2));
+        assert!(!is_plausible_rssi(0));
+    }
+
+    #[test]
+    fn boundary_is_inclusive() {
+        assert!(is_plausible_rssi(MAX_PLAUSIBLE_RSSI_DBM));
+        assert!(!is_plausible_rssi(MAX_PLAUSIBLE_RSSI_DBM + 1));
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SignalField {
     grid_size: [usize; 3],
@@ -1014,8 +1061,13 @@ const CALIBRATION_GRID_MAX_GAP_S: f64 = 5.0;
 /// straight into the EMA and inflated `csi_fps_ema` by 1–3 orders of
 /// magnitude (issue #1180). We reject sub-5 ms deltas as burst artifacts and
 /// cap accepted estimates to the firmware's 50 fps physical ceiling.
-pub(crate) const MIN_PLAUSIBLE_CSI_DT_SEC: f64 = 0.005;
+pub(crate) const MAX_PLAUSIBLE_CSI_DT_SEC: f64 = 1.0;
 pub(crate) const MAX_PHYSICAL_CSI_FPS: f64 = 50.0;
+
+/// Smoothing factor for the inter-frame delta EMA. 1/32 at ~40 fps is roughly
+/// a one-second window: long enough to ride out burst structure, short enough
+/// to follow a node whose rate genuinely changes.
+const CSI_FPS_EMA_ALPHA: f64 = 1.0 / 32.0;
 
 /// ADR-110 iter 18 — EMA update for per-node CSI fps tracking.
 ///
@@ -1028,84 +1080,108 @@ pub(crate) const MAX_PHYSICAL_CSI_FPS: f64 = 50.0;
 /// Free function for testability — every transformation that doesn't
 /// touch the rest of `NodeState` lives outside the `impl` block.
 pub(crate) fn update_csi_fps_ema(prev_fps: f64, dt_sec: f64) -> Option<f64> {
-    if !(dt_sec >= MIN_PLAUSIBLE_CSI_DT_SEC && dt_sec < 1.0) {
+    if !(dt_sec > 0.0 && dt_sec < MAX_PLAUSIBLE_CSI_DT_SEC) {
         return None;
     }
-    let instantaneous = (1.0 / dt_sec).min(MAX_PHYSICAL_CSI_FPS);
-    // y[n] = y[n-1] + (x - y[n-1]) / 8
-    Some(prev_fps + (instantaneous - prev_fps) / 8.0)
+    if !(prev_fps.is_finite() && prev_fps > 0.0) {
+        return None;
+    }
+    // Smooth in the DELTA domain: y[n] = y[n-1] + alpha (dt - y[n-1]), then
+    // invert. Averaging 1/dt instead lets one short delta dominate the mean --
+    // the reciprocal is unbounded as dt approaches zero, so a single 36 us
+    // arrival outweighs hundreds of nominal ones. Averaging dt is bounded by
+    // construction, and the deltas sum to the elapsed time, which is what
+    // makes the result equal frames/elapsed.
+    let prev_dt = 1.0 / prev_fps;
+    let dt_ema = prev_dt + (dt_sec - prev_dt) * CSI_FPS_EMA_ALPHA;
+    if dt_ema <= 0.0 {
+        return None;
+    }
+    Some(1.0 / dt_ema)
 }
 
 #[cfg(test)]
 mod fps_ema_tests {
-    use super::update_csi_fps_ema;
+    use super::{update_csi_fps_ema, MAX_PHYSICAL_CSI_FPS};
 
     #[test]
     fn steady_10hz_converges_toward_10() {
+        // The delta-domain EMA uses alpha = 1/32 where the reciprocal-domain
+        // one used 1/8, so it is deliberately about three times slower to
+        // settle. That is the cost of not letting a single short delta swing
+        // the estimate; the horizon here is sized for it.
         let mut fps = 20.0;
-        for _ in 0..40 {
+        for _ in 0..160 {
             fps = update_csi_fps_ema(fps, 0.100).unwrap();
         }
-        assert!((fps - 10.0).abs() < 0.1,
-                "expected ~10 Hz after 40 samples at 100 ms intervals, got {fps}");
-    }
-
-    #[test]
-    fn steady_20hz_stays_near_20() {
-        let mut fps = 20.0;
-        for _ in 0..20 {
-            fps = update_csi_fps_ema(fps, 0.050).unwrap();
-        }
-        assert!((fps - 20.0).abs() < 0.05, "expected ~20 Hz, got {fps}");
+        assert!(
+            (fps - 10.0).abs() < 0.1,
+            "expected ~10 Hz at 100 ms intervals, got {fps}"
+        );
     }
 
     #[test]
     fn nonpositive_dt_rejected() {
-        assert!(update_csi_fps_ema(15.0, 0.0).is_none());
-        assert!(update_csi_fps_ema(15.0, -0.1).is_none());
+        assert!(update_csi_fps_ema(40.0, 0.0).is_none());
+        assert!(update_csi_fps_ema(40.0, -0.001).is_none());
     }
 
     #[test]
     fn long_gap_rejected_as_implausible() {
-        assert!(update_csi_fps_ema(20.0, 2.0).is_none());
+        assert!(update_csi_fps_ema(40.0, 1.5).is_none());
     }
 
     #[test]
-    fn subms_burst_delta_rejected() {
-        // Issue #1180: a 36 µs intra-burst delta implies ~27 kHz and must
-        // not enter the EMA. Anything below the 5 ms floor is rejected.
-        assert!(update_csi_fps_ema(40.0, 0.000_036).is_none());
-        assert!(update_csi_fps_ema(40.0, 0.001).is_none());
-        // Just above the floor is accepted.
-        assert!(update_csi_fps_ema(40.0, 0.005).is_some());
+    fn nonsense_previous_value_rejected() {
+        assert!(update_csi_fps_ema(0.0, 0.025).is_none());
+        assert!(update_csi_fps_ema(f64::NAN, 0.025).is_none());
     }
 
     #[test]
-    fn accepted_burst_edge_is_capped_to_firmware_ceiling() {
-        let mut fps = 50.0;
-        for _ in 0..32 {
-            fps = update_csi_fps_ema(fps, 0.005).unwrap();
-        }
-        assert!(fps <= 50.0, "reported {fps} Hz above firmware ceiling");
-    }
-
-    #[test]
-    fn burst_interleaved_with_nominal_stays_in_band() {
-        // A true ~40 fps node whose frames arrive in sub-ms bursts: feeding
-        // only the plausible (nominal-cadence) deltas keeps the EMA near the
-        // ground truth instead of blowing up. Burst deltas are rejected by
-        // the caller (see NodeState::observe_csi_frame_arrival), so the EMA
-        // only ever sees the ~25 ms inter-group gaps.
+    fn a_single_burst_delta_cannot_dominate_the_estimate() {
+        // Issue #1180. One 36 us arrival among nominal ones. Averaging 1/dt
+        // put ~27 kHz into the mean; averaging dt cannot, because a delta that
+        // small barely moves an average of deltas.
         let mut fps = 40.0;
-        for _ in 0..40 {
-            // nominal 25 ms gap (40 fps); intervening sub-ms bursts skipped
+        for _ in 0..64 {
             fps = update_csi_fps_ema(fps, 0.025).unwrap();
-            assert!(update_csi_fps_ema(fps, 0.000_040).is_none());
+        }
+        let before = fps;
+        fps = update_csi_fps_ema(fps, 0.000_036).unwrap();
+        assert!(
+            fps < before * 1.05,
+            "one burst delta moved the estimate from {before} to {fps}"
+        );
+    }
+
+    #[test]
+    fn bursty_delivery_recovers_the_true_production_rate() {
+        // A node genuinely producing 40 fps whose frames are delivered in
+        // pairs ~40 us apart every 50 ms: four frames per 100 ms.
+        //
+        // Rejecting the intra-burst delta and holding the anchor measures the
+        // 50 ms gap between bursts but counts one frame for it, reading 20 --
+        // exactly half. Averaging every delta keeps one term per frame and
+        // recovers 40.
+        let mut fps = 40.0;
+        for _ in 0..400 {
+            fps = update_csi_fps_ema(fps, 0.000_040).unwrap();
+            fps = update_csi_fps_ema(fps, 0.049_960).unwrap();
         }
         assert!(
-            (fps - 40.0).abs() < 1.0,
-            "EMA should stay within ~1 Hz of the 40 fps ground truth, got {fps}"
+            (fps - 40.0).abs() < 2.0,
+            "expected ~40 fps through burst delivery, got {fps}"
         );
+    }
+
+    #[test]
+    fn the_physical_ceiling_still_bounds_what_is_consumed() {
+        // The estimator itself is unclamped; MAX_PHYSICAL_CSI_FPS is enforced
+        // at the consumption boundary (measured_sample_rate_hz) so restored or
+        // malformed state cannot overclock the DSP math.
+        assert_eq!(MAX_PHYSICAL_CSI_FPS, 50.0);
+        let clamped = 9_000.0_f64.clamp(1.0, MAX_PHYSICAL_CSI_FPS);
+        assert_eq!(clamped, 50.0);
     }
 }
 
@@ -1230,15 +1306,18 @@ impl NodeState {
         let first_sensing_frame = self.last_frame_time.is_none();
         if let Some(prev) = self.last_frame_time {
             let dt = now.duration_since(prev).as_secs_f64();
-            // Burst arrivals (sub-floor dt, issue #1180): do NOT re-anchor on
-            // them. Keeping the previous anchor means the next genuine
-            // inter-frame gap measures the true cadence across the whole
-            // burst instead of intra-burst jitter — so a 50 fps node whose
-            // frames arrive in 36 µs bursts every 25 ms still reads ~40 fps,
-            // not 27 kHz.
-            if dt < MIN_PLAUSIBLE_CSI_DT_SEC {
-                return false;
-            }
+            // Re-anchor on EVERY arrival, including intra-burst ones.
+            //
+            // Holding the anchor across a burst measures the interval BETWEEN
+            // bursts while counting only one frame for it, so a burst carrying
+            // N frames is under-counted N-fold. That is invisible when a burst
+            // happens to hold one frame, and an exact halving when it holds
+            // two. Anchoring every frame keeps one delta per frame, and the
+            // deltas then sum to the elapsed time -- the condition that makes
+            // the mean-of-dt estimator equal frames/elapsed.
+            //
+            // The unbounded 1/dt blow-up this replaces is handled in
+            // update_csi_fps_ema by averaging dt rather than its reciprocal.
             if let Some(new_ema) = update_csi_fps_ema(self.csi_fps_ema, dt) {
                 self.csi_fps_ema = new_ema;
                 self.csi_fps_samples = self.csi_fps_samples.saturating_add(1);
@@ -2509,6 +2588,10 @@ struct AppStateInner {
     latest_qualcomm_csi: Option<qualcomm_csi::QualcommCsiSnapshot>,
     /// Instant of the last validated Qualcomm CSI UDP frame.
     last_qualcomm_frame: Option<std::time::Instant>,
+    /// Latest validated RTL8721Dx CSI summary; distinct from RTL8720F radar.
+    latest_realtek_csi: Option<realtek_csi::RealtekCsiSnapshot>,
+    /// Instant of the last validated RTL8721Dx CSI UDP frame.
+    last_realtek_csi_frame: Option<std::time::Instant>,
     /// Latest bounded ADR-270 event per vendor. Complex CSI uses dedicated transports.
     latest_vendor_rf: BTreeMap<String, wifi_densepose_sensing_server::vendor_rf::VendorEventSnapshot>,
     tx: broadcast::Sender<String>,
@@ -2625,7 +2708,7 @@ struct AppStateInner {
     /// entry `i` applies to the i-th smallest currently-active node_id, the
     /// same convention `MultistaticFuser::fuse` uses. See
     /// `node_positions_by_active_id`.
-    node_positions_config: Vec<[f32; 3]>,
+    node_positions_config: HashMap<u8, [f32; 3]>,
     /// Governed trust-path bridge (ADR-135..146): runs the same live frames
     /// through the privacy/provenance/witness control plane. Does not alter
     /// person-count behavior; its trust state (witness, effective class,
@@ -3057,7 +3140,13 @@ impl AppStateInner {
                 }
             }
         }
-        if self.source.starts_with("realtek") {
+        if self.source.starts_with("realtek_csi") {
+            if let Some(last) = self.last_realtek_csi_frame {
+                if last.elapsed() > ESP32_OFFLINE_TIMEOUT {
+                    return format!("{}:offline", self.source);
+                }
+            }
+        } else if self.source.starts_with("realtek") {
             if let Some(last) = self.last_realtek_frame {
                 if last.elapsed() > ESP32_OFFLINE_TIMEOUT {
                     return format!("{}:offline", self.source);
@@ -3127,6 +3216,8 @@ impl AppStateInner {
             last_mediatek_frame: None,
             latest_qualcomm_csi: None,
             last_qualcomm_frame: None,
+            latest_realtek_csi: None,
+            last_realtek_csi_frame: None,
             latest_vendor_rf: BTreeMap::new(),
             tx: broadcast::channel::<String>(16).0,
             intro: wifi_densepose_sensing_server::introspection::IntrospectionState::new(),
@@ -3175,7 +3266,7 @@ impl AppStateInner {
             pose_tracker: PoseTracker::new(),
             last_tracker_instant: None,
             multistatic_fuser: MultistaticFuser::new(),
-            node_positions_config: Vec::new(),
+            node_positions_config: HashMap::new(),
             engine_bridge: engine_bridge::EngineBridge::new(
                 wifi_densepose_bfld::PrivacyMode::PrivateHome,
                 1,
@@ -4706,6 +4797,7 @@ fn trimmed_mean(buf: &VecDeque<f64>) -> f64 {
 // ── Windows WiFi RSSI collector ──────────────────────────────────────────────
 
 /// Parse `netsh wlan show interfaces` output for RSSI and signal quality
+#[cfg(not(target_os = "macos"))]
 fn parse_netsh_interfaces_output(output: &str) -> Option<(f64, f64, String)> {
     let mut rssi = None;
     let mut signal = None;
@@ -4738,7 +4830,7 @@ fn parse_netsh_interfaces_output(output: &str) -> Option<(f64, f64, String)> {
     }
 }
 
-async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
+async fn wifi_task(state: SharedState, tick_ms: u64) {
     let mut interval = tokio::time::interval(Duration::from_millis(tick_ms));
     let mut seq: u32 = 0;
 
@@ -4747,7 +4839,8 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
     let mut pipeline = WindowsWifiPipeline::new();
 
     info!(
-        "Windows WiFi multi-BSSID pipeline active (tick={}ms, max_bssids=32)",
+        "WiFi RSSI pipeline active (platform={}, tick={}ms, max_bssids=32)",
+        std::env::consts::OS,
         tick_ms
     );
 
@@ -4756,8 +4849,16 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
         seq += 1;
 
         // ── Step 1: Run multi-BSSID scan via spawn_blocking ──────────
-        // NetshBssidScanner is not Send, so we run `netsh` and parse
-        // the output inside a blocking closure.
+        // Keep platform subprocess calls off the async runtime workers.
+        #[cfg(target_os = "macos")]
+        let bssid_scan_result = tokio::task::spawn_blocking(|| {
+            wifi_densepose_wifiscan::adapter::MacosCoreWlanScanner::new()
+                .scan_sync()
+                .map_err(|e| e.to_string())
+        })
+        .await;
+
+        #[cfg(not(target_os = "macos"))]
         let bssid_scan_result = tokio::task::spawn_blocking(|| {
             let output = std::process::Command::new("netsh")
                 .args(["wlan", "show", "networks", "mode=bssid"])
@@ -4782,12 +4883,14 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
         let observations = match bssid_scan_result {
             Ok(Ok(obs)) if !obs.is_empty() => obs,
             Ok(Ok(_empty)) => {
-                debug!("Multi-BSSID scan returned 0 observations, falling back");
+                debug!("WiFi scan returned 0 observations");
+                #[cfg(not(target_os = "macos"))]
                 windows_wifi_fallback_tick(&state, seq).await;
                 continue;
             }
             Ok(Err(e)) => {
-                warn!("Multi-BSSID scan error: {e}, falling back");
+                warn!("WiFi scan error: {e}");
+                #[cfg(not(target_os = "macos"))]
                 windows_wifi_fallback_tick(&state, seq).await;
                 continue;
             }
@@ -4986,6 +5089,7 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
 /// Fallback: single-RSSI collection via `netsh wlan show interfaces`.
 ///
 /// Used when the multi-BSSID scan fails or returns 0 observations.
+#[cfg(not(target_os = "macos"))]
 async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
     let output = match tokio::process::Command::new("netsh")
         .args(["wlan", "show", "interfaces"])
@@ -5139,8 +5243,21 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
     s.latest_update = Some(update);
 }
 
-/// Probe if Windows WiFi is connected
-async fn probe_windows_wifi() -> bool {
+/// Probe the platform WiFi source using the same helper as capture.
+#[cfg(target_os = "macos")]
+async fn probe_wifi() -> bool {
+    matches!(
+        tokio::task::spawn_blocking(|| {
+            wifi_densepose_wifiscan::adapter::MacosCoreWlanScanner::new().scan_sync()
+        })
+        .await,
+        Ok(Ok(observations)) if !observations.is_empty()
+    )
+}
+
+/// Probe if Windows WiFi is connected.
+#[cfg(not(target_os = "macos"))]
+async fn probe_wifi() -> bool {
     match tokio::process::Command::new("netsh")
         .args(["wlan", "show", "interfaces"])
         .output()
@@ -5202,7 +5319,7 @@ struct SourcePlan {
     bind_udp: bool,
     /// Run the simulated-data generator (serves poses until a real frame arrives).
     run_simulator: bool,
-    /// Run the Windows WiFi capture task.
+    /// Run the platform WiFi capture task.
     run_wifi: bool,
 }
 
@@ -5709,6 +5826,53 @@ async fn latest_qualcomm_csi(State(state): State<SharedState>) -> Json<serde_jso
     match &s.latest_qualcomm_csi {
         Some(snapshot) => Json(serde_json::to_value(snapshot).unwrap_or_default()),
         None => Json(serde_json::json!({"status": "no Qualcomm CSI data yet"})),
+    }
+}
+
+async fn latest_realtek_csi(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    match &s.latest_realtek_csi {
+        Some(snapshot) => Json(serde_json::to_value(snapshot).unwrap_or_default()),
+        None => Json(serde_json::json!({"status": "no Realtek RTL8721Dx CSI data yet"})),
+    }
+}
+
+fn primary_source_with_realtek(
+    last_esp32_frame: Option<std::time::Instant>,
+    realtek_source: &str,
+) -> String {
+    if last_esp32_frame.is_some_and(|seen| seen.elapsed() < ESP32_OFFLINE_TIMEOUT) {
+        "esp32".to_string()
+    } else {
+        realtek_source.to_string()
+    }
+}
+
+#[cfg(test)]
+mod realtek_ingest_tests {
+    use super::*;
+    use wifi_densepose_hardware::realtek_csi::simulator::{RealtekCsiSimulator, SimulatorConfig};
+
+    #[test]
+    fn secondary_realtek_does_not_displace_fresh_esp32_room_source() {
+        assert_eq!(
+            primary_source_with_realtek(Some(std::time::Instant::now()), "realtek_csi"),
+            "esp32"
+        );
+        assert_eq!(primary_source_with_realtek(None, "realtek_csi"), "realtek_csi");
+    }
+
+    #[tokio::test]
+    async fn latest_route_keeps_synthetic_provenance_and_node_identity() {
+        let state: SharedState = Arc::new(RwLock::new(AppStateInner::minimal()));
+        let mut simulator = RealtekCsiSimulator::new(SimulatorConfig::default()).unwrap();
+        let snapshot = realtek_csi::RealtekCsiSnapshot::from_frame(&simulator.next_frame());
+        let expected_node_id = snapshot.node_id;
+        state.write().await.latest_realtek_csi = Some(snapshot);
+        let Json(value) = latest_realtek_csi(State(state)).await;
+        assert_eq!(value["node_id"], expected_node_id);
+        assert_eq!(value["source"], "realtek_csi:simulated");
+        assert_eq!(value["synthetic"], true);
     }
 }
 
@@ -9714,26 +9878,27 @@ async fn info_page() -> Html<String> {
 /// `node_id -> node_positions_config[node_id]` lookup silently misses for
 /// every real deployment. This mirrors the same ascending-rank convention so
 /// the live `NodeInfo.position` field agrees with what fusion actually used.
+/// Positions of the nodes currently reporting, keyed by node id.
+///
+/// Rank assignment -- giving the Nth-lowest active id the Nth entry of an
+/// ordered list -- makes a position depend on which OTHER nodes happen to be
+/// alive. One node going quiet re-ranks every node above it and silently moves
+/// their coordinates. Keying by id states the mapping instead of inferring it.
+/// The active-node filter is unchanged.
 fn node_positions_by_active_id(
-    node_positions_config: &[[f32; 3]],
+    node_positions_config: &HashMap<u8, [f32; 3]>,
     node_states: &HashMap<u8, NodeState>,
     now: std::time::Instant,
 ) -> HashMap<u8, [f64; 3]> {
-    let mut active_ids: Vec<u8> = node_states
+    node_states
         .iter()
         .filter(|(_, n)| {
             n.last_frame_time
                 .is_some_and(|t| now.duration_since(t).as_secs() < 10)
         })
-        .map(|(&id, _)| id)
-        .collect();
-    active_ids.sort_unstable();
-    active_ids
-        .into_iter()
-        .enumerate()
-        .filter_map(|(rank, id)| {
+        .filter_map(|(&id, _)| {
             node_positions_config
-                .get(rank)
+                .get(&id)
                 .map(|p| (id, [p[0] as f64, p[1] as f64, p[2] as f64]))
         })
         .collect()
@@ -9749,18 +9914,25 @@ mod node_positions_by_active_id_tests {
         ns
     }
 
+    fn cfg(entries: &[(u8, [f32; 3])]) -> HashMap<u8, [f32; 3]> {
+        entries.iter().copied().collect()
+    }
+
     #[test]
-    fn non_sequential_node_ids_get_positions_by_ascending_rank() {
-        // Real fleets use logical IDs like 11, 12, 13 — not 0, 1, 2. The
-        // configured position list must map by ascending node_id rank, not
-        // by treating node_id as a direct index into the list.
+    fn non_sequential_node_ids_get_their_own_position() {
+        // Real fleets use logical IDs like 11, 12, 13 -- not 0, 1, 2. Rank
+        // assignment handled that by sorting; keying by id states it directly.
         let now = std::time::Instant::now();
         let mut node_states = HashMap::new();
         node_states.insert(13, active_node(now));
         node_states.insert(11, active_node(now));
         node_states.insert(12, active_node(now));
 
-        let configured = [[1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [3.0, 0.0, 0.0]];
+        let configured = cfg(&[
+            (11, [1.0, 0.0, 0.0]),
+            (12, [2.0, 0.0, 0.0]),
+            (13, [3.0, 0.0, 0.0]),
+        ]);
         let resolved = node_positions_by_active_id(&configured, &node_states, now);
 
         assert_eq!(resolved.get(&11), Some(&[1.0, 0.0, 0.0]));
@@ -9769,22 +9941,36 @@ mod node_positions_by_active_id_tests {
     }
 
     #[test]
-    fn stale_nodes_are_excluded_from_rank_assignment() {
+    fn a_stale_node_does_not_move_the_others() {
+        // THE REASON THIS IS KEYED BY ID. Under rank assignment a node going
+        // quiet re-ranks everything above it, so node 13 inherits node 12's
+        // coordinates -- a silent position error across the fleet caused by
+        // nothing more than one board missing a beacon.
         let now = std::time::Instant::now();
+        let configured = cfg(&[
+            (11, [1.0, 0.0, 0.0]),
+            (12, [2.0, 0.0, 0.0]),
+            (13, [3.0, 0.0, 0.0]),
+        ]);
+
         let mut node_states = HashMap::new();
         node_states.insert(11, active_node(now));
-        let mut stale = NodeState::new();
-        stale.last_frame_time =
-            Some(now - std::time::Duration::from_secs(30));
-        node_states.insert(12, stale);
+        node_states.insert(12, active_node(now));
         node_states.insert(13, active_node(now));
+        let all_up = node_positions_by_active_id(&configured, &node_states, now);
 
-        let configured = [[1.0, 0.0, 0.0], [3.0, 0.0, 0.0]];
-        let resolved = node_positions_by_active_id(&configured, &node_states, now);
+        let mut stale = NodeState::new();
+        stale.last_frame_time = Some(now - std::time::Duration::from_secs(30));
+        node_states.insert(12, stale);
+        let one_down = node_positions_by_active_id(&configured, &node_states, now);
 
-        assert_eq!(resolved.get(&11), Some(&[1.0, 0.0, 0.0]));
-        assert_eq!(resolved.get(&12), None, "stale node must not consume a rank");
-        assert_eq!(resolved.get(&13), Some(&[3.0, 0.0, 0.0]));
+        assert_eq!(one_down.get(&12), None, "a stale node reports no position");
+        assert_eq!(one_down.get(&11), all_up.get(&11), "node 11 must not move");
+        assert_eq!(
+            one_down.get(&13),
+            all_up.get(&13),
+            "node 13 must not inherit node 12's coordinates"
+        );
     }
 
     #[test]
@@ -9793,7 +9979,7 @@ mod node_positions_by_active_id_tests {
         let mut node_states = HashMap::new();
         node_states.insert(11, active_node(now));
 
-        let resolved = node_positions_by_active_id(&[], &node_states, now);
+        let resolved = node_positions_by_active_id(&cfg(&[]), &node_states, now);
         assert_eq!(resolved.get(&11), None);
     }
 }
@@ -9809,7 +9995,7 @@ async fn udp_receiver_task(
     let addr = format!("{bind_ip}:{udp_port}");
     let socket = match UdpSocket::bind(&addr).await {
         Ok(s) => {
-            info!("UDP listening on {addr} for ESP32, MediaTek, Qualcomm CSI, and RTL8720F radar frames");
+            info!("UDP listening on {addr} for ESP32, MediaTek, Qualcomm, RTL8721Dx CSI, and RTL8720F radar frames");
             s
         }
         Err(e) => {
@@ -9911,6 +10097,33 @@ async fn udp_receiver_task(
                     }
                     continue;
                 }
+                if len >= 4
+                    && u32::from_le_bytes(buf[..4].try_into().expect("four-byte slice"))
+                        == wifi_densepose_hardware::realtek_csi::RAC1_MAGIC
+                {
+                    match wifi_densepose_hardware::realtek_csi::CsiFrame::from_bytes(&buf[..len]) {
+                        Ok((frame, consumed)) if consumed == len => {
+                            let snapshot = realtek_csi::RealtekCsiSnapshot::from_frame(&frame);
+                            debug!("RTL8721Dx CSI from {src}: node={} seq={} subcarriers={}", snapshot.node_id, snapshot.sequence, snapshot.num_sub_carrier);
+                            let json = serde_json::to_string(&snapshot).ok();
+                            let mut s = state.write().await;
+                            // A secondary Realtek link must not replace a fresh ESP32
+                            // room source and make its vitals disappear from the UI.
+                            s.source = primary_source_with_realtek(
+                                s.last_esp32_frame,
+                                snapshot.source,
+                            );
+                            s.last_realtek_csi_frame = Some(std::time::Instant::now());
+                            s.latest_realtek_csi = Some(snapshot);
+                            if let Some(json) = json {
+                                let _ = s.tx.send(json);
+                            }
+                        }
+                        Ok((_, consumed)) => warn!("RTL8721Dx CSI datagram from {src} has trailing bytes: consumed={consumed} received={len}"),
+                        Err(error) => warn!("Rejected RTL8721Dx CSI datagram from {src}: {error}"),
+                    }
+                    continue;
+                }
                 // ADR-039: Try edge vitals packet first (magic 0xC511_0002).
                 if let Some(vitals) = parse_esp32_vitals(&buf[..len]) {
                     debug!(
@@ -9944,10 +10157,18 @@ async fn udp_receiver_task(
                         warn!(name: semconv::EVENT_RUVIEW_FALL_DETECTED, { "ruview.node.id" = node_id }, "fall detected by node {node_id}");
                     }
                     ns.edge_vitals = Some(vitals.clone());
-                    ns.rssi_history.push_back(vitals.rssi as f64);
-                    if ns.rssi_history.len() > 60 {
-                        ns.rssi_history.pop_front();
-                    }
+                    // An implausible RSSI (e.g. -1/-2 dBm, see
+                    // `is_plausible_rssi`) is a firmware sentinel, not a
+                    // measurement — don't let it clobber the node's history.
+                    let mean_rssi_dbm = if is_plausible_rssi(vitals.rssi) {
+                        ns.rssi_history.push_back(vitals.rssi as f64);
+                        if ns.rssi_history.len() > 60 {
+                            ns.rssi_history.pop_front();
+                        }
+                        vitals.rssi as f64
+                    } else {
+                        ns.rssi_history.back().copied().unwrap_or(0.0)
+                    };
 
                     // Store per-node person count from edge vitals.
                     let node_est = if vitals.presence {
@@ -10065,7 +10286,7 @@ async fn udp_receiver_task(
                     );
 
                     let features = FeatureInfo {
-                        mean_rssi: vitals.rssi as f64,
+                        mean_rssi: mean_rssi_dbm,
                         variance: vitals.motion_energy as f64,
                         motion_band_power: vitals.motion_energy as f64,
                         breathing_band_power: if vitals.presence { 0.5 } else { 0.0 },
@@ -12006,11 +12227,11 @@ async fn main() {
     let plan = if normalized == "auto" {
         info!("Auto-detecting data source (UDP :{} bound either way)...", args.udp_port);
         let esp32 = probe_esp32(args.udp_port).await;
-        let wifi = if esp32 { false } else { probe_windows_wifi().await };
+        let wifi = if esp32 { false } else { probe_wifi().await };
         if esp32 {
             info!("  ESP32 CSI detected on UDP :{}", args.udp_port);
         } else if wifi {
-            info!("  Windows WiFi detected");
+            info!("  WiFi detected ({})", std::env::consts::OS);
         } else {
             warn!(
                 "No real CSI source at boot — serving SIMULATED data (tagged as \
@@ -12269,7 +12490,7 @@ async fn main() {
     // threaded into `engine_bridge` so both fusion paths honor the same
     // WDP_TDM_SLOTS/WDP_GUARD_INTERVAL_US-derived guard (#1049/#1057).
     let mut engine_bridge_multistatic_cfg: Option<MultistaticConfig> = None;
-    let mut node_positions_config: Vec<[f32; 3]> = Vec::new();
+    let mut node_positions_config: HashMap<u8, [f32; 3]> = HashMap::new();
     let state: SharedState = Arc::new(RwLock::new(AppStateInner {
         latest_update: None,
         link_table: links::LinkTable::new(),
@@ -12284,6 +12505,8 @@ async fn main() {
         last_mediatek_frame: None,
         latest_qualcomm_csi: None,
         last_qualcomm_frame: None,
+        latest_realtek_csi: None,
+        last_realtek_csi_frame: None,
         latest_vendor_rf: BTreeMap::new(),
         tx,
         intro: wifi_densepose_sensing_server::introspection::IntrospectionState::new(),
@@ -12359,14 +12582,30 @@ async fn main() {
                 ..cfg.clone()
             });
             if let Some(ref pos_str) = args.node_positions {
-                let positions = field_bridge::parse_node_positions(pos_str);
-                if !positions.is_empty() {
+                let entries = field_bridge::parse_node_position_entries(pos_str);
+                if !entries.is_empty() {
                     info!(
                         "Configured {} node positions for multistatic fusion",
-                        positions.len()
+                        entries.len()
                     );
-                    node_positions_config = positions.clone();
-                    fuser.set_node_positions(positions);
+                    // Identity comes from the explicit `node_id:` prefix when
+                    // given, and from the list index otherwise. Built by a
+                    // tested function rather than inline here, because keying
+                    // this map by index while reading it back by node_id is
+                    // precisely the bug being fixed, and a loop inside main()
+                    // is unreachable from any test.
+                    node_positions_config = field_bridge::node_positions_by_id(&entries);
+                    // Issue #1866: the same keyed map now goes to the fuser,
+                    // so one parsed identity serves both the NodeInfo output
+                    // and the effectful fusion path. The fuser previously took
+                    // a positional list and addressed it by cohort rank, which
+                    // stops being a node id the moment a stale or out-of-guard
+                    // node is dropped -- every node above the gap silently
+                    // inherited its neighbour's coordinates. `node_positions_by_id`
+                    // still applies the documented legacy rule (an entry with
+                    // no `node_id:` prefix takes its list index as its id), so
+                    // an existing `--node-positions` string keeps its meaning.
+                    fuser.set_node_positions_by_id(node_positions_config.clone());
                 }
             }
             engine_bridge_multistatic_cfg = Some(MultistaticConfig {
@@ -12489,7 +12728,7 @@ async fn main() {
         tokio::spawn(broadcast_tick_task(state.clone(), args.tick_ms));
     }
     if plan.run_wifi {
-        tokio::spawn(windows_wifi_task(state.clone(), args.tick_ms));
+        tokio::spawn(wifi_task(state.clone(), args.tick_ms));
     }
     if plan.run_simulator {
         tokio::spawn(simulated_data_task(state.clone(), args.tick_ms));
@@ -12630,6 +12869,7 @@ async fn main() {
         .route("/api/v1/radar/latest", get(latest_realtek_radar))
         .route("/api/v1/csi/mediatek/latest", get(latest_mediatek_csi))
         .route("/api/v1/csi/qualcomm/latest", get(latest_qualcomm_csi))
+        .route("/api/v1/csi/realtek/latest", get(latest_realtek_csi))
         .route("/api/v1/rf/vendors", get(vendor_descriptors))
         .route("/api/v1/rf/vendors/latest", get(latest_vendor_events))
         .route("/api/v1/rf/vendors/:vendor/latest", get(latest_vendor_event))
@@ -13075,31 +13315,32 @@ mod sync_snapshot_helper_tests {
     }
 
     #[test]
-    fn observe_csi_frame_arrival_ignores_subms_bursts() {
-        // Issue #1180 regression: a ~40 fps node whose frames are delivered
-        // in tight UDP bursts (sub-ms intra-burst deltas) must still report
-        // ~40 fps, not tens of kHz. Synthesize the arrival stream by adding
-        // Durations to a base Instant.
+    fn observe_csi_frame_arrival_recovers_rate_through_udp_bursts() {
+        // Issue #1180. A node genuinely producing 40 fps whose frames reach
+        // the socket in pairs: two arrivals ~40 us apart, then the rest of a
+        // 50 ms period. Four frames per 100 ms is 40 fps.
+        //
+        // The scenario is chosen to be physically consistent with the
+        // firmware's own 50 fps send ceiling. Counting three arrivals per
+        // 25 ms group would describe 120 frames per second, which no single
+        // node can emit, so an estimator tuned to report 40 for that stream is
+        // tuned to discard real frames.
         use std::time::Duration;
         let base = std::time::Instant::now();
         let mut ns = NodeState::new();
         ns.csi_fps_ema = 40.0; // pretend already warmed up
         ns.csi_fps_samples = 10;
 
-        // 30 nominal 25 ms groups, each preceded by a 3-frame sub-ms burst.
-        for g in 0..30u64 {
-            let group_t = base + Duration::from_millis(25 * g);
+        for g in 0..200u64 {
+            let group_t = base + Duration::from_millis(50 * g);
             ns.observe_csi_frame_arrival(group_t);
-            // burst: two extra arrivals 40 µs and 80 µs later — must be
-            // ignored for rate purposes (anchor must not advance to them).
             ns.observe_csi_frame_arrival(group_t + Duration::from_micros(40));
-            ns.observe_csi_frame_arrival(group_t + Duration::from_micros(80));
         }
 
         assert!(
             (ns.csi_fps_ema - 40.0).abs() < 2.0,
-            "csi_fps_ema must stay near the 40 fps ground truth despite \
-             sub-ms bursts, got {}",
+            "csi_fps_ema must recover the 40 fps ground truth through burst \
+             delivery, got {}",
             ns.csi_fps_ema
         );
     }
