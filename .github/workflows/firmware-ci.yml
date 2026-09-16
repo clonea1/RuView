@@ -52,6 +52,9 @@ jobs:
             target: esp32s3
             sdkconfig: sdkconfig.defaults
             partition_table_name: partitions_display.csv
+            # ota_0 in partitions_display.csv is 0x200000 = 2048 KiB; gate at
+            # ~80%/90% of the real OTA slot (RuView#1891), superseding the
+            # ad-hoc 1200 KiB stopgap from dbaa3c7f.
             size_warn_kb: 1474
             size_limit_kb: 1638
             artifact_app: esp32-csi-node.bin
@@ -92,14 +95,11 @@ jobs:
           idf.py set-target ${{ matrix.target }}
           idf.py build
 
-      - name: Build and run host-side ADR-110 unit tests
+      - name: Build and run host-side firmware unit tests
         if: matrix.variant == 'c6-4mb'
         working-directory: firmware/esp32-csi-node/test
         run: |
-          make test_adr110
-          ./test_adr110
-          make test_c6_antenna
-          ./test_c6_antenna
+          make host_tests
 
       - name: Verify binary size budget
         working-directory: firmware/esp32-csi-node
