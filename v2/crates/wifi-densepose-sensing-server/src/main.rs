@@ -1829,6 +1829,25 @@ pub(crate) struct Wall {
     pub kind: Option<String>,
 }
 
+/// The building's real outline on one storey, as a closed ring in plan view.
+///
+/// `width_m x depth_m` is a bounding box, and a bounding box is a poor
+/// description of a real house: an L-shaped plan leaves a notch inside the box
+/// that is not part of the building at all. A ring says which cells are
+/// actually indoors.
+///
+/// Several rings may share a `level`. They are a union, not a ring plus
+/// holes: a wing, a detached garage, or a stairwell landing are each their
+/// own outline.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Footprint {
+    /// Storey this outline describes.
+    pub level: i32,
+    /// Ring vertices in room coordinates, implicitly closed: the last vertex
+    /// connects back to the first, so a triangle is three points, not four.
+    pub points: Vec<[f32; 2]>,
+}
+
 /// Room geometry (a simple rectangle) plus sensor node placements, as
 /// defined via the Room Builder UI (`POST /api/v1/config/room`).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -1863,6 +1882,11 @@ pub(crate) struct RoomConfig {
     /// Wall segments in plan view, tagged by storey.
     #[serde(default)]
     pub walls: Vec<Wall>,
+    /// The building's real outline, one or more rings per storey. Empty means
+    /// "the building is the whole `width_m x depth_m` box", which is how every
+    /// config written before footprints existed behaves.
+    #[serde(default)]
+    pub footprint: Vec<Footprint>,
     /// Which storey the access point is on. `None` means the first floor.
     ///
     /// `ap_position` already carries an absolute z, so this is not needed for
@@ -1910,6 +1934,7 @@ mod room_config_tests {
             ap_floor: None,
             floors: Vec::new(),
             walls: Vec::new(),
+            footprint: Vec::new(),
         }
     }
 
@@ -2108,6 +2133,7 @@ mod room_config_tests {
             ap_floor: None,
         floors: Vec::new(),
         walls: Vec::new(),
+        footprint: Vec::new(),
         };
         save_room_config(dir.path(), &saved);
         let loaded = load_room_config(dir.path());
@@ -2117,6 +2143,24 @@ mod room_config_tests {
         assert_eq!(loaded.nodes[0].id, 0);
         assert_eq!(loaded.nodes[0].label.as_deref(), Some("front-right"));
         assert_eq!(loaded.nodes[1].label, None);
+    }
+
+    /// `RoomBuilderTab.js` has read and written `config.footprint` since this
+    /// branch's first commit; the field just never existed on the server, so
+    /// every drawn outline round-tripped to nothing. This is the field, and
+    /// the save/load half of the fix.
+    #[test]
+    fn footprint_round_trips_through_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut saved = base();
+        saved.footprint = vec![Footprint {
+            level: 1,
+            points: vec![[0.0, 0.0], [5.0, 0.0], [5.0, 4.0], [0.0, 4.0]],
+        }];
+        save_room_config(dir.path(), &saved);
+        let loaded = load_room_config(dir.path());
+        assert_eq!(loaded.footprint.len(), 1);
+        assert_eq!(loaded.footprint[0].points.len(), 4);
     }
 
     fn valid_config() -> RoomConfig {
@@ -2131,6 +2175,7 @@ mod room_config_tests {
             ap_floor: None,
         floors: Vec::new(),
         walls: Vec::new(),
+        footprint: Vec::new(),
         }
     }
 
@@ -12927,6 +12972,7 @@ async fn config_get_room(State(state): State<SharedState>) -> Json<serde_json::V
         "ap_position": saved.ap_position,
         "floors": saved.floors,
         "walls": saved.walls,
+        "footprint": saved.footprint,
         "ap_floor": saved.ap_floor,
     }))
 }
@@ -13052,8 +13098,40 @@ pub(crate) fn validate_room_config(config: &RoomConfig) -> Result<(), String> {
         }
     }
 
+    // ── Footprint ────────────────────────────────────────────────────────
+    for (i, ring) in config.footprint.iter().enumerate() {
+        // Two points are a line and one is a dot; neither encloses anything,
+        // and a degenerate ring saved here would silently mask the entire
+        // search grid away rather than fail visibly, so it is rejected here.
+        if ring.points.len() < 3 {
+            return Err(format!(
+                "footprint {i} has {} point(s); a closed outline needs at least 3",
+                ring.points.len()
+            ));
+        }
+        if ring.points.len() > MAX_FOOTPRINT_POINTS {
+            return Err(format!(
+                "footprint {i} has {} points; the limit is {MAX_FOOTPRINT_POINTS}",
+                ring.points.len()
+            ));
+        }
+        if !ring.points.iter().flatten().all(|v| v.is_finite()) {
+            return Err(format!("footprint {i} has a non-finite vertex"));
+        }
+        if !config.floors.is_empty() && !levels.contains(&ring.level) {
+            return Err(format!(
+                "footprint {i} is on undefined floor {}",
+                ring.level
+            ));
+        }
+    }
+
     Ok(())
 }
+
+/// Bounded because a footprint ring arrives from the network and is walked
+/// once per grid cell per tick.
+const MAX_FOOTPRINT_POINTS: usize = 512;
 
 async fn config_set_room(
     State(state): State<SharedState>,
