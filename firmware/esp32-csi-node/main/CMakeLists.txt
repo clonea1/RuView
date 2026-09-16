@@ -1,6 +1,7 @@
 set(SRCS
-    "main.c" "csi_collector.c"
+    "main.c" "csi_collector.c" "node_log.c"
     "thermal.c" "stream_sender.c" "nvs_config.c"
+    "serial_onboarding.c" "serial_onboarding_protocol.c"
     "edge_processing.c" "ota_update.c" "power_mgmt.c"
     "wasm_runtime.c" "wasm_upload.c" "rvf_parser.c"
     "mmwave_sensor.c"
@@ -14,6 +15,7 @@ set(SRCS
     "c6_twt.c"
     "c6_timesync.c"
     "c6_lp_core.c"
+    "c6_antenna_select.c"
     # ADR-110 D1 workaround — ESP-NOW cross-node sync (works on S3+C6)
     "c6_sync_espnow.c"
     # ADR-110 B1/B2 unblock — soft-AP HE/TWT (C6-only when enabled)
@@ -31,6 +33,9 @@ set(REQUIRES
     esp_http_client
     esp_app_format
     esp_timer
+    fatfs                 # node_log.c: the storage FAT volume
+    wear_levelling        # node_log.c: wl_mount behind that volume
+    espcoredump           # coredump-to-flash readback
     esp_pm
     esp_driver_uart
     esp_driver_gpio
@@ -39,6 +44,8 @@ set(REQUIRES
     driver
     lwip
     mbedtls
+    efuse
+    led_strip
 )
 
 # ADR-110: C6-only components — pulled in when building for esp32c6.
@@ -46,6 +53,12 @@ set(REQUIRES
 # we use the IDF_TARGET variable that idf.py sets from sdkconfig.defaults / set-target.
 if(IDF_TARGET STREQUAL "esp32c6")
     list(APPEND REQUIRES ieee802154 ulp esp_hw_support)
+endif()
+
+# ESP-IDF 6 split the temperature sensor driver out of the legacy `driver`
+# component. Keep the 5.4 lane working while declaring the v6 dependency.
+if(IDF_VERSION_MAJOR GREATER_EQUAL 6)
+    list(APPEND REQUIRES esp_driver_tsens)
 endif()
 
 # ADR-061: Mock CSI generator for QEMU testing + ADR-081 mock radio binding

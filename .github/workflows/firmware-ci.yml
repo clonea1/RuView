@@ -53,7 +53,9 @@ jobs:
             sdkconfig: sdkconfig.defaults
             partition_table_name: partitions_display.csv
             size_warn_kb: 1100
-            size_limit_kb: 1152
+            # Current 8 MB image is 1163 KiB after USB onboarding. The OTA app
+            # partition is 2048 KiB; retain a 1200 KiB hard gate and warning.
+            size_limit_kb: 1200
             artifact_app: esp32-csi-node.bin
             artifact_pt: partition-table.bin
           - variant: 4mb
@@ -92,12 +94,11 @@ jobs:
           idf.py set-target ${{ matrix.target }}
           idf.py build
 
-      - name: Build and run host-side ADR-110 unit tests
+      - name: Build and run host-side firmware unit tests
         if: matrix.variant == 'c6-4mb'
         working-directory: firmware/esp32-csi-node/test
         run: |
-          make test_adr110
-          ./test_adr110
+          make host_tests
 
       - name: Verify binary size budget
         working-directory: firmware/esp32-csi-node
@@ -184,3 +185,22 @@ jobs:
           name: esp32-csi-node-firmware-${{ matrix.variant }}
           path: firmware/esp32-csi-node/release-staging/
           retention-days: 90
+
+  build-c6-idf6:
+    name: Build XIAO C6 external antenna (ESP-IDF 6.0.2)
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.0.2
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          submodules: recursive
+
+      - name: Build the IDF 6 canary image
+        working-directory: firmware/esp32-csi-node
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32c6;sdkconfig.defaults.xiao-external" set-target esp32c6
+          idf.py build
+          test "$(stat -c%s build/esp32-csi-node.bin)" -le $((1152 * 1024))
+          strings build/esp32-csi-node.bin | grep -F "external U.FL"
