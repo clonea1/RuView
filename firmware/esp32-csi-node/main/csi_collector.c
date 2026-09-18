@@ -469,7 +469,7 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
      * while the on-device Tier 1/2 pipeline receives a uniform, sustainable
      * stream. Enqueuing every burst frame overloaded the unicore C6 DSP and
      * turned 30-40 callback pps into an irregular approximately 8 Hz subset. */
-    if (frame_len > CSI_HEADER_SIZE) {
+    if (frame_len > CSI_HEADER_SIZE_V3) {
         if (s_next_edge_enqueue_us == 0) {
             s_next_edge_enqueue_us = now_us;
         }
@@ -477,8 +477,8 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
         if (now_us >= s_next_edge_enqueue_us) {
             /* Reuse the sanitized ADR-018 payload. Feeding info->buf here
              * would reintroduce first_word_invalid artifacts on device. */
-            (void)edge_enqueue_csi(&frame_buf[CSI_HEADER_SIZE],
-                                   (uint16_t)(frame_len - CSI_HEADER_SIZE),
+            (void)edge_enqueue_csi(&frame_buf[CSI_HEADER_SIZE_V3],
+                                   (uint16_t)(frame_len - CSI_HEADER_SIZE_V3),
                                    (int8_t)info->rx_ctrl.rssi, info->rx_ctrl.channel);
 
             /* Preserve the configured sample clock instead of resetting it to
