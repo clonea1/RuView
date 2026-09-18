@@ -44,6 +44,8 @@ pub const SYNC_PACKET_SIZE_V2: usize = 38;
 pub const SYNC_PACKET_SIZE_V3: usize = 50;
 /// Wire size once the edge-pipeline counters are appended (proto v4).
 pub const SYNC_PACKET_SIZE_V4: usize = 58;
+/// Wire size once the seq-gate drop counter is appended (proto v5).
+pub const SYNC_PACKET_SIZE_V5: usize = 62;
 /// Wire protocol version currently emitted by firmware.
 pub const SYNC_PACKET_PROTO_VER: u8 = 0x02;
 /// Protocol version that first carried `node_mac`.
@@ -52,6 +54,13 @@ pub const SYNC_PACKET_PROTO_VER_MAC: u8 = 0x02;
 pub const SYNC_PACKET_PROTO_VER_TX_STATS: u8 = 0x03;
 /// Protocol version that first carried the edge-pipeline counters.
 pub const SYNC_PACKET_PROTO_VER_EDGE_STATS: u8 = 0x04;
+/// Protocol version that first carried the seq-gate drop counter.
+///
+/// Decode-only here: this branch does not carry the runtime seq-gate-mode
+/// firmware feature that produces this counter (that lives only on
+/// `experiment/fleet-combined`), so this crate can parse a v5 packet from a
+/// node that runs it, but this PR's own firmware still emits v4.
+pub const SYNC_PACKET_PROTO_VER_SEQ_DROP: u8 = 0x05;
 
 /// Decoded ADR-110 §A0.12 sync packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,6 +179,16 @@ pub struct EdgeCounters {
     pub frames_processed: u32,
     /// Frames discarded by that guard for being empty or wider than the grid.
     pub frames_rejected: u32,
+    /// Frames discarded by the `rx_seq` selection gate, before the rate gate
+    /// sees them. `None` before proto v5.
+    ///
+    /// Deliberately separate from `TxCounters::early_drop`: the seq gate
+    /// returns before that counter increments, so the windowed
+    /// `(early_drop + accepted) / accepted` ratio still falls by roughly the
+    /// configured period when the gate is working, which is the cheap remote
+    /// check that it is executing at all. Folding the two together would erase
+    /// that signal. This reports the same discards directly.
+    pub seq_drop: Option<u32>,
 }
 
 impl NodeHealth {
@@ -293,6 +312,14 @@ impl SyncPacket {
                 Some(EdgeCounters {
                     frames_processed: u32::from_le_bytes(buf[50..54].try_into().unwrap()),
                     frames_rejected: u32::from_le_bytes(buf[54..58].try_into().unwrap()),
+                    // Same length-AND-version guard once more.
+                    seq_drop: if proto_ver >= SYNC_PACKET_PROTO_VER_SEQ_DROP
+                        && buf.len() >= SYNC_PACKET_SIZE_V5
+                    {
+                        Some(u32::from_le_bytes(buf[58..62].try_into().unwrap()))
+                    } else {
+                        None
+                    },
                 })
             } else {
                 None
@@ -763,6 +790,57 @@ mod tx_counter_tests {
             b[54..58].copy_from_slice(&rej.to_le_bytes());
         }
         b
+    }
+
+    /// v5 adds the seq-gate drop counter after the edge ones; everything
+    /// else is v4.
+    fn frame_v5(proto: u8, len: usize, ok: u32, rej: u32, seq: u32) -> Vec<u8> {
+        let mut b = frame_v4(proto, len, ok, rej);
+        if len >= SYNC_PACKET_SIZE_V5 {
+            b[58..62].copy_from_slice(&seq.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn v5_reports_the_seq_gate_drops() {
+        let p = SyncPacket::from_bytes(&frame_v5(5, SYNC_PACKET_SIZE_V5, 900, 0, 6300)).unwrap();
+        let e = p.health.edge.expect("v5 carries edge counters");
+        assert_eq!(e.seq_drop, Some(6300));
+        assert_eq!(e.frames_processed, 900);
+    }
+
+    /// The seq gate working looks like this: a large drop count beside a
+    /// healthy processed count. It must NOT be conflated with early_drop.
+    #[test]
+    fn a_working_seq_gate_is_visible_without_arithmetic() {
+        let p = SyncPacket::from_bytes(&frame_v5(5, SYNC_PACKET_SIZE_V5, 1000, 0, 7000)).unwrap();
+        let e = p.health.edge.unwrap();
+        assert!(e.seq_drop.unwrap() > e.frames_processed,
+                "at period 8 the gate discards far more than it keeps");
+        assert_eq!(e.frames_rejected, 0, "and none of it is a grid mismatch");
+    }
+
+    #[test]
+    fn v4_reports_no_seq_drop() {
+        let p = SyncPacket::from_bytes(&frame_v4(4, SYNC_PACKET_SIZE_V4, 5, 6)).unwrap();
+        let e = p.health.edge.expect("v4 still carries edge counters");
+        assert!(e.seq_drop.is_none(), "a v4 node has no seq-gate counter");
+    }
+
+    /// Padded v4 and truncated v5, same traps as every version before.
+    #[test]
+    fn a_padded_v4_datagram_does_not_yield_seq_drop() {
+        let p = SyncPacket::from_bytes(&frame_v5(4, SYNC_PACKET_SIZE_V5, 1, 2, 99)).unwrap();
+        assert!(p.health.edge.unwrap().seq_drop.is_none(),
+                "length alone must not admit it -- proto v4 cannot have it");
+    }
+
+    #[test]
+    fn a_truncated_v5_datagram_does_not_yield_seq_drop() {
+        let p = SyncPacket::from_bytes(&frame_v5(5, SYNC_PACKET_SIZE_V4, 0, 0, 0)).unwrap();
+        assert!(p.health.edge.unwrap().seq_drop.is_none(),
+                "version alone must not admit it -- the bytes are not there");
     }
 
     #[test]
