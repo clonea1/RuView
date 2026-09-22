@@ -20,6 +20,7 @@
 #include "nvs.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "stream_sender.h"
 
 static const char *TAG = "ota_update";
 
@@ -108,13 +109,29 @@ bool ota_auth_check(httpd_req_t *req)
  * Deliberately conservative: a reboot for any other reason inside the soak
  * window rolls back a good image. That errs toward a node that works over a
  * node that is new, which is the right way to be wrong.
+ *
+ * docs/ADR-360-crash-fix-plan-2026-09-22.md extends this: the original
+ * one-shot 60 s timer confirmed on wall-clock-plus-network-presence alone,
+ * which is not the same as the node actually being able to send. The night
+ * that mattered, each node soaked and self-confirmed fine in isolation
+ * during its solo push -- the crash only showed up later under real 9-node
+ * concurrent load a solo soak can't reproduce, so this alone would not have
+ * caught that specific incident. It hardens the gate against a differently-
+ * broken image: one that reaches the soak deadline while already failing to
+ * send. Confirmation now also requires stream_sender-observed send-health at
+ * the moment the soak completes, rechecked periodically and deferred
+ * (bounded) rather than confirmed blind if that health isn't there yet.
  */
 
 #define ROLLBACK_SOAK_US (60 * 1000000ULL)
+#define ROLLBACK_RECHECK_US (10 * 1000000ULL)        /* health recheck cadence once soaked */
+#define ROLLBACK_MAX_DEFER_US (5 * 60 * 1000000ULL)  /* give up deferring after this long past the base soak */
+#define ROLLBACK_MAX_FAILURE_STREAK 3                /* stream_sender_failure_streak() must be below this */
 #define OTA_STATE_NS     "ota_state"
 
 static bool s_pending_verify = false;
 static esp_timer_handle_t s_soak_timer = NULL;
+static int64_t s_soak_started_us = 0;
 /* Sized for the worst case the compiler can prove: label, a 32-char
  * version, the state phrase and the longest reset-reason string. */
 static char s_rollback_reason[160] = {0};
@@ -189,13 +206,44 @@ void ota_rollback_boot_check(void)
     }
 }
 
+static bool rollback_send_health_ok(void)
+{
+    return stream_sender_last_success_us() != 0 &&
+           stream_sender_failure_streak() < ROLLBACK_MAX_FAILURE_STREAK;
+}
+
 static void rollback_confirm(void *arg)
 {
     (void)arg;
     if (!s_pending_verify) return;
+
+    int64_t soaked_for = esp_timer_get_time() - s_soak_started_us;
+    if (soaked_for < (int64_t)ROLLBACK_SOAK_US) {
+        return; /* base soak not yet complete; periodic timer fires again */
+    }
+
+    if (!rollback_send_health_ok()) {
+        int64_t deferred_for = soaked_for - (int64_t)ROLLBACK_SOAK_US;
+        if (deferred_for >= (int64_t)ROLLBACK_MAX_DEFER_US) {
+            ESP_LOGE(TAG, "new image soaked but never reached send-health after %llu s "
+                          "total -- giving up on confirmation; it will roll back on next reboot",
+                     (unsigned long long)(soaked_for / 1000000ULL));
+            if (s_soak_timer) esp_timer_stop(s_soak_timer);
+            return;
+        }
+        ESP_LOGW(TAG, "new image soaked but not send-healthy yet (last_success=%s, "
+                      "failure_streak=%u) -- deferring confirmation, %llu/%llu s into the max defer",
+                 stream_sender_last_success_us() != 0 ? "yes" : "never",
+                 (unsigned)stream_sender_failure_streak(),
+                 (unsigned long long)(deferred_for / 1000000ULL),
+                 (unsigned long long)(ROLLBACK_MAX_DEFER_US / 1000000ULL));
+        return; /* periodic timer fires again */
+    }
+
     if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
         s_pending_verify = false;
-        ESP_LOGI(TAG, "new image CONFIRMED: networked and stable, rollback cancelled");
+        if (s_soak_timer) esp_timer_stop(s_soak_timer);
+        ESP_LOGI(TAG, "new image CONFIRMED: networked, stable, and send-healthy -- rollback cancelled");
         /* The previous failure, if any, is now history. */
         s_rollback_reason[0] = '\0';
         rollback_store_reason(NULL);
@@ -207,20 +255,30 @@ static void rollback_confirm(void *arg)
 void ota_rollback_notify_connected(void)
 {
     if (!s_pending_verify || s_soak_timer) return;
+    s_soak_started_us = esp_timer_get_time();
     const esp_timer_create_args_t a = {
         .callback = rollback_confirm,
         .name = "ota_soak",
     };
     if (esp_timer_create(&a, &s_soak_timer) == ESP_OK) {
-        esp_timer_start_once(s_soak_timer, ROLLBACK_SOAK_US);
-        ESP_LOGI(TAG, "image on trial reached the network; confirming in %llu s",
-                 ROLLBACK_SOAK_US / 1000000ULL);
+        esp_timer_start_periodic(s_soak_timer, ROLLBACK_RECHECK_US);
+        ESP_LOGI(TAG, "image on trial reached the network; confirming after a %llu s soak "
+                      "plus a send-health check, rechecked every %llu s",
+                 ROLLBACK_SOAK_US / 1000000ULL, ROLLBACK_RECHECK_US / 1000000ULL);
     } else {
-        /* Without a soak we cannot confirm, and an unconfirmed image reverts.
-         * Confirm now: a working node on new firmware beats a pointless
-         * rollback caused by our own resource failure. */
-        ESP_LOGW(TAG, "no timer for the soak; confirming immediately");
-        rollback_confirm(NULL);
+        /* No timer engine available to soak or recheck health -- a resource
+         * failure of our own, unrelated to whether the new image actually
+         * works. Preserve the original fallback: confirm immediately rather
+         * than leave the node permanently unconfirmed for a reason that has
+         * nothing to do with image health. */
+        ESP_LOGW(TAG, "no timer for the soak/health recheck; confirming immediately");
+        if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
+            s_pending_verify = false;
+            s_rollback_reason[0] = '\0';
+            rollback_store_reason(NULL);
+        } else {
+            ESP_LOGE(TAG, "could not mark the image valid; it will roll back on reboot");
+        }
     }
 }
 
