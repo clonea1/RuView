@@ -129,8 +129,24 @@ bool ota_auth_check(httpd_req_t *req)
 #define ROLLBACK_MAX_FAILURE_STREAK 3                /* stream_sender_failure_streak() must be below this */
 #define OTA_STATE_NS     "ota_state"
 
+/* The soak timer above only starts once ota_rollback_notify_connected()
+ * fires, which itself requires an IP. It cannot do anything for an image
+ * that never gets that far -- bad baked-in credentials, a crash loop before
+ * association, a hung driver init -- so without a second clock that image
+ * would just sit PENDING_VERIFY forever, reachable by nobody, until someone
+ * noticed and power-cycled it (which reverts it). This timer is
+ * that second clock: armed unconditionally whenever boot_check finds the
+ * image on trial, stopped the moment the node reaches the network (same
+ * event as the soak timer's start), and otherwise fires once and forces a
+ * reboot. On that reboot the running image is still ESP_OTA_IMG_PENDING_VERIFY
+ * (never marked valid), so the bootloader's own rule -- documented in the
+ * file header above -- reverts it exactly as it would a crash reboot; this
+ * just forces that outcome deliberately instead of waiting for one. */
+#define OTA_SAFETY_TIMEOUT_US (10 * 60 * 1000000ULL)
+
 static bool s_pending_verify = false;
 static esp_timer_handle_t s_soak_timer = NULL;
+static esp_timer_handle_t s_safety_timer = NULL;
 static int64_t s_soak_started_us = 0;
 /* Sized for the worst case the compiler can prove: label, a 32-char
  * version, the state phrase and the longest reset-reason string. */
@@ -162,6 +178,23 @@ static void rollback_store_reason(const char *reason)
     nvs_close(h);
 }
 
+/** Fires only if the trial image never reaches the network within
+ *  OTA_SAFETY_TIMEOUT_US of boot -- ota_rollback_notify_connected() stops and
+ *  deletes this timer the moment it does. */
+static void ota_safety_timeout_cb(void *arg)
+{
+    (void)arg;
+    uint32_t timeout_s = (uint32_t)(OTA_SAFETY_TIMEOUT_US / 1000000ULL);
+    ESP_LOGE(TAG, "new image on trial never reached the network within %lu s "
+                  "of boot -- forcing a reboot so the bootloader rolls back",
+             (unsigned long)timeout_s);
+    snprintf(s_rollback_reason, sizeof(s_rollback_reason),
+             "image never reached the network within %lu s of boot",
+             (unsigned long)timeout_s);
+    rollback_store_reason(s_rollback_reason);
+    esp_restart();
+}
+
 void ota_rollback_boot_check(void)
 {
     const esp_partition_t *running = esp_ota_get_running_partition();
@@ -173,6 +206,25 @@ void ota_rollback_boot_check(void)
         ESP_LOGW(TAG, "new image on trial (%s): must reach the network and "
                       "survive %llu s or the bootloader reverts",
                  running->label, ROLLBACK_SOAK_US / 1000000ULL);
+
+        const esp_timer_create_args_t sa = {
+            .callback = ota_safety_timeout_cb,
+            .name = "ota_safety",
+        };
+        if (esp_timer_create(&sa, &s_safety_timer) == ESP_OK) {
+            esp_timer_start_once(s_safety_timer, OTA_SAFETY_TIMEOUT_US);
+            ESP_LOGW(TAG, "OTA safety timer armed: %llu s to reach the "
+                          "network or force a rollback reboot",
+                     OTA_SAFETY_TIMEOUT_US / 1000000ULL);
+        } else {
+            /* Fail open: a timer we could not create must not be worse than
+             * no timer at all. Without it an image that never associates
+             * still just sits on trial until power-cycled -- the same
+             * exposure that existed before this change, not a new one. */
+            s_safety_timer = NULL;
+            ESP_LOGE(TAG, "could not arm OTA safety timer; an image that "
+                          "never reaches the network will not auto-revert");
+        }
     }
 
     /* Did the bootloader already revert something? The failed image is the
@@ -254,6 +306,22 @@ static void rollback_confirm(void *arg)
 
 void ota_rollback_notify_connected(void)
 {
+    /* Stop the safety timer first and unconditionally, before the
+     * s_soak_timer early-return below: reaching this function at all means
+     * the node just got an IP, which is exactly the condition the safety
+     * timer exists to detect the absence of, and that stays true even if a
+     * future caller invokes this more than once. There is an unavoidable,
+     * narrow race if the timer fires in the esp_timer task at the same
+     * moment this runs on the event-loop task -- esp_timer_stop() can lose
+     * that race, in which case the callback's esp_restart() wins. Either
+     * outcome is a reboot, never a hang, so it is left as a known, bounded
+     * risk rather than solved with a lock. */
+    if (s_safety_timer) {
+        esp_timer_stop(s_safety_timer);
+        esp_timer_delete(s_safety_timer);
+        s_safety_timer = NULL;
+    }
+
     if (!s_pending_verify || s_soak_timer) return;
     s_soak_started_us = esp_timer_get_time();
     const esp_timer_create_args_t a = {
