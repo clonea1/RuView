@@ -57,20 +57,6 @@
                 <a href="pose-fusion.html" role="menuitem">Pose Fusion<em>multi-node fused pose</em></a>
               </div>
             </div>
-        </nav>
-
-        <!-- Dashboard Tab -->
-        <section id="dashboard" class="tab-content active" role="tabpanel" aria-labelledby="dashboard">
-            <div class="hero-section">
-                <h2 data-i18n="dashboard.title">Revolutionary WiFi-Based Human Pose Detection</h2>
-                <p class="hero-description">
-                    AI can track your full-body movement through walls using just WiFi signals. 
-                    Researchers at Carnegie Mellon have trained a neural network to turn basic WiFi 
-                    signals into detailed wireframe models of human bodies.
-                </p>
-                
-                <!-- Error container -->
-                <div class="error-container" style="display: none;"></div>
             <a href="pose-fusion.html" class="nav-tab" style="text-decoration:none">Pose Fusion</a>
             <a href="observatory.html" class="nav-tab" style="text-decoration:none">Observatory</a>
         </nav>
@@ -550,7 +536,11 @@
     <div id="globalErrorToast" class="error-toast"></div>
 
     <!-- Load application scripts as modules -->
-    <script type="module" src="app.js">  (function () {
+    <script type="module" src="app.js"></script>
+<script>
+  // Tools menu. Click-toggle rather than :hover: this UI gets opened on a
+  // phone, where hover does not exist and a hover-only menu is unreachable.
+(function () {
     var wrap = document.getElementById('toolsMenu');
     if (!wrap) return;
     var btn = document.getElementById('toolsBtn');
@@ -565,8 +555,12 @@
       btn.setAttribute('aria-expanded', 'true');
       wrap.classList.add('open');
     }
+    // stopImmediatePropagation, not stopPropagation: TabManager also binds every
+    // .nav-tab (this button included) and would switch to a tab that does not
+    // exist, blanking the page. This script runs before the app.js module, so
+    // its listener is registered first and can stop TabManager's.
     btn.addEventListener('click', function (e) {
-      e.stopPropagation();
+      e.stopImmediatePropagation();
       list.hidden ? open() : close();
     });
     // Clicking anywhere else closes it, including on touch where there is no
