@@ -3501,6 +3501,37 @@ a:focus-visible,
   font-weight: var(--font-weight-semibold);
 }
 
+/* Tools section of the drawer (links copied from the desktop Tools menu). */
+.mobile-nav-head {
+  margin-top: var(--space-8);
+  padding: var(--space-12) var(--space-24) var(--space-4);
+  border-top: 1px solid var(--color-border);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text);
+}
+
+.mobile-nav-subhead {
+  padding: var(--space-8) var(--space-24) var(--space-4);
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--color-text-secondary);
+  opacity: 0.7;
+}
+
+.mobile-nav-tool {
+  font-size: var(--font-size-sm);
+}
+
+.mobile-nav-tool em {
+  display: block;
+  font-style: normal;
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-normal, 400);
+  opacity: 0.8;
+}
+
 .mobile-nav-hint {
   padding: var(--space-16) var(--space-24);
   font-size: var(--font-size-xs);
