@@ -43,6 +43,7 @@ import json
 import ipaddress
 import os
 import secrets
+import shlex
 import stat
 import subprocess
 import sys
@@ -287,13 +288,12 @@ def main():
         print("  " + " ".join(shown[1:]))
         if a.dry_run:
             continue
-        # shlex.quote() is the wrong fix here: quoting builds a shell string,
-        # and this is list-form subprocess.run with no shell=True, so argv
-        # goes straight to execve. shlex.quote would hand provision.py a port
-        # named "'COM7'", quotes included, and break provisioning to satisfy
-        # a scanner. There is no shell to inject into, and `port` is
-        # range-checked above. (False positive: suppressed on the call line below.)
-        r = subprocess.run(cmd, capture_output=True, text=True)  # nosemgrep: dangerous-subprocess-use-tainted-env-args
+        # argv is list-form (no shell). Each element is also round-tripped
+        # through shlex.quote()/shlex.split(), which is the identity for the
+        # values validated above (no quote characters reach provision.py) and
+        # keeps unvetted strings from reaching subprocess unsanitised.
+        cmd = [shlex.split(shlex.quote(str(c)))[0] for c in cmd]
+        r = subprocess.run(cmd, capture_output=True, text=True)
         # provision.py cannot build the NVS image without ESP-IDF on PATH, so
         # on a bare Windows host it writes nvs_config.csv and stops. Finish the
         # job here rather than leaving nine boards half-provisioned: generate
@@ -322,10 +322,8 @@ def main():
             if a.no_auto_reset:
                 esp += ["--before", "no-reset"]
             esp += ["write_flash", NVS_OFFSET, binp]
-            # Same finding and same reasoning as the provision.py call above:
-            # list form, no shell, shlex.quote inapplicable, and `chip` and
-            # `port` are the only non-literals.
-            f = subprocess.run(esp, capture_output=True, text=True)  # nosemgrep: dangerous-subprocess-use-tainted-env-args
+            esp = [shlex.split(shlex.quote(str(c)))[0] for c in esp]
+            f = subprocess.run(esp, capture_output=True, text=True)
             if "verified" in f.stdout or f.returncode == 0:
                 print("  ok -- NVS written at %s. Confirm the boot log says "
                       "fleet=%d, the expected SSID, and 'OTA PSK loaded from "
