@@ -98,6 +98,13 @@ For an existing provisioned node, back up its current application and inspect
 `http://DEVICE_IP:8032/ota/status` before choosing an application-only update.
 Writing only offset `0x20000` is safe only when the status endpoint reports
 `running_partition` as `ota_0` and the downloaded image matches the board.
+
+After an OTA, the same endpoint's `ota_state` must read `valid` before you
+power-cycle the node or push again. `pending_verify` means the image has not
+passed its first-boot health check yet and would revert on reset. A passed
+check means only that the node reached the network and sent CSI. See
+[RUNBOOK §2.1](RUNBOOK.md) and ADR-379.
+
 The full bundles do not include NVS, so the documented four-offset install
 preserves WiFi and node configuration while replacing the boot and application
 images.
@@ -161,9 +168,15 @@ board default and emits no antenna-path claim.
 ### 3. Provision WiFi credentials (no reflash needed)
 
 ```bash
+# Keep the WiFi password in an owner-only file, not on the command line.
+printf '%s\n' 'YourPass' > ~/.wifi-pass && chmod 600 ~/.wifi-pass
 python firmware/esp32-csi-node/provision.py --port COM7 \
-  --ssid "YourSSID" --password "YourPass" --target-ip 192.168.1.20
+  --ssid "YourSSID" --password-file ~/.wifi-pass --target-ip 192.168.1.20
 ```
+
+Leave out both `--password` and `--password-file` and the script asks for the
+password when run from a terminal. `--password` still works, but it shows up in
+`ps` and shell history.
 
 ### 4. Start the sensing server
 
@@ -362,6 +375,14 @@ The `MSYS_NO_PATHCONV=1` prefix prevents Git Bash from mangling the `/project` p
 - `build/partition_table/partition-table.bin` -- flash partition layout
 - `build/esp32-csi-node.bin` -- application firmware
 
+### Release bundles
+
+Firmware downloads are published from dedicated `vX.Y.Z-esp32` tags after all
+S3 and C6 matrix builds pass. Each release contains separate S3 8 MB, S3 4 MB,
+and C6 4 MB archives plus an archive checksum manifest. The repository's
+automated `vNNNN` server releases (for example `v2655`) are not firmware tags;
+do not use their presence or absence of assets as firmware provenance.
+
 ### Custom Configuration
 
 To change Kconfig settings before building:
@@ -432,9 +453,14 @@ The easiest way to write NVS settings:
 ```bash
 python firmware/esp32-csi-node/provision.py --port COM7 \
   --ssid "MyWiFi" \
-  --password "MyPassword" \
+  --password-file ~/.wifi-pass \
   --target-ip 192.168.1.20
 ```
+
+The password file must be owner-only (`chmod 600`); one trailing newline is
+dropped. Without a password flag the script prompts on a terminal; in scripts
+and CI it doesn't prompt and fails if no password was given now or saved
+earlier for that port.
 
 ### Remote Configuration (no USB)
 
@@ -711,6 +737,7 @@ cargo build -p wifi-densepose-wasm-edge --target wasm32-unknown-unknown --releas
 | `main/nvs_config.c` / `.h` | Runtime configuration: loads Kconfig defaults, overrides from NVS |
 | `main/edge_processing.c` / `.h` | Tier 0-2 DSP pipeline: SPSC ring buffer, biquad IIR filters, Welford stats, BPM extraction, presence, fall detection |
 | `main/ota_update.c` / `.h` | HTTP OTA firmware update server on port 8032 |
+| `main/ota_health.c` / `.h` | First-boot health check that confirms an OTA'd image or rolls it back (ADR-379) |
 | `main/power_mgmt.c` / `.h` | Battery-aware light sleep duty cycling |
 | `main/wasm_runtime.c` / `.h` | WASM3 interpreter: module slots, host API bindings, budget guard, per-frame dispatch |
 | `main/wasm_upload.c` / `.h` | HTTP endpoints for WASM module upload, list, start, stop, delete |
