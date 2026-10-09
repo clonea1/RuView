@@ -1,5 +1,27 @@
 menu "CSI Node Configuration"
 
+    config C6_XIAO_ANTENNA_SELECT
+        bool "Control the Seeed XIAO ESP32-C6 RF switch"
+        depends on IDF_TARGET_ESP32C6
+        default n
+        help
+            Enable only for Seeed XIAO ESP32-C6 boards. The XIAO uses GPIO3
+            to enable RF-switch control and GPIO14 to choose its internal or
+            external antenna. Leave this disabled for generic ESP32-C6 boards
+            because GPIO3 and GPIO14 may have unrelated functions there.
+
+    choice C6_XIAO_ANTENNA_PATH
+        prompt "Seeed XIAO ESP32-C6 antenna path"
+        depends on C6_XIAO_ANTENNA_SELECT
+        default C6_XIAO_ANTENNA_INTERNAL
+
+        config C6_XIAO_ANTENNA_INTERNAL
+            bool "Internal ceramic antenna"
+
+        config C6_XIAO_ANTENNA_EXTERNAL
+            bool "External U.FL antenna"
+    endchoice
+
     config CSI_NODE_ID
         int "Node ID (0-255)"
         default 1
@@ -307,6 +329,25 @@ menu "WASM Programmable Sensing (ADR-040)"
         help
             How often to call on_timer() on running WASM modules.
             Default 1000 ms = 1 Hz.
+
+endmenu
+
+menu "OTA / WASM HTTP server (ADR-379)"
+
+config OTA_HTTPD_STACK_SIZE
+    int "Stack size of the OTA / WASM HTTP server task (bytes)"
+    range 4096 16384
+    default 8192
+    help
+      HTTPD_DEFAULT_CONFIG() gives 4096. MEASURED 2026-09-29 on an ESP32-S3
+      (node 4, v0.8.12): every POST /ota overflowed it ("stack overflow in
+      task httpd", RTC_SW_CPU_RST), so no OTA had ever completed on this
+      firmware. The same task runs POST /wasm/upload (signature check plus
+      wasm3 module load) and GET /wasm/list.
+
+      Every OTA and WASM upload logs "httpd stack after <handler>: N of M
+      bytes never used". Lower this only with those numbers in hand, and keep
+      at least 1 KB unused on the worst handler.
 
 endmenu
 
@@ -651,3 +692,64 @@ config UPLINK_WATCHDOG_TIMEOUT_S
       packet's health field before assuming the watchdog is responsible.
 
 endmenu
+
+menu "OTA health check (ADR-379)"
+
+config OTA_HEALTH_TIMEOUT_S
+    int "Seconds an OTA'd image has to prove itself before rolling back"
+    depends on BOOTLOADER_APP_ROLLBACK_ENABLE
+    range 30 900
+    default 120
+    help
+      Only applies when the running image is ESP_OTA_IMG_PENDING_VERIFY, i.e.
+      it was just delivered by OTA to a node whose bootloader has
+      CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE. USB-flashed and already-confirmed
+      images are never checked.
+
+      Healthy means: the STA got an IP, and the stream sender accepted at least
+      one CSI frame. Both must happen within this many seconds of boot, or the
+      image is marked invalid and the node reboots into the previous slot.
+
+      Measured from boot, and the WiFi boot wait alone can take about two
+      minutes against an absent AP, so an AP outage during a rollout rolls a
+      good image back. That is the safe direction: re-push it later.
+
+config OTA_HEALTH_MIN_UPTIME_S
+    int "Minimum uptime before an OTA'd image may be confirmed"
+    depends on BOOTLOADER_APP_ROLLBACK_ENABLE
+    range 0 600
+    default 30
+    help
+      Holds confirmation back for this long after boot even once both signals
+      are in, so an image that crashes shortly after starting its pipelines
+      still reverts (a crash while PENDING_VERIFY is a rollback). Clamped to
+      OTA_HEALTH_TIMEOUT_S.
+
+config OTA_HEALTH_FORCE_FAIL
+    bool "TEST ONLY: fail the OTA health check to exercise rollback"
+    depends on BOOTLOADER_APP_ROLLBACK_ENABLE
+    default n
+    help
+      Builds an image that rolls itself back at the point it would otherwise
+      confirm. OTA-push it to a node to prove rollback works end to end: the
+      node should reboot into the previous image. Has no effect when USB
+      flashed (such an image is not PENDING_VERIFY). Never ship this.
+
+endmenu
+
+config CSI_GATE_MESH_ALIGNED
+    bool "Align the CSI rate gate to mesh time (enables cross-node pairing)"
+    default y
+    help
+      The per-node elapsed gate ("20 ms since MY last accept") gives every node
+      an independent phase, so two healthy nodes at 50 Hz accept disjoint
+      frames and nothing can be paired across them. This aligns the 20 ms
+      window to mesh time so nodes choose the same windows.
+
+config CSI_SEQ_DIAG
+    bool "Log (source MAC, rx_seq) for every CSI callback (ADR-345 phase 2 probe)"
+    default n
+    help
+      Diagnostic. Emits the transmitter address and 802.11 sequence number for
+      each CSI callback so the effect of the gate above can be measured rather
+      than assumed. Verbose; leave off in normal operation.

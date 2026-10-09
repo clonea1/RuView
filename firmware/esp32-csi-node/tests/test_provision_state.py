@@ -92,12 +92,12 @@ class TestMerge(unittest.TestCase):
         args = _mk_args()  # all None
         prior = {
             "ssid": "MyWiFi",
-            "target_ip": "192.168.1.20",
+            "target_ip": "192.0.2.20",
             "node_id": 3,
         }
         merged = provision.merge_state_into_args(args, prior)
         self.assertEqual(args.ssid, "MyWiFi")
-        self.assertEqual(args.target_ip, "192.168.1.20")
+        self.assertEqual(args.target_ip, "192.0.2.20")
         self.assertEqual(args.node_id, 3)
         for key, val in prior.items():
             self.assertEqual(merged[key], val)
@@ -121,11 +121,11 @@ class TestMerge(unittest.TestCase):
         args = _mk_args(seed_url="http://10.1.10.236")
         prior = {
             "ssid": "ruv.net",
-            "target_ip": "192.168.1.20",
+            "target_ip": "192.0.2.20",
         }
         merged = provision.merge_state_into_args(args, prior)
         self.assertEqual(args.ssid, "ruv.net")
-        self.assertEqual(args.target_ip, "192.168.1.20")
+        self.assertEqual(args.target_ip, "192.0.2.20")
         self.assertEqual(args.seed_url, "http://10.1.10.236")
         # And the on-disk merged dict carries all three keys.
         self.assertEqual(set(merged.keys()),
@@ -162,7 +162,7 @@ class TestLegacySecretBearingState(unittest.TestCase):
             "password": "old-passphrase",
             "seed_token": "old-token",
             "ota_psk": "0123456789abcdef",
-            "target_ip": "192.168.1.20",
+            "target_ip": "192.0.2.20",
             "node_id": 3,
         }
         with open(self.path, "w", encoding="utf-8") as fh:
@@ -188,7 +188,7 @@ class TestLegacySecretBearingState(unittest.TestCase):
     def test_load_keeps_the_non_secret_settings(self):
         state, _ = self._load_quietly()
         self.assertEqual(state["ssid"], "ruv.net")
-        self.assertEqual(state["target_ip"], "192.168.1.20")
+        self.assertEqual(state["target_ip"], "192.0.2.20")
         self.assertEqual(state["node_id"], 3)
 
     def test_load_rewrites_the_file_without_the_credential(self):

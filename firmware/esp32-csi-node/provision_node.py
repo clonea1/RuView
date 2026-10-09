@@ -7,8 +7,11 @@ transcript of the session. That is a poor place for it and an easy thing to
 forget you did.
 
 This reads the password from a file, passes it to provision.py as a subprocess
-argument (unavoidable -- that is provision.py's only interface), and never
-prints or echoes it. The password still appears briefly in the child process's
+argument (not --password-file: this script tolerates a BOM and surrounding
+whitespace that provision.py's stricter reader would keep in the passphrase),
+and never prints or echoes it. provision.py does not cache the password, so
+it is supplied on every run, which is what this script does.
+The password still appears briefly in the child process's
 argv, so this is not protection against a local attacker; it is protection
 against the credential being permanently recorded somewhere it does not belong.
 
@@ -65,7 +68,7 @@ def load_conf(net=None):
             '  {\n'
             '    "ssid": "thisismyssid",\n'
             '    "password_file": "~/secrets/thisismyssid.txt",\n'
-            '    "target_ip": "192.168.1.10",\n'
+            '    "target_ip": "192.0.2.10",\n'
             '    "ota_psk_file": "~/secrets/ota_psk.txt",\n'
             '    "chip": "esp32c6",\n'
             '    "edge_tier": 2\n'
@@ -289,9 +292,8 @@ def main():
         # goes straight to execve. shlex.quote would hand provision.py a port
         # named "'COM7'", quotes included, and break provisioning to satisfy
         # a scanner. There is no shell to inject into, and `port` is
-        # range-checked above.
-        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        # range-checked above. (False positive: suppressed on the call line below.)
+        r = subprocess.run(cmd, capture_output=True, text=True)  # nosemgrep: dangerous-subprocess-use-tainted-env-args
         # provision.py cannot build the NVS image without ESP-IDF on PATH, so
         # on a bare Windows host it writes nvs_config.csv and stops. Finish the
         # job here rather than leaving nine boards half-provisioned: generate
@@ -323,8 +325,7 @@ def main():
             # Same finding and same reasoning as the provision.py call above:
             # list form, no shell, shlex.quote inapplicable, and `chip` and
             # `port` are the only non-literals.
-            # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
-            f = subprocess.run(esp, capture_output=True, text=True)
+            f = subprocess.run(esp, capture_output=True, text=True)  # nosemgrep: dangerous-subprocess-use-tainted-env-args
             if "verified" in f.stdout or f.returncode == 0:
                 print("  ok -- NVS written at %s. Confirm the boot log says "
                       "fleet=%d, the expected SSID, and 'OTA PSK loaded from "

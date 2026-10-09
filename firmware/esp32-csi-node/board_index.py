@@ -3,7 +3,9 @@
 
 Why this exists
 ---------------
-`provision.py` keys its state files by **serial port**: COM3.json, COM5.json.
+`provision.py` used to key its state files by **serial port** (COM3.json,
+COM5.json) and now keys them by MAC when it can read one; this index is still
+what assigns node_ids.
 A port is a property of which USB socket you happened to use, not of the board
 plugged into it. Cycling six boards through three ports makes a duplicate
 node_id near-certain, and nothing errors -- the second board silently takes the
