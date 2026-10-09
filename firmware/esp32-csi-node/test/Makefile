@@ -56,11 +56,12 @@ FUZZ_JOBS     ?= 1
         test_vitals run_vitals test_mmwave_detect run_mmwave_detect host_tests \
         test_thermal run_thermal test_csi_sanitize run_csi_sanitize \
         test_c6_antenna run_c6_antenna test_serial_onboarding run_serial_onboarding \
+        run_delivery_contract test_ota_health run_ota_health \
         test_edge_grid run_edge_grid
 
 all: fuzz_serialize fuzz_edge fuzz_nvs test_adr110 test_vitals test_mmwave_detect \
      test_thermal test_csi_sanitize test_c6_antenna test_serial_onboarding \
-     test_edge_grid
+     test_ota_health test_edge_grid
 
 # --- XIAO ESP32-C6 RF switch selection ---
 # Host-side truth table for the GPIO14 antenna selector. GPIO3 is always driven
@@ -150,9 +151,22 @@ run_edge_grid: test_edge_grid
 	./test_edge_grid_he
 	./test_edge_grid_pre_he
 
+# --- OTA first-boot health check (ADR-379) ---
+# Host-side. Exercises ota_health_step() from ../main/ota_health.h directly --
+# the decision the device runs to confirm or roll back an OTA'd image.
+test_ota_health: test_ota_health.c $(MAIN_DIR)/ota_health.h
+	cc -std=c99 -Wall -Wextra -Werror -I$(MAIN_DIR) -o $@ $<
+
+run_ota_health: test_ota_health
+	./test_ota_health
+
+run_delivery_contract:
+	python3 test_delivery_contract.py
+
 host_tests: run_adr110 run_vitals run_mmwave_detect run_thermal run_csi_sanitize \
-            run_c6_antenna run_serial_onboarding run_edge_grid
-	@echo "Host tests passed (ADR-110 + CSI sanitation + vitals + mmwave + thermal + C6 antenna + USB onboarding + edge grid)"
+            run_c6_antenna run_serial_onboarding run_delivery_contract run_ota_health \
+            run_edge_grid
+	@echo "Host tests passed (ADR-110 + CSI sanitation + vitals + mmwave + thermal + C6 antenna + USB onboarding + delivery contract + OTA health + edge grid)"
 
 # --- Serialize fuzzer ---
 # Tests csi_serialize_frame() with random wifi_csi_info_t inputs.
@@ -190,5 +204,5 @@ run_all: run_serialize run_edge run_nvs
 clean:
 	rm -f fuzz_serialize fuzz_edge fuzz_nvs test_adr110 test_vitals test_mmwave_detect \
 		test_thermal test_csi_sanitize test_c6_antenna test_serial_onboarding \
-		test_edge_grid_he test_edge_grid_pre_he
+		test_ota_health test_edge_grid_he test_edge_grid_pre_he
 	rm -rf corpus_serialize/ corpus_edge/ corpus_nvs/

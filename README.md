@@ -6,6 +6,12 @@
   </a>
 </p>
 
+<p align="center">
+  <a href="https://ruos.cognitum.one">
+    <img src="assets/ruos-animated.svg" alt="RuView — WiFi becomes spatial awareness, with Ruflo coordination and a ruOS sensing workspace" width="100%">
+  </a>
+</p>
+
 
 ## **See through walls with WiFi** ##
 
@@ -40,29 +46,56 @@ Every WiFi router already fills your space with radio waves. When people move, b
 <details>
 <summary><strong>RuView MetaHarness</strong> — guided operation for humans and AI agents</summary>
 
-The RuView-specific metaharness we created is published as [`@ruvnet/ruview`](harness/ruview/README.md). It provides source-cited guidance, guarded Claude Code/Codex agents, deterministic verification, an honesty check for accuracy claims, and an explicitly granted OAuth-only Cognitum Spaces read.
+The RuView-specific metaharness we created is published as [`@ruvnet/ruview`](harness/ruview/README.md). It provides:
+- source-cited guidance;
+- device access for CSI nodes, radar and LiDAR;
+- firmware flashing with boot evidence;
+- one MCP server, usable over stdio or HTTP for ChatGPT, with a live console widget;
+- a Claude Code mod;
+- guarded Claude Code/Codex agents;
+- deterministic verification;
+- an honesty check for accuracy claims.
+
+Companion packages: [`homecore`](harness/homecore/README.md) (Homecore developer metaharness) and [`@ruvnet/ruview-kernel`](harness/ruview-kernel/README.md) (the vitals pipeline as WASM).
 
 ```bash
 # Check the local setup and get source-cited guidance
-npx @ruvnet/ruview@0.4.0 doctor
-npx @ruvnet/ruview@0.4.0 guidance --topic sensing --query "model loading"
+npx @ruvnet/ruview@0.9.1 doctor
+npx @ruvnet/ruview@0.9.1 guidance --topic sensing --query "model loading"
+
+# Hardware: what is plugged in, live CSI from your nodes, a 60 GHz radar kit
+npx @ruvnet/ruview@0.9.1 devices
+npx @ruvnet/ruview@0.9.1 esp32 --watch                       # ESP32 + Realtek RAC1 nodes, live view
+npx @ruvnet/ruview@0.9.1 esp32 --seconds 45 --analyze        # live CSI through the vitals kernel
+npx @ruvnet/ruview@0.9.1 mmwave --source esphome --host <kit-ip>
+
+# Agents: MCP over stdio, or over HTTP for ChatGPT (token-protected, read tools only)
+npx @ruvnet/ruview@0.9.1 mcp start
+RUVIEW_MCP_GRANTS=device-access npx @ruvnet/ruview@0.9.1 mcp start --http
+
+# Claude Code: a live sensing pane (/ruview), shipped in the package
+npx @ruvnet/ruview@0.9.1 mod
 
 # Run a read-only RuView agent through Codex
-npx @ruvnet/ruview@0.4.0 agent run --host codex --repo . \
+npx @ruvnet/ruview@0.9.1 agent run --host codex --repo . \
   --prompt "Find the nearest tests and cite the source files"
 
-# Search or verify the reviewed contributor brain
-npx @ruvnet/ruview@0.4.0 brain search --query "calibration"
-npx @ruvnet/ruview@0.4.0 brain verify --repo .
-
-# Check claims, replay the deterministic proof, or expose the MCP server
-npx @ruvnet/ruview@0.4.0 claim-check --file REPORT.md
-npx @ruvnet/ruview@0.4.0 verify
-npx @ruvnet/ruview@0.4.0 spaces
-npx @ruvnet/ruview@0.4.0 mcp start
+# Check claims, replay the deterministic proof, search the reviewed brain
+npx @ruvnet/ruview@0.9.1 claim-check --file REPORT.md
+npx @ruvnet/ruview@0.9.1 verify
+npx @ruvnet/ruview@0.9.1 brain search --query "calibration"
 ```
 
-Agent runs are read-only by default. Workspace writes require both `--allow-write` and `--confirm`; retrieved brain content is evidence, not authority.
+**Safety:**
+- Agent runs are read-only by default. Workspace writes require both `--allow-write` and `--confirm`.
+- Hardware reads need the `device-access` grant.
+- Flashing and calibration never run over the HTTP transport.
+- Device-reported vitals are labelled as unvalidated.
+- Retrieved brain content is evidence, not authority.
+
+A single `npx ruview` package bundling all of this is ready (ADR-376). It is waiting on npm to release the unscoped name.
+
+Full walkthrough: [user guide → RuView npm toolkit](docs/user-guide.md#ruview-npm-toolkit-ruvnetruview).
 
 </details>
 
@@ -114,8 +147,11 @@ RuView turns ordinary WiFi into a contactless sensor. A $9 ESP32 board reads the
 ```bash
 # Option 1: Docker (simulated data, no hardware needed)
 docker pull ruvnet/wifi-densepose:latest
-docker run -p 3000:3000 ruvnet/wifi-densepose:latest
+export RUVIEW_API_TOKEN=$(openssl rand -hex 32)   # required; the container exits 64 without it
+docker run -p 127.0.0.1:3000:3000 -e RUVIEW_API_TOKEN ruvnet/wifi-densepose:latest
 # Open http://localhost:3000
+# ESP32 nodes in Docker also need a UDP source guard (RUVIEW_UDP_ALLOW);
+# see docs/user-guide.md "Receiving ESP32 frames in Docker".
 
 # Option 2a: Live sensing with ESP32-S3 hardware ($9)
 # Flash firmware, provision WiFi, and start sensing:
@@ -694,7 +730,13 @@ claude --plugin-dir ./plugins/ruview
 
 Verify the plugin structure: `bash plugins/ruview/scripts/smoke.sh`. Full details: [`plugins/ruview/README.md`](plugins/ruview/README.md).
 
-For the portable RuView MetaHarness, use `npx @ruvnet/ruview@0.4.0`; the quick commands and fuller explanation are in the collapsed MetaHarness section near the top of this README and in [`harness/ruview/`](harness/ruview/README.md).
+**Live sensing pane (Claude Code mod):** the same marketplace also lists `ruview-live`, a Claude Code mod.
+- Install it with `/plugin install ruview-live@ruview`, or run `npx @ruvnet/ruview@0.9.1 mod` for its path inside the npm package.
+- `/ruview` opens a pane beside the transcript with your CSI nodes and radar, refreshed on a timer, plus a one-line status.
+- It is read-only.
+- Mods are early access; if `/ruview` is missing, start Claude Code with `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`. See [ADR-377](docs/adr/ADR-377-ruview-live-claude-code-mod.md).
+
+For the portable RuView MetaHarness, use `npx @ruvnet/ruview@0.9.1`. The quick commands and a fuller explanation are in the collapsed MetaHarness section near the top of this README, in [`harness/ruview/`](harness/ruview/README.md), and in the [user guide](docs/user-guide.md#ruview-npm-toolkit-ruvnetruview).
 
 </details>
 
