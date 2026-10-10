@@ -81,8 +81,22 @@ for residuals, weights in your_csi_source:  # one frame at a time
         print(f"{est.value_bpm:.1f} BPM  (confidence={est.confidence:.2f})")
 ```
 
-Heart rate is the same shape — `HeartRateExtractor.esp32_default()` with a
-0.8–2.0 Hz band-pass and a 15-second window.
+For heart rate, use `HeartRateExtractor.esp32_default()` with a 0.8–2.0 Hz
+bandpass and a 15-second window. Its second argument is `phases`, not the
+breathing extractor's `weights`:
+
+```python
+hr = HeartRateExtractor.esp32_default()
+est = hr.extract(residuals=residuals, phases=phases)
+# If phase measurements are unavailable, phases=[] uses equal weighting.
+```
+
+The current binding rejects the old `weights` keyword with `TypeError`.
+Heart-rate estimation requires a local autocorrelation peak; a declining
+breathing-only correlation is not treated as a pulse at the band edge.
+Additional filtering reduces respiratory leakage, while confidence remains
+capped by evidence from the original filter stage. Synthetic regression tests
+cover these cases; they do not establish accuracy on real CSI or medical use.
 
 ### Subscribe to a live sensing-server
 

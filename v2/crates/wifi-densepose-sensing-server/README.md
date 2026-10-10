@@ -43,6 +43,8 @@ per ADR-022 Phase 3.
 - **WebSocket broadcast** -- Real-time sensing updates pushed to all connected clients at
   `ws://localhost:8765/ws/sensing`.
 - **Static file serving** -- Hosts the sensing UI on port 8080 with CORS headers.
+- **Private startup baseline** -- Restores a recent, installation-bound empty-room field model
+  without storing raw CSI or authorizing numeric vital signs (ADR-355).
 
 ## Modules
 
@@ -74,6 +76,23 @@ cargo run -p wifi-densepose-sensing-server -- \
     --static-dir ./ui
 ```
 
+### Empty-room startup baseline
+
+Provide a stable installation ID and an application-owned private state directory:
+
+```bash
+cargo run -p wifi-densepose-sensing-server -- \
+    --installation-id installation-01 \
+    --data-dir /path/to/private/application-state
+```
+
+Complete the normal empty-room calibration, then call
+`POST /api/v1/calibration/bootstrap/promote`. The server measures a separate 12-sample holdout
+before storing an aggregate field-model snapshot. On a later start with the same installation ID,
+the snapshot is restored with `bootstrap_only` authority. It can reduce startup background false
+positives, but cannot authorize calibrated evidence or numeric heart and breathing rates. Use
+`POST /api/v1/calibration/reset` with administrator scope to remove it.
+
 ### Using as a library
 
 ```rust
@@ -92,6 +111,40 @@ if let Some(vitals) = detector.detect() {
     println!("Breathing: {:.1} BPM", vitals.breathing_rate_bpm);
     println!("Heart rate: {:.0} BPM", vitals.heart_rate_bpm);
 }
+```
+
+## Live multi-node occupancy
+
+For ESP32 CSI and edge-vitals updates, the room's debounced classification gates
+the published count. An absent packet from one node does not clear a room that
+other fresh nodes still classify as occupied. Conversely, a positive node reading
+does not force a count while room presence is still absent or pending debounce.
+
+Only nodes with a sensing timestamp less than ten seconds old contribute to the
+count or room vote. A retained stale node can remain available for diagnostics,
+but cannot raise current occupancy. Edge-vitals confidence is kept separate from
+the raw CSI count score, so alternating packet types do not inflate the count.
+The legacy `edge_vitals` message carries its named node's count, subject to room
+absence/bootstrap suppression; `sensing_update.estimated_persons` is room-wide.
+
+These are state-consistency rules, not an accuracy claim. Calibrated-zero
+precedence over heuristic counts and aging a buffered update during a complete
+stream outage remain separate work. The per-node diagnostic endpoint also retains
+historical values with freshness labels. Consumers must honor source/freshness
+status rather than treating a retained value as current evidence.
+
+For a field report such as [#2058](https://github.com/ruvnet/RuView/issues/2058),
+retain the exact server commit and configuration, timestamped `sensing_update`
+and `/api/v1/nodes` samples, packet types/rates per node, calibration status and
+known room occupancy. A deterministic regression establishes the software defect;
+the reporter's logs are still required to attribute their observed fluctuations.
+Exclude credentials and unrelated network/person data from shared diagnostics.
+
+Focused checks (from `v2/`):
+
+```bash
+cargo test -p wifi-densepose-sensing-server --bin sensing-server --no-default-features person_count_tests
+cargo test -p wifi-densepose-sensing-server --no-default-features
 ```
 
 ## Architecture

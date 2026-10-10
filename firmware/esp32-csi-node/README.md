@@ -19,6 +19,25 @@ This firmware captures WiFi Channel State Information (CSI) from an ESP32-S3 (pr
 > | **Fall detection** | Phase acceleration threshold | Configurable sensitivity |
 > | **Programmable sensing** | WASM modules loaded over HTTP | Hot-swap, no reflash |
 
+## Firmware 0.8.12: guided Mac onboarding
+
+Firmware 0.8.12 adds the protocol used by the RuView macOS Add
+Sensor workflow. A directly attached S3 or C6 can identify itself through a
+nonce bound USB serial receipt, preserve its current WiFi settings, accept an
+unused node ID and private LAN server address, then reboot. The Mac app does
+not report success until the sensing server observes that node as fresh.
+
+This is not a firmware flashing API. A board on 0.8.8 or earlier must receive a
+matching chip build through the documented backup and flash process once. The
+USB protocol rejects public target addresses and invalid identifiers. New WiFi
+credentials are bounded, committed only in NVS, and never included in the
+receipt or diagnostic output. See
+[ADR 363](../../docs/adr/ADR-363-native-macos-usb-node-onboarding.md).
+
+On ESP32 C6, the default optional mmWave UART uses GPIO 4 and GPIO 5. Firmware
+refuses any mmWave configuration that overlaps the active console pins. This
+prevents a sensor probe from taking over UART0 RX and disabling Mac onboarding.
+
 ## Firmware 0.8.8 in plain language
 
 Release 0.8.8 makes the sensing stream more internally consistent and easier
@@ -79,6 +98,13 @@ For an existing provisioned node, back up its current application and inspect
 `http://DEVICE_IP:8032/ota/status` before choosing an application-only update.
 Writing only offset `0x20000` is safe only when the status endpoint reports
 `running_partition` as `ota_0` and the downloaded image matches the board.
+
+After an OTA, the same endpoint's `ota_state` must read `valid` before you
+power-cycle the node or push again. `pending_verify` means the image has not
+passed its first-boot health check yet and would revert on reset. A passed
+check means only that the node reached the network and sent CSI. See
+[RUNBOOK §2.1](RUNBOOK.md) and ADR-379.
+
 The full bundles do not include NVS, so the documented four-offset install
 preserves WiFi and node configuration while replacing the boot and application
 images.
@@ -115,12 +141,42 @@ python -m esptool --chip esp32s3 --port COM7 --baud 460800 \
   0x20000 firmware/esp32-csi-node/build/esp32-csi-node.bin
 ```
 
+#### Seeed XIAO ESP32-C6 external antenna
+
+The XIAO ESP32-C6 has a hardware RF switch between its internal ceramic
+antenna and U.FL connector. Generic C6 boards do not share this wiring, so the
+firmware leaves GPIO3 and GPIO14 untouched by default. For an XIAO with an
+external antenna already attached while powered off, build with one of the
+opt-in overlays:
+
+```bash
+# Controlled A condition: internal antenna, RF path stated in the boot log.
+idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32c6;sdkconfig.defaults.xiao-internal" \
+  set-target esp32c6
+idf.py build
+
+# Controlled B condition: external U.FL antenna.
+idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32c6;sdkconfig.defaults.xiao-external" \
+  set-target esp32c6
+idf.py build
+```
+
+The boot log must report the intended `internal ceramic` or `external U.FL`
+path before that measurement is labelled. The standard C6 build keeps the
+board default and emits no antenna-path claim.
+
 ### 3. Provision WiFi credentials (no reflash needed)
 
 ```bash
+# Keep the WiFi password in an owner-only file, not on the command line.
+printf '%s\n' 'YourPass' > ~/.wifi-pass && chmod 600 ~/.wifi-pass
 python firmware/esp32-csi-node/provision.py --port COM7 \
-  --ssid "YourSSID" --password "YourPass" --target-ip 192.168.1.20
+  --ssid "YourSSID" --password-file ~/.wifi-pass --target-ip 192.168.1.20
 ```
+
+Leave out both `--password` and `--password-file` and the script asks for the
+password when run from a terminal. `--password` still works, but it shows up in
+`ps` and shell history.
 
 ### 4. Start the sensing server
 
@@ -257,9 +313,16 @@ Offset  Size  Field
 12      4     Sequence number (LE u32)
 16      1     RSSI (i8)
 17      1     Noise floor (i8)
-18      2     Reserved
+18      1     PPDU type (ADR-110; zero when tagging is disabled)
+19      1     Flags: bit0=40 MHz, bit2=STBC, bit4=sync valid,
+              bit5=invalid first CSI word zeroed by firmware
 20      N*2   I/Q pairs (n_antennas * n_subcarriers * 2 bytes)
 ```
+
+When ESP-IDF marks `first_word_invalid`, the firmware preserves packet geometry,
+zeros the first four CSI bytes, and sets byte 19 bit 5. The same sanitized bytes
+feed the edge DSP path. This prevents a documented hardware artifact from being
+learned as motion while keeping older readers wire compatible.
 
 ### Vitals Packet (32 bytes)
 
@@ -311,6 +374,14 @@ The `MSYS_NO_PATHCONV=1` prefix prevents Git Bash from mangling the `/project` p
 - `build/bootloader/bootloader.bin` -- second-stage bootloader
 - `build/partition_table/partition-table.bin` -- flash partition layout
 - `build/esp32-csi-node.bin` -- application firmware
+
+### Release bundles
+
+Firmware downloads are published from dedicated `vX.Y.Z-esp32` tags after all
+S3 and C6 matrix builds pass. Each release contains separate S3 8 MB, S3 4 MB,
+and C6 4 MB archives plus an archive checksum manifest. The repository's
+automated `vNNNN` server releases (for example `v2655`) are not firmware tags;
+do not use their presence or absence of assets as firmware provenance.
 
 ### Custom Configuration
 
@@ -382,9 +453,14 @@ The easiest way to write NVS settings:
 ```bash
 python firmware/esp32-csi-node/provision.py --port COM7 \
   --ssid "MyWiFi" \
-  --password "MyPassword" \
+  --password-file ~/.wifi-pass \
   --target-ip 192.168.1.20
 ```
+
+The password file must be owner-only (`chmod 600`); one trailing newline is
+dropped. Without a password flag the script prompts on a terminal; in scripts
+and CI it doesn't prompt and fails if no password was given now or saved
+earlier for that port.
 
 ### NVS Key Reference
 
@@ -574,6 +650,7 @@ cargo build -p wifi-densepose-wasm-edge --target wasm32-unknown-unknown --releas
 | `main/nvs_config.c` / `.h` | Runtime configuration: loads Kconfig defaults, overrides from NVS |
 | `main/edge_processing.c` / `.h` | Tier 0-2 DSP pipeline: SPSC ring buffer, biquad IIR filters, Welford stats, BPM extraction, presence, fall detection |
 | `main/ota_update.c` / `.h` | HTTP OTA firmware update server on port 8032 |
+| `main/ota_health.c` / `.h` | First-boot health check that confirms an OTA'd image or rolls it back (ADR-379) |
 | `main/power_mgmt.c` / `.h` | Battery-aware light sleep duty cycling |
 | `main/wasm_runtime.c` / `.h` | WASM3 interpreter: module slots, host API bindings, budget guard, per-frame dispatch |
 | `main/wasm_upload.c` / `.h` | HTTP endpoints for WASM module upload, list, start, stop, delete |
