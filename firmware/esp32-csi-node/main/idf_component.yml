@@ -10,7 +10,8 @@ dependencies:
   espressif/esp_lcd_touch: "^1.0"
 
   ## Onboard WS2812 LED Disabling
-  espressif/led_strip: "^3.0.0"
+  # 3.1.0 needs the IDF >= 5.5 API rmt_tx_switch_gpio; stay on 3.0.x for IDF 5.4
+  espressif/led_strip: "~3.0.3"
 
   ## cJSON for config_api.c.
   ## Bundled as the `json` component up to ESP-IDF 5.x and moved out to the
